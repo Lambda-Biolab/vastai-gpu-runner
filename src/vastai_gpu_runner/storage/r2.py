@@ -291,36 +291,45 @@ class R2Sink:
         logger.info("Cleaned up %d R2 objects for batch %s", deleted, batch_id)
         return deleted
 
-    # -- DCD chunk operations (for large trajectory files) -----------------
+    # -- Large file chunked upload -----------------------------------------
 
-    def upload_dcd_chunk(
+    def upload_file_chunk(
         self,
-        local_dcd: Path,
+        local_file: Path,
         chunk_index: int,
         offset: int,
         size: int,
         r2_prefix: str,
+        *,
+        filename_stem: str = "data",
+        filename_ext: str = "",
     ) -> bool:
-        """Upload a byte-range chunk of a DCD trajectory to R2.
+        """Upload a byte-range chunk of a large file to R2.
+
+        Reads bytes ``[offset:offset+size]`` from *local_file* and uploads
+        as ``{r2_prefix}/{filename_stem}_chunk_{NNN}{filename_ext}``.
+        Concatenating chunks in index order reconstructs the original file.
 
         Args:
-            local_dcd: Path to the full trajectory.dcd on disk.
+            local_file: Path to the full file on disk.
             chunk_index: Zero-based chunk sequence number.
             offset: Byte offset to start reading from.
             size: Number of bytes in this chunk.
             r2_prefix: R2 key prefix for the chunks.
+            filename_stem: Base name for chunk files (default ``"data"``).
+            filename_ext: File extension including dot (default ``""``).
 
         Returns:
             True on success, False on failure.
         """
-        key = f"{r2_prefix}trajectory_chunk_{chunk_index:03d}.dcd"
+        key = f"{r2_prefix}{filename_stem}_chunk_{chunk_index:03d}{filename_ext}"
         try:
-            with open(local_dcd, "rb") as fh:
+            with open(local_file, "rb") as fh:
                 fh.seek(offset)
                 data = fh.read(size)
             self._client.put_object(Bucket=self.bucket, Key=key, Body=data)
             logger.debug(
-                "Uploaded DCD chunk %d (%d bytes, offset %d)",
+                "Uploaded chunk %d (%d bytes, offset %d)",
                 chunk_index,
                 size,
                 offset,
@@ -328,7 +337,7 @@ class R2Sink:
             return True
         except Exception:
             logger.warning(
-                "DCD chunk upload failed: chunk %d, offset %d, size %d",
+                "Chunk upload failed: chunk %d, offset %d, size %d",
                 chunk_index,
                 offset,
                 size,
@@ -337,21 +346,35 @@ class R2Sink:
             return False
 
     @staticmethod
-    def consolidate_dcd_chunks(local_dir: Path) -> Path | None:
-        """Concatenate ``trajectory_chunk_*.dcd`` files into ``trajectory.dcd``.
+    def consolidate_chunks(
+        local_dir: Path,
+        *,
+        filename_stem: str = "data",
+        filename_ext: str = "",
+        output_name: str | None = None,
+    ) -> Path | None:
+        """Concatenate chunked files into a single file.
+
+        Chunks are sorted by index (``{stem}_chunk_000{ext}``, ...)
+        and concatenated byte-for-byte. After concatenation, chunk
+        files are deleted.
 
         Args:
             local_dir: Directory containing downloaded chunk files.
+            filename_stem: Base name used when uploading chunks.
+            filename_ext: File extension used when uploading chunks.
+            output_name: Output filename. Defaults to ``{stem}{ext}``.
 
         Returns:
-            Path to the consolidated ``trajectory.dcd``, or None if no
-            chunks were found.
+            Path to the consolidated file, or None if no chunks found.
         """
-        chunks = sorted(local_dir.glob("trajectory_chunk_*.dcd"))
+        chunks = sorted(local_dir.glob(f"{filename_stem}_chunk_*{filename_ext}"))
         if not chunks:
             return None
 
-        traj_path = local_dir / "trajectory.dcd"
+        if output_name is None:
+            output_name = f"{filename_stem}{filename_ext}"
+        traj_path = local_dir / output_name
         total_bytes = 0
         with open(traj_path, "wb") as out:
             for chunk in chunks:
@@ -360,7 +383,7 @@ class R2Sink:
                 total_bytes += len(data)
 
         logger.info(
-            "Consolidated %d DCD chunks -> %s (%d bytes)",
+            "Consolidated %d chunks -> %s (%d bytes)",
             len(chunks),
             traj_path,
             total_bytes,
@@ -505,25 +528,37 @@ else:
         batch_id: str,
         job_name: str,
         workspace: str = "/workspace",
+        *,
+        large_file: str = "",
+        checkpoint_files: list[str] | None = None,
     ) -> str:
-        """Generate an R2 upload script for job-based workers (e.g. MD).
+        """Generate an R2 upload script for job-based workers.
 
-        Supports: ``--checkpoint``, ``--done``, or no args.
+        Supports: ``--checkpoint``, ``--done``, or no args (upload all).
+
+        If *large_file* is set (e.g. ``"trajectory.dcd"``), the script
+        uses chunked delta uploads for that file to handle files that grow
+        continuously during execution. Other checkpoint files are uploaded
+        in full on each ``--checkpoint`` call.
 
         Args:
             batch_id: Batch identifier.
             job_name: Job name.
             workspace: Worker workspace path.
+            large_file: Filename for chunked upload (empty = no chunking).
+            checkpoint_files: Files to upload on ``--checkpoint``.
+                Defaults to all files in output/ if not specified.
 
         Returns:
             Python script as a string.
         """
+        ckpt_list = repr(checkpoint_files) if checkpoint_files else "None"
         return f'''#!/usr/bin/env python3
 """Upload checkpoint/results to Cloudflare R2 (auto-generated by vastai-gpu-runner).
 
 Modes:
-    --checkpoint    Chunked DCD upload (delta bytes only) + state.xml + energy.csv
-    --done          Final chunk flush + all small files + DONE marker
+    --checkpoint    Chunked large-file upload (delta bytes) + checkpoint files
+    --done          Final chunk flush + all output files + DONE marker
     (no args)       Same as --done
 """
 import argparse
@@ -537,7 +572,9 @@ BUCKET = "{self.bucket}"
 PREFIX = "{self.prefix}/{batch_id}/{job_name}/"
 WORKSPACE = "{workspace}"
 OUTPUT = os.path.join(WORKSPACE, "output")
-DCD_STATE_FILE = os.path.join(WORKSPACE, "dcd_upload_state.json")
+CHUNK_STATE_FILE = os.path.join(WORKSPACE, "chunk_upload_state.json")
+LARGE_FILE = "{large_file}"  # Empty string = no chunked upload
+CHECKPOINT_FILES = {ckpt_list}  # None = upload all files in output/
 
 s3 = boto3.client(
     "s3",
@@ -548,35 +585,38 @@ s3 = boto3.client(
 )
 
 
-def _load_dcd_state() -> dict:
-    if os.path.exists(DCD_STATE_FILE):
+def _load_chunk_state() -> dict:
+    if os.path.exists(CHUNK_STATE_FILE):
         try:
-            return _json.loads(open(DCD_STATE_FILE).read())
+            return _json.loads(open(CHUNK_STATE_FILE).read())
         except Exception:
             pass
     return {{"offset": 0, "chunk_index": 0}}
 
 
-def _save_dcd_state(state: dict) -> None:
-    with open(DCD_STATE_FILE, "w") as f:
+def _save_chunk_state(state: dict) -> None:
+    with open(CHUNK_STATE_FILE, "w") as f:
         f.write(_json.dumps(state))
 
 
-def _flush_dcd_chunk() -> bool:
-    state = _load_dcd_state()
+def _flush_large_file_chunk() -> bool:
+    if not LARGE_FILE:
+        return False
+    state = _load_chunk_state()
     offset = state["offset"]
     chunk_index = state["chunk_index"]
-    dcd_path = os.path.join(OUTPUT, "trajectory.dcd")
-    if not os.path.exists(dcd_path):
+    file_path = os.path.join(OUTPUT, LARGE_FILE)
+    if not os.path.exists(file_path):
         return False
-    dcd_size = os.path.getsize(dcd_path)
-    if dcd_size <= offset:
+    file_size = os.path.getsize(file_path)
+    if file_size <= offset:
         return False
-    chunk_size = dcd_size - offset
-    chunk_key = PREFIX + f"trajectory_chunk_{{chunk_index:03d}}.dcd"
-    tmp_path = os.path.join(WORKSPACE, "_dcd_chunk.tmp")
+    chunk_size = file_size - offset
+    stem, ext = os.path.splitext(LARGE_FILE)
+    chunk_key = PREFIX + f"{{stem}}_chunk_{{chunk_index:03d}}{{ext}}"
+    tmp_path = os.path.join(WORKSPACE, "_chunk.tmp")
     try:
-        with open(dcd_path, "rb") as src, open(tmp_path, "wb") as dst:
+        with open(file_path, "rb") as src, open(tmp_path, "wb") as dst:
             src.seek(offset)
             remaining = chunk_size
             while remaining > 0:
@@ -586,13 +626,13 @@ def _flush_dcd_chunk() -> bool:
                 dst.write(block)
                 remaining -= len(block)
         s3.upload_file(tmp_path, BUCKET, chunk_key)
-        state["offset"] = dcd_size
+        state["offset"] = file_size
         state["chunk_index"] = chunk_index + 1
-        _save_dcd_state(state)
-        print(f"  DCD chunk {{chunk_index}}: {{chunk_size}} bytes")
+        _save_chunk_state(state)
+        print(f"  chunk {{chunk_index}}: {{chunk_size}} bytes")
         return True
     except Exception as exc:
-        print(f"WARN: DCD chunk upload failed: {{exc}}")
+        print(f"WARN: chunk upload failed: {{exc}}")
         return False
     finally:
         if os.path.exists(tmp_path):
@@ -601,9 +641,12 @@ def _flush_dcd_chunk() -> bool:
 
 def upload_checkpoint() -> int:
     uploaded = 0
-    if _flush_dcd_chunk():
+    if _flush_large_file_chunk():
         uploaded += 1
-    for fname in ["state.xml", "energy.csv", "topology.pdb"]:
+    files = CHECKPOINT_FILES or (
+        [f for f in os.listdir(OUTPUT) if f != LARGE_FILE] if os.path.isdir(OUTPUT) else []
+    )
+    for fname in files:
         local_path = os.path.join(OUTPUT, fname)
         if os.path.exists(local_path) and os.path.getsize(local_path) > 0:
             try:
@@ -623,11 +666,11 @@ def upload_done_marker() -> None:
 
 def upload_all() -> int:
     uploaded = 0
-    if _flush_dcd_chunk():
+    if _flush_large_file_chunk():
         uploaded += 1
     if os.path.isdir(OUTPUT):
         for fname in os.listdir(OUTPUT):
-            if fname == "trajectory.dcd":
+            if fname == LARGE_FILE:
                 continue
             local_path = os.path.join(OUTPUT, fname)
             if os.path.isfile(local_path):

@@ -1,6 +1,5 @@
 """GPU health checks and R2 connectivity gates for cloud workers.
 
-Unified from the shared patterns in Boltz-2 and OpenMM workers:
 - GPU temperature + ECC error check via nvidia-smi
 - Optional GPU VRAM minimum check
 - R2 connectivity gate via upload script

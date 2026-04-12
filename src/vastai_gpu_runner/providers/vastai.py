@@ -203,12 +203,14 @@ class VastaiRunner(CloudRunner):
         allowed_images: frozenset[str] | None = None,
         docker_image: str = DEFAULT_IMAGE,
         min_gpu_vram_mib: int = MIN_GPU_VRAM_MIB,
+        setup_commands: list[str] | None = None,
     ) -> None:
         """Initialize Vast.ai runner with deployment config and safety guards."""
         super().__init__(config)
         self.allowed_images = allowed_images
         self.docker_image = docker_image
         self.min_gpu_vram_mib = min_gpu_vram_mib
+        self._setup_commands = setup_commands or []
 
     def search_offers(self, **kwargs: object) -> list[dict[str, object]]:
         """Search Vast.ai marketplace for matching GPU offers."""
@@ -372,21 +374,33 @@ class VastaiRunner(CloudRunner):
         return True
 
     def setup_environment(self, instance: CloudInstance) -> bool:
-        """Install micromamba + conda env on the instance."""
-        if not self.config.conda_env_spec:
-            logger.info("No conda_env_spec — skipping environment setup")
+        """Run environment setup commands on the instance.
+
+        If ``setup_commands`` was provided at construction, runs those.
+        Otherwise, if ``conda_env_spec`` is set in the config, installs
+        micromamba + creates a conda environment. If neither is set,
+        skips setup entirely (assumes Docker image is ready).
+
+        Override this method for fully custom setup logic.
+        """
+        commands = self._setup_commands
+        if not commands and not self.config.conda_env_spec:
+            logger.info("No setup commands or conda_env_spec — skipping environment setup")
             return True
 
-        setup_commands = [
-            "apt-get update -qq && apt-get install -y -qq bzip2 ca-certificates",
-            'curl -kL -o /tmp/mm.tar.bz2 "https://micro.mamba.pm/api/micromamba/linux-64/latest"',
-            "mkdir -p /opt/micromamba"
-            " && tar -xjf /tmp/mm.tar.bz2 -C /opt/micromamba --strip-components=1",
-            "/opt/micromamba/bin/micromamba create -y -n env"
-            f" -c conda-forge {self.config.conda_env_spec}",
-        ]
+        if not commands:
+            # Default: micromamba + conda env
+            commands = [
+                "apt-get update -qq && apt-get install -y -qq bzip2 ca-certificates",
+                "curl -kL -o /tmp/mm.tar.bz2 "
+                '"https://micro.mamba.pm/api/micromamba/linux-64/latest"',
+                "mkdir -p /opt/micromamba"
+                " && tar -xjf /tmp/mm.tar.bz2 -C /opt/micromamba --strip-components=1",
+                "/opt/micromamba/bin/micromamba create -y -n env"
+                f" -c conda-forge {self.config.conda_env_spec}",
+            ]
 
-        for cmd in setup_commands:
+        for cmd in commands:
             rc, output = ssh_cmd(instance, cmd, timeout=600)
             if rc != 0:
                 logger.error("Setup command failed: %s -> %s", cmd[:50], output[:200])
