@@ -55,11 +55,7 @@ def query_vastai_pricing(
         offers = runner.search_offers()
 
         if offers:
-            prices = [
-                float(str(o.get("dph_total", 0.0)))
-                for o in offers
-                if o.get("dph_total")
-            ]
+            prices = [float(str(o.get("dph_total", 0.0))) for o in offers if o.get("dph_total")]
             if prices:
                 results[gpu_type] = PriceSummary(
                     gpu_type=gpu_type,

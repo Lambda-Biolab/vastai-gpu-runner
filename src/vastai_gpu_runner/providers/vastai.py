@@ -325,8 +325,7 @@ class VastaiRunner(CloudRunner):
         while time.time() < deadline:
             rc, output = ssh_cmd(
                 instance,
-                "nvidia-smi --query-gpu=memory.used,memory.total "
-                "--format=csv,noheader,nounits",
+                "nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits",
             )
             if rc == 0:
                 try:
@@ -380,8 +379,7 @@ class VastaiRunner(CloudRunner):
 
         setup_commands = [
             "apt-get update -qq && apt-get install -y -qq bzip2 ca-certificates",
-            'curl -kL -o /tmp/mm.tar.bz2 '
-            '"https://micro.mamba.pm/api/micromamba/linux-64/latest"',
+            'curl -kL -o /tmp/mm.tar.bz2 "https://micro.mamba.pm/api/micromamba/linux-64/latest"',
             "mkdir -p /opt/micromamba"
             " && tar -xjf /tmp/mm.tar.bz2 -C /opt/micromamba --strip-components=1",
             "/opt/micromamba/bin/micromamba create -y -n env"
@@ -406,15 +404,10 @@ class VastaiRunner(CloudRunner):
         # Check for duplicate workers
         rc, output = ssh_cmd(instance, f"pgrep -f {worker_script}")
         if rc == 0 and output.strip():
-            logger.warning(
-                "Worker already running on %s — skipping launch", instance.instance_id
-            )
+            logger.warning("Worker already running on %s — skipping launch", instance.instance_id)
             return True
 
-        launch_cmd = (
-            f"cd {ws} && "
-            f"nohup bash {worker_script} > {ws}/worker.log 2>&1 &"
-        )
+        launch_cmd = f"cd {ws} && nohup bash {worker_script} > {ws}/worker.log 2>&1 &"
 
         rc, _ = ssh_cmd(instance, launch_cmd, timeout=30)
         if rc != 0:
@@ -424,9 +417,7 @@ class VastaiRunner(CloudRunner):
         time.sleep(5)
         rc, output = ssh_cmd(instance, f"pgrep -f {worker_script}")
         if rc != 0:
-            logger.error(
-                "Worker process not found after launch on %s", instance.instance_id
-            )
+            logger.error("Worker process not found after launch on %s", instance.instance_id)
             return False
 
         logger.info("Worker launched on %s", instance.instance_id)
@@ -441,13 +432,9 @@ class VastaiRunner(CloudRunner):
             return {"running": False, "complete": True}
 
         # Check if worker PID is alive (detects silent preemption)
-        rc_pid, pid_str = ssh_cmd(
-            instance, f"cat {ws}/worker.pid 2>/dev/null", timeout=5
-        )
+        rc_pid, pid_str = ssh_cmd(instance, f"cat {ws}/worker.pid 2>/dev/null", timeout=5)
         if rc_pid == 0 and pid_str.strip().isdigit():
-            rc_alive, _ = ssh_cmd(
-                instance, f"kill -0 {pid_str.strip()} 2>/dev/null", timeout=5
-            )
+            rc_alive, _ = ssh_cmd(instance, f"kill -0 {pid_str.strip()} 2>/dev/null", timeout=5)
             if rc_alive != 0:
                 logger.warning(
                     "Worker PID %s is dead on %s but no DONE file — silent crash",
@@ -492,9 +479,7 @@ class VastaiRunner(CloudRunner):
         Verifies the instance belongs to this project before destruction
         if ``allowed_images`` was set on the runner.
         """
-        if not verify_instance_ownership(
-            instance.instance_id, allowed_images=self.allowed_images
-        ):
+        if not verify_instance_ownership(instance.instance_id, allowed_images=self.allowed_images):
             logger.error(
                 "REFUSED to destroy instance %s — ownership check failed.",
                 instance.instance_id,
@@ -552,9 +537,7 @@ class VastaiRunner(CloudRunner):
                     timeout=15,
                 )
                 if resp.status_code in (200, 204, 404):
-                    logger.info(
-                        "REST DELETE %s: %d", instance.instance_id, resp.status_code
-                    )
+                    logger.info("REST DELETE %s: %d", instance.instance_id, resp.status_code)
                     break
                 logger.warning(
                     "REST DELETE %s returned %d (attempt %d/3)",

@@ -64,9 +64,7 @@ def get_r2_client(
     return boto3.client(
         "s3",
         endpoint_url=env.get("R2_ENDPOINT", os.environ.get("R2_ENDPOINT", "")),
-        aws_access_key_id=env.get(
-            "R2_ACCESS_KEY_ID", os.environ.get("R2_ACCESS_KEY_ID", "")
-        ),
+        aws_access_key_id=env.get("R2_ACCESS_KEY_ID", os.environ.get("R2_ACCESS_KEY_ID", "")),
         aws_secret_access_key=env.get(
             "R2_SECRET_ACCESS_KEY", os.environ.get("R2_SECRET_ACCESS_KEY", "")
         ),
@@ -115,14 +113,10 @@ class R2Sink:
         count = 0
         paginator = self._client.get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
-            count += sum(
-                1 for obj in page.get("Contents", []) if obj["Key"].endswith(".done")
-            )
+            count += sum(1 for obj in page.get("Contents", []) if obj["Key"].endswith(".done"))
         return count
 
-    def download_shard(
-        self, batch_id: str, shard_id: int, local_dir: Path
-    ) -> list[str]:
+    def download_shard(self, batch_id: str, shard_id: int, local_dir: Path) -> list[str]:
         """Download all outputs for a shard from R2.
 
         Args:
@@ -143,7 +137,7 @@ class R2Sink:
         for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
             for obj in page.get("Contents", []):
                 key = obj["Key"]
-                rel_path = key[len(prefix):]
+                rel_path = key[len(prefix) :]
                 if rel_path:
                     keys.append((key, rel_path))
 
@@ -197,9 +191,7 @@ class R2Sink:
     ) -> None:
         """Write a global marker for a completed prediction."""
         key = f"{self.global_marker_prefix(batch_id)}{prediction_name}.done"
-        self._client.put_object(
-            Bucket=self.bucket, Key=key, Body=worker_id.encode()
-        )
+        self._client.put_object(Bucket=self.bucket, Key=key, Body=worker_id.encode())
 
     def count_global_completed(self, batch_id: str) -> int:
         """Count total completed predictions across all workers."""
@@ -207,9 +199,7 @@ class R2Sink:
         count = 0
         paginator = self._client.get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
-            count += sum(
-                1 for obj in page.get("Contents", []) if obj["Key"].endswith(".done")
-            )
+            count += sum(1 for obj in page.get("Contents", []) if obj["Key"].endswith(".done"))
         return count
 
     # -- Job operations (1 job = 1 instance, e.g. MD) ----------------------
@@ -227,9 +217,7 @@ class R2Sink:
         except self._client.exceptions.ClientError:
             return False
 
-    def download_job(
-        self, batch_id: str, job_name: str, local_dir: Path
-    ) -> list[str]:
+    def download_job(self, batch_id: str, job_name: str, local_dir: Path) -> list[str]:
         """Download all outputs for a job from R2.
 
         Args:
@@ -250,7 +238,7 @@ class R2Sink:
         for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
             for obj in page.get("Contents", []):
                 key = obj["Key"]
-                rel_path = key[len(prefix):]
+                rel_path = key[len(prefix) :]
                 if rel_path:
                     keys.append((key, rel_path))
 
@@ -281,9 +269,7 @@ class R2Sink:
         prefix = f"{self.prefix}/{batch_id}/"
         done_shards: list[int] = []
         paginator = self._client.get_paginator("list_objects_v2")
-        for page in paginator.paginate(
-            Bucket=self.bucket, Prefix=prefix, Delimiter="/"
-        ):
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix, Delimiter="/"):
             for cp in page.get("CommonPrefixes", []):
                 shard_dir = cp["Prefix"].rstrip("/").split("/")[-1]
                 if shard_dir.startswith("shard_"):
@@ -300,9 +286,7 @@ class R2Sink:
         for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
             objects = [{"Key": obj["Key"]} for obj in page.get("Contents", [])]
             if objects:
-                self._client.delete_objects(
-                    Bucket=self.bucket, Delete={"Objects": objects}
-                )
+                self._client.delete_objects(Bucket=self.bucket, Delete={"Objects": objects})
                 deleted += len(objects)
         logger.info("Cleaned up %d R2 objects for batch %s", deleted, batch_id)
         return deleted

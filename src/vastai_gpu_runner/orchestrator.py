@@ -92,18 +92,9 @@ def sweep_zombie_instances(
             continue
 
         # Check R2 before destroying stopped tracked instances
-        if (
-            iid in tracked_ids
-            and status in ("stopped", "exited")
-            and r2_sink
-            and r2_batch_id
-        ):
+        if iid in tracked_ids and status in ("stopped", "exited") and r2_sink and r2_batch_id:
             try:
-                job_name = (
-                    label.replace(label_prefix + "-", "", 1)
-                    if label_prefix in label
-                    else ""
-                )
+                job_name = label.replace(label_prefix + "-", "", 1) if label_prefix in label else ""
                 if job_name and r2_sink.is_job_done(r2_batch_id, job_name):
                     logger.info(
                         "Zombie sweep: %s is stopped but R2 DONE — skipping",
@@ -234,13 +225,9 @@ def poll_instance_progress(
         return {"running": False, "complete": True}
 
     # Layer 2: PID liveness
-    rc_pid, pid_str = ssh_cmd(
-        instance, f"cat {workspace}/worker.pid 2>/dev/null", timeout=5
-    )
+    rc_pid, pid_str = ssh_cmd(instance, f"cat {workspace}/worker.pid 2>/dev/null", timeout=5)
     if rc_pid == 0 and pid_str.strip().isdigit():
-        rc_alive, _ = ssh_cmd(
-            instance, f"kill -0 {pid_str.strip()} 2>/dev/null", timeout=5
-        )
+        rc_alive, _ = ssh_cmd(instance, f"kill -0 {pid_str.strip()} 2>/dev/null", timeout=5)
         if rc_alive != 0:
             logger.warning(
                 "Worker PID %s is dead on %s but no DONE file",

@@ -21,8 +21,10 @@ logger = logging.getLogger(__name__)
 
 # Default SSH options for ephemeral cloud instances
 _SSH_OPTS = [
-    "-o", "StrictHostKeyChecking=no",
-    "-o", "UserKnownHostsFile=/dev/null",
+    "-o",
+    "StrictHostKeyChecking=no",
+    "-o",
+    "UserKnownHostsFile=/dev/null",
 ]
 
 
@@ -45,8 +47,10 @@ def ssh_cmd(
     cmd = [
         "ssh",
         *_SSH_OPTS,
-        "-o", f"ConnectTimeout={min(timeout, 10)}",
-        "-p", str(instance.ssh_port),
+        "-o",
+        f"ConnectTimeout={min(timeout, 10)}",
+        "-p",
+        str(instance.ssh_port),
         f"{instance.ssh_user}@{instance.ssh_host}",
         command,
     ]
@@ -87,7 +91,8 @@ def scp_upload(
     cmd = [
         "scp",
         *_SSH_OPTS,
-        "-P", str(instance.ssh_port),
+        "-P",
+        str(instance.ssh_port),
         str(local_path),
         f"{instance.ssh_user}@{instance.ssh_host}:{remote_path}",
     ]
@@ -131,7 +136,8 @@ def scp_download(
     cmd = [
         "scp",
         *_SSH_OPTS,
-        "-P", str(instance.ssh_port),
+        "-P",
+        str(instance.ssh_port),
         f"{instance.ssh_user}@{instance.ssh_host}:{remote_path}",
         str(local_path),
     ]

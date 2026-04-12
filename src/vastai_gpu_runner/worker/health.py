@@ -65,9 +65,7 @@ def check_gpu(*, min_memory_mib: int = 0, max_temp_c: int = 90) -> bool:
             return False
 
         if min_memory_mib > 0 and mem < min_memory_mib:
-            logger.error(
-                "ABORT: GPU memory %d MiB < %d MiB minimum", mem, min_memory_mib
-            )
+            logger.error("ABORT: GPU memory %d MiB < %d MiB minimum", mem, min_memory_mib)
             return False
 
         if ecc not in ("0", "N/A", "[N/A]", ""):

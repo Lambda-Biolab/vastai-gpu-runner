@@ -233,9 +233,7 @@ class CloudRunner:
             )
             if result.returncode not in (0, 23, 24):
                 # 23 = partial transfer, 24 = vanished source files
-                logger.error(
-                    "rsync failed (rc=%d): %s", result.returncode, result.stderr[:500]
-                )
+                logger.error("rsync failed (rc=%d): %s", result.returncode, result.stderr[:500])
                 return []
         except subprocess.TimeoutExpired:
             logger.error("rsync timeout downloading from %s", instance.instance_id)

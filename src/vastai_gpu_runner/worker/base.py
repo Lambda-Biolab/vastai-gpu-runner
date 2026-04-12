@@ -12,6 +12,7 @@ Usage::
             # Run prediction / simulation / training
             return 0  # exit code
 
+
     worker = MyWorker(workspace=Path("/workspace/my_workload"))
     sys.exit(worker.main())
 """
@@ -141,10 +142,7 @@ class BaseWorker(ABC):
             return
 
         try:
-            url = (
-                f"https://console.vast.ai/api/v0/instances/"
-                f"{instance_id}/?api_key={api_key}"
-            )
+            url = f"https://console.vast.ai/api/v0/instances/{instance_id}/?api_key={api_key}"
             req = urllib.request.Request(url, method="DELETE")  # noqa: S310
             urllib.request.urlopen(req, timeout=15)  # noqa: S310
             logger.info("Self-destruct: instance %s destroyed", instance_id)

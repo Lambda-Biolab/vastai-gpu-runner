@@ -8,8 +8,12 @@ Public API::
 
     # Types and interfaces
     from vastai_gpu_runner import (
-        CloudRunner, DeploymentConfig, CloudInstance,
-        DeploymentResult, Provider, InstanceStatus,
+        CloudRunner,
+        DeploymentConfig,
+        CloudInstance,
+        DeploymentResult,
+        Provider,
+        InstanceStatus,
     )
 
     # Vast.ai provider
@@ -26,7 +30,10 @@ Public API::
 
     # Estimator
     from vastai_gpu_runner.estimator.core import (
-        GPU_SPEED_FACTOR, ScalingRow, EstimateResult, PriceSummary,
+        GPU_SPEED_FACTOR,
+        ScalingRow,
+        EstimateResult,
+        PriceSummary,
     )
 """
 
