@@ -26,6 +26,14 @@ class Provider(enum.Enum):
     RUNPOD = "runpod"
 
 
+class ComputeMode(enum.Enum):
+    """Where to run GPU workloads."""
+
+    LOCAL = "L"
+    CLOUD = "C"
+    HYBRID = "H"
+
+
 class InstanceStatus(enum.Enum):
     """Lifecycle state of a cloud instance."""
 

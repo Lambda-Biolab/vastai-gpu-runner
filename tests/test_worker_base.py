@@ -111,9 +111,7 @@ class TestBaseWorker:
         worker = ConcreteWorker(tmp_path, exit_code=0)
         with (
             patch.object(worker, "write_pid"),
-            patch(
-                "vastai_gpu_runner.worker.base.check_gpu", return_value=True
-            ),
+            patch("vastai_gpu_runner.worker.base.check_gpu", return_value=True),
             patch.object(worker, "_check_r2", return_value=True),
             patch.object(worker, "upload_results"),
             patch.object(worker, "self_destruct"),
@@ -127,9 +125,7 @@ class TestBaseWorker:
         worker = ConcreteWorker(tmp_path)
         with (
             patch.object(worker, "write_pid"),
-            patch(
-                "vastai_gpu_runner.worker.base.check_gpu", return_value=False
-            ),
+            patch("vastai_gpu_runner.worker.base.check_gpu", return_value=False),
         ):
             code = worker.main()
         assert code == 1
@@ -138,9 +134,7 @@ class TestBaseWorker:
         worker = ConcreteWorker(tmp_path)
         with (
             patch.object(worker, "write_pid"),
-            patch(
-                "vastai_gpu_runner.worker.base.check_gpu", return_value=True
-            ),
+            patch("vastai_gpu_runner.worker.base.check_gpu", return_value=True),
             patch.object(worker, "_check_r2", return_value=False),
         ):
             code = worker.main()

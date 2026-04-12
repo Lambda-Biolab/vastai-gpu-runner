@@ -40,23 +40,43 @@ class TestFormatTime:
 
 class TestScalingRow:
     def test_wall_time_human(self) -> None:
-        row = ScalingRow(cloud_gpus=4, cloud_gpu_type="RTX_4090",
-                         wall_time_hours=1.5, cloud_cost_min=2.0, cloud_cost_max=3.0)
+        row = ScalingRow(
+            cloud_gpus=4,
+            cloud_gpu_type="RTX_4090",
+            wall_time_hours=1.5,
+            cloud_cost_min=2.0,
+            cloud_cost_max=3.0,
+        )
         assert row.wall_time_human == "1h 30m"
 
     def test_cost_display_local_only(self) -> None:
-        row = ScalingRow(cloud_gpus=0, cloud_gpu_type="RTX_4090",
-                         wall_time_hours=1.0, cloud_cost_min=0.0, cloud_cost_max=0.0)
+        row = ScalingRow(
+            cloud_gpus=0,
+            cloud_gpu_type="RTX_4090",
+            wall_time_hours=1.0,
+            cloud_cost_min=0.0,
+            cloud_cost_max=0.0,
+        )
         assert row.cost_display == "$0.00"
 
     def test_cost_display_range(self) -> None:
-        row = ScalingRow(cloud_gpus=4, cloud_gpu_type="RTX_3090",
-                         wall_time_hours=0.5, cloud_cost_min=1.20, cloud_cost_max=1.80)
+        row = ScalingRow(
+            cloud_gpus=4,
+            cloud_gpu_type="RTX_3090",
+            wall_time_hours=0.5,
+            cloud_cost_min=1.20,
+            cloud_cost_max=1.80,
+        )
         assert row.cost_display == "$1.20-$1.80"
 
     def test_to_dict(self) -> None:
-        row = ScalingRow(cloud_gpus=2, cloud_gpu_type="RTX_4090",
-                         wall_time_hours=1.0, cloud_cost_min=0.64, cloud_cost_max=0.64)
+        row = ScalingRow(
+            cloud_gpus=2,
+            cloud_gpu_type="RTX_4090",
+            wall_time_hours=1.0,
+            cloud_cost_min=0.64,
+            cloud_cost_max=0.64,
+        )
         d = row.to_dict()
         assert d["cloud_gpus"] == 2
         assert "wall_time_human" in d

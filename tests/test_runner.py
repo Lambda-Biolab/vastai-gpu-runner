@@ -90,7 +90,8 @@ class TestCloudRunner:
             {"id": "2", "machine_id": "m2"},
         ]
         result = runner.run_full_cycle(
-            {}, Path("/tmp/test"),
+            {},
+            Path("/tmp/test"),
             offers=offers,
             used_machine_ids=used,
             machine_lock=lock,

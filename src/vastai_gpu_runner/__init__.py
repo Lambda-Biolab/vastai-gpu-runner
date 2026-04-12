@@ -40,6 +40,7 @@ Public API::
 from vastai_gpu_runner.runner import CloudRunner
 from vastai_gpu_runner.types import (
     CloudInstance,
+    ComputeMode,
     DeploymentConfig,
     DeploymentResult,
     InstanceStatus,
@@ -49,6 +50,7 @@ from vastai_gpu_runner.types import (
 __all__ = [
     "CloudInstance",
     "CloudRunner",
+    "ComputeMode",
     "DeploymentConfig",
     "DeploymentResult",
     "InstanceStatus",
