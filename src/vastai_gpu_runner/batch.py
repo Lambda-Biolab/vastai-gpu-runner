@@ -133,11 +133,24 @@ class BatchOrchestrator(ABC, Generic[UnitT]):
         budget_usd: float = 0.0,
         max_retries: int = 2,
         max_parallel_deploys: int = 16,
+        max_parallel_collects: int = 1,
         poll_interval_seconds: int = 30,
         zombie_sweep_every_n_cycles: int = 5,
         poll_timeout_seconds: float = 0.0,
     ) -> None:
-        """Initialise orchestrator state. See class docstring for argument meanings."""
+        """Initialise orchestrator state. See class docstring for argument meanings.
+
+        ``max_parallel_collects`` controls how many terminal units are
+        finalised (``collect_unit_results`` + ``destroy_instance``)
+        concurrently within a single poll cycle. Default 1 preserves
+        sequential semantics. Raise it when many units complete around
+        the same wall-clock time and the download step is I/O-bound
+        (e.g. rsync over SSH); bandwidth-constrained environments should
+        leave it at 1 or 2.
+        """
+        if max_parallel_collects < 1:
+            msg = f"max_parallel_collects must be >= 1, got {max_parallel_collects}"
+            raise ValueError(msg)
         self._runner_factory = runner_factory
         self._label_prefix = label_prefix
         self._workspace_dir = workspace_dir
@@ -146,6 +159,7 @@ class BatchOrchestrator(ABC, Generic[UnitT]):
         self._budget_usd = budget_usd
         self._max_retries = max_retries
         self._max_parallel_deploys = max_parallel_deploys
+        self._max_parallel_collects = max_parallel_collects
         self._poll_interval_seconds = poll_interval_seconds
         self._zombie_sweep_every_n_cycles = zombie_sweep_every_n_cycles
         self._poll_timeout_seconds = poll_timeout_seconds
@@ -407,32 +421,53 @@ class BatchOrchestrator(ABC, Generic[UnitT]):
         return True
 
     def _poll_cycle_once(self) -> bool:
-        """One sweep over live units. Returns True if any unit made progress."""
-        any_progress = False
+        """One sweep over live units. Returns True if any unit made progress.
+
+        Phase A classifies each live unit (pure, no side effects). Phase B
+        handles preempted units (serial — destroy + instance-loss bookkeeping
+        is cheap). Phase C finalises terminal units, optionally in parallel
+        via ``max_parallel_collects``.
+        """
+        terminal: list[tuple[str, CloudRunner, CloudInstance, UnitT]] = []
+        preempted: list[tuple[str, CloudRunner, CloudInstance, UnitT]] = []
         for unit_key in list(self._live_runners.keys()):
             entry = self._live_runners.get(unit_key)
             if entry is None:
                 continue
             runner, instance, unit = entry
-            verdict = self._check_unit(runner, instance, unit)
-            if verdict in ("completed", "preempted"):
-                any_progress = True
-        return any_progress
+            verdict = self._classify_live_unit(runner, instance, unit)
+            if verdict == "terminal":
+                terminal.append((unit_key, runner, instance, unit))
+            elif verdict == "preempted":
+                preempted.append((unit_key, runner, instance, unit))
 
-    def _check_unit(
+        for unit_key, runner, instance, unit in preempted:
+            with contextlib.suppress(Exception):
+                runner.destroy_instance(instance)
+            with self._state_lock:
+                self._handle_instance_loss(unit, unit_key, "worker died silently")
+
+        if terminal:
+            self._finalise_terminal_units(terminal)
+
+        return bool(terminal or preempted)
+
+    def _classify_live_unit(
         self,
         runner: CloudRunner,
         instance: CloudInstance,
         unit: UnitT,
-    ) -> Literal["completed", "running", "preempted", "failed"]:
-        """Single-unit poll cycle. R2-first, then SSH fallback + rescue."""
-        unit_key = self.unit_key(unit)
+    ) -> Literal["terminal", "running", "preempted"]:
+        """Pure classification of a live unit. No side effects.
 
-        # Layer 1: R2 DONE marker (works even if SSH is flaky)
+        R2 DONE → ``terminal``. SSH ``complete`` → ``terminal``. SSH
+        ``worker_dead`` with R2 re-check miss → ``preempted``. Otherwise
+        ``running``. Exceptions from ``check_progress`` are logged and
+        classified as ``running`` (transient SSH flakiness).
+        """
         if self.unit_is_done_in_r2(unit):
-            return self._finalise_completed(runner, instance, unit, unit_key)
+            return "terminal"
 
-        # Layer 2: SSH progress check
         try:
             progress = runner.check_progress(instance)
         except Exception as exc:
@@ -444,26 +479,71 @@ class BatchOrchestrator(ABC, Generic[UnitT]):
             return "running"
 
         if progress.get("complete"):
-            return self._finalise_completed(runner, instance, unit, unit_key)
+            return "terminal"
 
-        # Layer 3: silent worker crash detection
         if progress.get("worker_dead"):
             # Re-check R2 once more — worker may have uploaded results
             # between the check above and now.
             if self.unit_is_done_in_r2(unit):
-                return self._finalise_completed(runner, instance, unit, unit_key)
+                return "terminal"
             logger.warning(
                 "Poll %s: worker dead on %s — handling as instance loss",
                 self.unit_label(unit),
                 unit.instance_id,
             )
+            return "preempted"
+
+        return "running"
+
+    def _check_unit(
+        self,
+        runner: CloudRunner,
+        instance: CloudInstance,
+        unit: UnitT,
+    ) -> Literal["completed", "running", "preempted", "failed"]:
+        """Single-unit poll cycle. Composes ``_classify_live_unit`` + finalise.
+
+        Kept for backwards-compat with direct callers (unit tests, consumers
+        that prefer synchronous single-unit polling). The main loop uses
+        ``_poll_cycle_once`` which batches terminal units for parallel finalise.
+        """
+        unit_key = self.unit_key(unit)
+        verdict = self._classify_live_unit(runner, instance, unit)
+        if verdict == "running":
+            return "running"
+        if verdict == "preempted":
             with contextlib.suppress(Exception):
                 runner.destroy_instance(instance)
             with self._state_lock:
                 self._handle_instance_loss(unit, unit_key, "worker died silently")
             return "preempted"
+        return self._finalise_completed(runner, instance, unit, unit_key)
 
-        return "running"
+    def _finalise_terminal_units(
+        self,
+        terminal: list[tuple[str, CloudRunner, CloudInstance, UnitT]],
+    ) -> None:
+        """Finalise a batch of terminal units, optionally in parallel.
+
+        Each finalise does ``collect_unit_results`` (I/O-bound — the reason
+        we parallelise) then ``destroy_instance``. ``_finalise_completed``
+        already guards its state mutations with ``self._state_lock``, so
+        parallel execution is safe.
+        """
+        if self._max_parallel_collects <= 1 or len(terminal) == 1:
+            for unit_key, runner, instance, unit in terminal:
+                self._finalise_completed(runner, instance, unit, unit_key)
+            return
+
+        workers = min(self._max_parallel_collects, len(terminal))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [
+                pool.submit(self._finalise_completed, runner, instance, unit, unit_key)
+                for unit_key, runner, instance, unit in terminal
+            ]
+            for fut in as_completed(futures):
+                with contextlib.suppress(Exception):
+                    fut.result()
 
     def _finalise_completed(
         self,

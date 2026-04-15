@@ -1,6 +1,6 @@
 [project]
 name = "vastai-gpu-runner"
-version = "0.2.0"
+version = "0.3.0"
 description = "Cloud GPU orchestration framework for Vast.ai — batch deployment, R2 storage, worker lifecycle"
 requires-python = ">=3.11"
 authors = [{ name = "antomicblitz" }]
@@ -120,7 +120,7 @@ exclude_also = [
 
 # --- bump-my-version ---
 [tool.bumpversion]
-current_version = "0.2.0"
+current_version = "0.3.0"
 parse = "(?P<major>\\d+)\\.(?P<minor>\\d+)\\.(?P<patch>\\d+)"
 serialize = ["{major}.{minor}.{patch}"]
 search = "{current_version}"
