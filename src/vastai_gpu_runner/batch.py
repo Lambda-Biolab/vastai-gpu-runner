@@ -341,39 +341,17 @@ class BatchOrchestrator(ABC, Generic[UnitT]):
         base = self._poll_interval_seconds
         cur_interval = min(base, 5)
         max_interval = min(base * 2, 60)
-        deadline = (
-            time.time() + self._poll_timeout_seconds
-            if self._poll_timeout_seconds > 0
-            else float("inf")
-        )
+        deadline = self._compute_poll_deadline()
         cycle = 0
 
         while self._live_runners and time.time() < deadline:
             cycle += 1
-
             if cycle % self._zombie_sweep_every_n_cycles == 0:
                 self._sweep_zombies()
-
-            if self._budget_usd > 0 and not check_budget(
-                self._estimate_current_spend(),
-                self._budget_usd,
-            ):
-                logger.error("Poll phase: budget exceeded — aborting")
+            if not self._poll_budget_ok():
                 break
 
-            any_made_progress = False
-            for unit_key in list(self._live_runners.keys()):
-                entry = self._live_runners.get(unit_key)
-                if entry is None:
-                    continue
-                runner, instance, unit = entry
-
-                verdict = self._check_unit(runner, instance, unit)
-                if verdict == "completed":
-                    any_made_progress = True
-                elif verdict == "preempted":
-                    any_made_progress = True
-
+            any_made_progress = self._poll_cycle_once()
             if any_made_progress:
                 cur_interval = min(base, 5)
             else:
@@ -386,6 +364,34 @@ class BatchOrchestrator(ABC, Generic[UnitT]):
                 self._poll_timeout_seconds,
                 len(self._live_runners),
             )
+
+    def _compute_poll_deadline(self) -> float:
+        """Absolute wall-clock deadline for the poll loop. ``inf`` when disabled."""
+        if self._poll_timeout_seconds > 0:
+            return time.time() + self._poll_timeout_seconds
+        return float("inf")
+
+    def _poll_budget_ok(self) -> bool:
+        """Check budget ceiling. Returns False if poll loop should abort."""
+        if self._budget_usd <= 0:
+            return True
+        if not check_budget(self._estimate_current_spend(), self._budget_usd):
+            logger.error("Poll phase: budget exceeded — aborting")
+            return False
+        return True
+
+    def _poll_cycle_once(self) -> bool:
+        """One sweep over live units. Returns True if any unit made progress."""
+        any_progress = False
+        for unit_key in list(self._live_runners.keys()):
+            entry = self._live_runners.get(unit_key)
+            if entry is None:
+                continue
+            runner, instance, unit = entry
+            verdict = self._check_unit(runner, instance, unit)
+            if verdict in ("completed", "preempted"):
+                any_progress = True
+        return any_progress
 
     def _check_unit(
         self,
