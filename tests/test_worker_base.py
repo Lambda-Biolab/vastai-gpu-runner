@@ -165,3 +165,59 @@ class TestBaseWorker:
             with patch("urllib.request.urlopen", mock_urlopen):
                 worker.self_destruct()
             assert not mock_urlopen.called
+
+    def test_main_self_destruct_on_workload_exception(self, tmp_path: Path) -> None:
+        """run_workload() raising MUST still trigger self_destruct.
+
+        Regression test for the bug where an uncaught exception in any
+        subclass's run_workload() would leak a running Vast.ai instance
+        and keep billing indefinitely.
+        """
+
+        class RaisingWorker(BaseWorker):
+            def run_workload(self) -> int:
+                raise RuntimeError("boom")
+
+        worker = RaisingWorker(tmp_path)
+        destroy_calls: list[str] = []
+        with (
+            patch.object(worker, "write_pid"),
+            patch("vastai_gpu_runner.worker.base.check_gpu", return_value=True),
+            patch.object(worker, "_check_r2", return_value=True),
+            patch.object(worker, "self_destruct", side_effect=lambda: destroy_calls.append("x")),
+        ):
+            code = worker.main()
+
+        assert code == 1
+        assert destroy_calls == ["x"], "self_destruct must run in finally after exception"
+        assert (tmp_path / "worker.exitcode").read_text() == "1"
+        assert (tmp_path / "worker.completed").read_text() == "0"
+
+    def test_main_self_destruct_on_gpu_failure(self, tmp_path: Path) -> None:
+        """GPU check failure MUST still trigger self_destruct."""
+        worker = ConcreteWorker(tmp_path)
+        destroy_calls: list[str] = []
+        with (
+            patch.object(worker, "write_pid"),
+            patch("vastai_gpu_runner.worker.base.check_gpu", return_value=False),
+            patch.object(worker, "self_destruct", side_effect=lambda: destroy_calls.append("x")),
+        ):
+            code = worker.main()
+
+        assert code == 1
+        assert destroy_calls == ["x"]
+
+    def test_main_self_destruct_on_preflight_failure(self, tmp_path: Path) -> None:
+        """Preflight gate failure MUST still trigger self_destruct."""
+        worker = ConcreteWorker(tmp_path)
+        destroy_calls: list[str] = []
+        with (
+            patch.object(worker, "write_pid"),
+            patch("vastai_gpu_runner.worker.base.check_gpu", return_value=True),
+            patch.object(worker, "_check_r2", return_value=False),
+            patch.object(worker, "self_destruct", side_effect=lambda: destroy_calls.append("x")),
+        ):
+            code = worker.main()
+
+        assert code == 3
+        assert destroy_calls == ["x"]
