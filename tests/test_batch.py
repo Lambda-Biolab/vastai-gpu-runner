@@ -640,6 +640,149 @@ class TestZombieSweep:
 
 
 # ---------------------------------------------------------------------------
+# Parallel collect (max_parallel_collects)
+# ---------------------------------------------------------------------------
+
+
+class TestParallelCollect:
+    """Tests for the ``max_parallel_collects`` constructor arg + split hooks.
+
+    The hook exists so consumers with slow I/O-bound finalise steps (e.g.
+    rsync over SSH) can opt into concurrent collection when many units
+    complete around the same wall-clock time. Default (1) preserves
+    sequential semantics; tests below pin both paths.
+    """
+
+    def test_default_is_one_sequential(self) -> None:
+        """Default constructor: max_parallel_collects == 1."""
+        orch = FakeOrchestrator(
+            units=[],
+            runner_factory=_mock_runner_factory(deploy_result=_ok_deploy()),
+            label_prefix="test",
+        )
+        assert orch._max_parallel_collects == 1
+
+    def test_invalid_value_raises(self) -> None:
+        """max_parallel_collects < 1 is rejected at construction."""
+        with pytest.raises(ValueError, match="max_parallel_collects"):
+            FakeOrchestrator(
+                units=[],
+                runner_factory=_mock_runner_factory(deploy_result=_ok_deploy()),
+                label_prefix="test",
+                max_parallel_collects=0,
+            )
+
+    def test_classify_live_unit_is_pure_no_side_effects(self) -> None:
+        """_classify_live_unit must not mutate state or call destroy_instance.
+
+        This is the contract that makes parallel finalise safe: the classify
+        half is pure, so we can batch multiple units' classifications before
+        touching any state.
+        """
+        unit = FakeUnit(key="u1", status="deployed")
+        orch = FakeOrchestrator(
+            units=[unit],
+            runner_factory=_mock_runner_factory(deploy_result=_ok_deploy()),
+            label_prefix="test",
+        )
+        runner = MagicMock(spec=CloudRunner)
+        runner.check_progress = MagicMock(return_value={"complete": True, "running": False})
+        runner.destroy_instance = MagicMock(return_value=True)
+        instance = CloudInstance(instance_id="i1")
+        orch._live_runners[unit.key] = (runner, instance, unit)
+
+        verdict = orch._classify_live_unit(runner, instance, unit)
+
+        assert verdict == "terminal"
+        # No side effects: unit still "deployed", no collect called, no destroy.
+        assert unit.status == "deployed"
+        assert "u1" not in orch.collect_calls
+        runner.destroy_instance.assert_not_called()
+        assert unit.key in orch._live_runners
+
+    def test_classify_returns_preempted_without_destroying(self) -> None:
+        """Classify reports preempted but does NOT destroy — that's phase B."""
+        unit = FakeUnit(key="u1", status="deployed", instance_id="i1")
+        orch = FakeOrchestrator(
+            units=[unit],
+            runner_factory=_mock_runner_factory(deploy_result=_ok_deploy()),
+            label_prefix="test",
+        )
+        runner = MagicMock(spec=CloudRunner)
+        runner.check_progress = MagicMock(
+            return_value={"complete": False, "running": False, "worker_dead": True}
+        )
+        runner.destroy_instance = MagicMock(return_value=True)
+        instance = CloudInstance(instance_id="i1")
+        orch._live_runners[unit.key] = (runner, instance, unit)
+
+        verdict = orch._classify_live_unit(runner, instance, unit)
+
+        assert verdict == "preempted"
+        runner.destroy_instance.assert_not_called()  # destroy is phase B, not classify
+        assert unit.status == "deployed"  # state mutation is phase B too
+
+    def test_poll_cycle_finalises_multiple_terminal_units_in_parallel(self) -> None:
+        """3 units, all terminal in one cycle, max_parallel_collects=3.
+
+        All 3 must be finalised, all 3 collect_calls recorded, all 3 status
+        == "downloaded", all 3 destroy_instance calls made, no units left in
+        live_runners.
+        """
+        units = [FakeUnit(key=f"u{i}", status="deployed") for i in range(3)]
+        orch = FakeOrchestrator(
+            units=units,
+            runner_factory=_mock_runner_factory(deploy_result=_ok_deploy()),
+            label_prefix="test",
+            max_parallel_collects=3,
+        )
+        runners: list[MagicMock] = []
+        for u in units:
+            runner = MagicMock(spec=CloudRunner)
+            runner.check_progress = MagicMock(return_value={"complete": True, "running": False})
+            runner.destroy_instance = MagicMock(return_value=True)
+            instance = CloudInstance(instance_id=f"i-{u.key}")
+            orch._live_runners[u.key] = (runner, instance, u)
+            runners.append(runner)
+
+        any_progress = orch._poll_cycle_once()
+
+        assert any_progress is True
+        assert sorted(orch.collect_calls) == ["u0", "u1", "u2"]
+        assert all(u.status == "downloaded" for u in units)
+        for runner in runners:
+            runner.destroy_instance.assert_called_once()
+        assert not orch._live_runners  # all removed
+
+    def test_poll_cycle_sequential_when_max_parallel_is_one(self) -> None:
+        """max_parallel_collects=1 path: same 3 units, serial finalise.
+
+        Same observable outcome as the parallel path — the split doesn't
+        change semantics, only concurrency.
+        """
+        units = [FakeUnit(key=f"u{i}", status="deployed") for i in range(3)]
+        orch = FakeOrchestrator(
+            units=units,
+            runner_factory=_mock_runner_factory(deploy_result=_ok_deploy()),
+            label_prefix="test",
+            max_parallel_collects=1,
+        )
+        for u in units:
+            runner = MagicMock(spec=CloudRunner)
+            runner.check_progress = MagicMock(return_value={"complete": True, "running": False})
+            runner.destroy_instance = MagicMock(return_value=True)
+            instance = CloudInstance(instance_id=f"i-{u.key}")
+            orch._live_runners[u.key] = (runner, instance, u)
+
+        any_progress = orch._poll_cycle_once()
+
+        assert any_progress is True
+        assert orch.collect_calls == ["u0", "u1", "u2"]  # strict order
+        assert all(u.status == "downloaded" for u in units)
+        assert not orch._live_runners
+
+
+# ---------------------------------------------------------------------------
 # Sanity: ABC cannot be instantiated
 # ---------------------------------------------------------------------------
 
