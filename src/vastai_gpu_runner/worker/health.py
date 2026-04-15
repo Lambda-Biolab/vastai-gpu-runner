@@ -29,61 +29,88 @@ def check_gpu(*, min_memory_mib: int = 0, max_temp_c: int = 90) -> bool:
         True if GPU is healthy, False if worker should abort.
     """
     try:
-        # Query fields based on whether memory check is needed
-        fields = "temperature.gpu,ecc.errors.uncorrected.aggregate.total"
-        if min_memory_mib > 0:
-            fields = "temperature.gpu,memory.total,ecc.errors.uncorrected.aggregate.total"
-
-        result = subprocess.run(
-            [
-                "nvidia-smi",
-                f"--query-gpu={fields}",
-                "--format=csv,noheader,nounits",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-        parts = result.stdout.strip().split(",")
-
-        if min_memory_mib > 0 and len(parts) >= 3:
-            temp = int(parts[0].strip()) if parts[0].strip().isdigit() else 0
-            mem = int(parts[1].strip()) if parts[1].strip().isdigit() else 0
-            ecc = parts[2].strip()
-        elif len(parts) >= 2:
-            temp = int(parts[0].strip()) if parts[0].strip().isdigit() else 0
-            mem = 0
-            ecc = parts[1].strip()
-        else:
-            logger.warning("nvidia-smi returned unexpected output: %s", result.stdout)
-            return True  # Proceed on parse failure
-
-        if temp > max_temp_c:
-            logger.error("ABORT: GPU temp %dC > %dC limit", temp, max_temp_c)
-            return False
-
-        if min_memory_mib > 0 and mem < min_memory_mib:
-            logger.error("ABORT: GPU memory %d MiB < %d MiB minimum", mem, min_memory_mib)
-            return False
-
-        if ecc not in ("0", "N/A", "[N/A]", ""):
-            try:
-                if int(ecc) > 0:
-                    logger.error("ABORT: GPU ECC errors: %s", ecc)
-                    return False
-            except ValueError:
-                pass
-
-        if min_memory_mib > 0:
-            logger.info("GPU OK: temp=%dC mem=%d MiB ecc=%s", temp, mem, ecc)
-        else:
-            logger.info("GPU OK: temp=%dC ecc=%s", temp, ecc)
-        return True
-
+        parts = _query_nvidia_smi(min_memory_mib)
     except Exception as exc:
         logger.warning("GPU check failed (proceeding): %s", exc)
         return True
+
+    parsed = _parse_gpu_fields(parts, min_memory_mib)
+    if parsed is None:
+        return True  # Proceed on parse failure
+    temp, mem, ecc = parsed
+
+    if not _gpu_within_limits(temp, mem, ecc, min_memory_mib, max_temp_c):
+        return False
+
+    if min_memory_mib > 0:
+        logger.info("GPU OK: temp=%dC mem=%d MiB ecc=%s", temp, mem, ecc)
+    else:
+        logger.info("GPU OK: temp=%dC ecc=%s", temp, ecc)
+    return True
+
+
+def _query_nvidia_smi(min_memory_mib: int) -> list[str]:
+    """Run nvidia-smi once and return the comma-split query fields."""
+    fields = "temperature.gpu,ecc.errors.uncorrected.aggregate.total"
+    if min_memory_mib > 0:
+        fields = "temperature.gpu,memory.total,ecc.errors.uncorrected.aggregate.total"
+    result = subprocess.run(
+        ["nvidia-smi", f"--query-gpu={fields}", "--format=csv,noheader,nounits"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    return result.stdout.strip().split(",")
+
+
+def _parse_gpu_fields(
+    parts: list[str],
+    min_memory_mib: int,
+) -> tuple[int, int, str] | None:
+    """Parse nvidia-smi output. Returns (temp_c, mem_mib, ecc) or None on shape mismatch."""
+    if min_memory_mib > 0 and len(parts) >= 3:
+        return _safe_int(parts[0]), _safe_int(parts[1]), parts[2].strip()
+    if len(parts) >= 2:
+        return _safe_int(parts[0]), 0, parts[1].strip()
+    logger.warning("nvidia-smi returned unexpected output: %s", ",".join(parts))
+    return None
+
+
+def _safe_int(raw: str) -> int:
+    """Parse an integer field from nvidia-smi output, defaulting to 0."""
+    stripped = raw.strip()
+    return int(stripped) if stripped.isdigit() else 0
+
+
+def _gpu_within_limits(
+    temp: int,
+    mem: int,
+    ecc: str,
+    min_memory_mib: int,
+    max_temp_c: int,
+) -> bool:
+    """Return True if all GPU health limits pass; log and return False on first breach."""
+    if temp > max_temp_c:
+        logger.error("ABORT: GPU temp %dC > %dC limit", temp, max_temp_c)
+        return False
+    if min_memory_mib > 0 and mem < min_memory_mib:
+        logger.error("ABORT: GPU memory %d MiB < %d MiB minimum", mem, min_memory_mib)
+        return False
+    if _ecc_error_count(ecc) > 0:
+        logger.error("ABORT: GPU ECC errors: %s", ecc)
+        return False
+    return True
+
+
+def _ecc_error_count(ecc: str) -> int:
+    """Parse ECC error count. Unknown/NA values return 0 (treat as healthy)."""
+    if ecc in ("0", "N/A", "[N/A]", ""):
+        return 0
+    try:
+        return int(ecc)
+    except ValueError:
+        return 0
 
 
 def check_r2_connectivity(workspace: Path) -> bool:

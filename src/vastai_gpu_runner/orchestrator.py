@@ -78,63 +78,93 @@ def sweep_zombie_instances(
         return 0
 
     tracked_ids = {inst.instance_id for _, (_, inst) in live_runners.items()}
-
     killed = 0
     for inst in instances:
-        iid = str(inst.get("id", ""))
-        label = inst.get("label", "")
-        status = inst.get("cur_state", "")
-
-        if not label.startswith(label_prefix):
-            continue
-
-        if iid in tracked_ids and status == "running":
-            continue
-
-        # Check R2 before destroying stopped tracked instances
-        if iid in tracked_ids and status in ("stopped", "exited") and r2_sink and r2_batch_id:
-            try:
-                job_name = label.replace(label_prefix + "-", "", 1) if label_prefix in label else ""
-                if job_name and r2_sink.is_job_done(r2_batch_id, job_name):
-                    logger.info(
-                        "Zombie sweep: %s is stopped but R2 DONE — skipping",
-                        iid,
-                    )
-                    continue
-            except Exception:
-                logger.debug("R2 check failed for %s — proceeding with destroy", iid)
-
-        if status in ("stopped", "exited") or iid not in tracked_ids:
-            logger.info(
-                "Zombie sweep: destroying %s (status=%s, tracked=%s)",
-                iid,
-                status,
-                iid in tracked_ids,
-            )
-            try:
-                import requests
-
-                api_key = load_vastai_api_key()
-                if api_key:
-                    base = "https://console.vast.ai/api/v0/instances"
-                    hdrs = {"Authorization": f"Bearer {api_key}"}
-                    requests.put(
-                        f"{base}/{iid}/",
-                        headers={**hdrs, "Content-Type": "application/json"},
-                        json={"state": "stopped"},
-                        timeout=10,
-                    )
-                    time.sleep(1)
-                    requests.delete(f"{base}/{iid}/", headers=hdrs, timeout=10)
-                else:
-                    vastai_cmd(["destroy", "instance", iid], timeout=15)
-            except Exception as exc:
-                logger.warning("Zombie sweep: failed to destroy %s: %s", iid, exc)
+        if _is_zombie(inst, label_prefix, tracked_ids, r2_sink, r2_batch_id):
+            _destroy_zombie(str(inst.get("id", "")), inst.get("cur_state", ""), tracked_ids)
             killed += 1
-
     if killed:
         logger.info("Zombie sweep: destroyed %d instance(s)", killed)
     return killed
+
+
+def _is_zombie(
+    inst: dict[str, object],
+    label_prefix: str,
+    tracked_ids: set[str],
+    r2_sink: R2Sink | None,
+    r2_batch_id: str,
+) -> bool:
+    """Classify whether an instance should be destroyed by the sweep."""
+    iid = str(inst.get("id", ""))
+    label = str(inst.get("label", ""))
+    status = str(inst.get("cur_state", ""))
+
+    if not label.startswith(label_prefix):
+        return False
+    if iid in tracked_ids and status == "running":
+        return False
+    if _r2_says_done(iid, label, label_prefix, status, tracked_ids, r2_sink, r2_batch_id):
+        return False
+    return status in ("stopped", "exited") or iid not in tracked_ids
+
+
+def _r2_says_done(
+    iid: str,
+    label: str,
+    label_prefix: str,
+    status: str,
+    tracked_ids: set[str],
+    r2_sink: R2Sink | None,
+    r2_batch_id: str,
+) -> bool:
+    """Return True if R2 has a DONE marker that should spare a stopped tracked instance."""
+    if iid not in tracked_ids or status not in ("stopped", "exited"):
+        return False
+    if r2_sink is None or not r2_batch_id:
+        return False
+    try:
+        job_name = label.replace(label_prefix + "-", "", 1) if label_prefix in label else ""
+        if job_name and r2_sink.is_job_done(r2_batch_id, job_name):
+            logger.info("Zombie sweep: %s is stopped but R2 DONE — skipping", iid)
+            return True
+    except Exception:
+        logger.debug("R2 check failed for %s — proceeding with destroy", iid)
+    return False
+
+
+def _destroy_zombie(iid: str, status: str, tracked_ids: set[str]) -> None:
+    """Destroy one zombie instance via REST API (preferred) or CLI fallback."""
+    logger.info(
+        "Zombie sweep: destroying %s (status=%s, tracked=%s)",
+        iid,
+        status,
+        iid in tracked_ids,
+    )
+    try:
+        api_key = load_vastai_api_key()
+        if api_key:
+            _destroy_via_rest(iid, api_key)
+        else:
+            vastai_cmd(["destroy", "instance", iid], timeout=15)
+    except Exception as exc:
+        logger.warning("Zombie sweep: failed to destroy %s: %s", iid, exc)
+
+
+def _destroy_via_rest(iid: str, api_key: str) -> None:
+    """Stop-then-delete an instance via the Vast.ai REST API."""
+    import requests
+
+    base = "https://console.vast.ai/api/v0/instances"
+    hdrs = {"Authorization": f"Bearer {api_key}"}
+    requests.put(
+        f"{base}/{iid}/",
+        headers={**hdrs, "Content-Type": "application/json"},
+        json={"state": "stopped"},
+        timeout=10,
+    )
+    time.sleep(1)
+    requests.delete(f"{base}/{iid}/", headers=hdrs, timeout=10)
 
 
 def ensure_detached(

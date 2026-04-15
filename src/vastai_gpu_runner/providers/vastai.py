@@ -157,31 +157,43 @@ def verify_instance_ownership(
         )
         return False
 
+    inst = _find_instance(instances, instance_id)
+    if inst is None:
+        logger.info("Instance %s not found in account (already destroyed?)", instance_id)
+        return True
+    return _image_is_allowed(inst, instance_id, allowed_images)
+
+
+def _find_instance(
+    instances: list[dict[str, object]],
+    instance_id: str,
+) -> dict[str, object] | None:
+    """Find one instance by ID. Returns None if not present."""
     for inst in instances:
         if str(inst.get("id")) == str(instance_id):
-            image = str(inst.get("image_uuid", ""))
-            label = str(inst.get("label", ""))
+            return inst
+    return None
 
-            # Check image against allowlist
-            if image in allowed_images:
-                return True
 
-            # Check for image substring match (tags may vary)
-            if any(img.split(":")[0] in image for img in allowed_images):
-                return True
-
-            logger.error(
-                "BLOCKED: instance %s belongs to another project "
-                "(image=%s, label=%s). Will NOT destroy.",
-                instance_id,
-                image,
-                label,
-            )
-            return False
-
-    # Instance not found — may already be destroyed
-    logger.info("Instance %s not found in account (already destroyed?)", instance_id)
-    return True
+def _image_is_allowed(
+    inst: dict[str, object],
+    instance_id: str,
+    allowed_images: frozenset[str],
+) -> bool:
+    """Return True if the instance's image matches the allowlist."""
+    image = str(inst.get("image_uuid", ""))
+    label = str(inst.get("label", ""))
+    if image in allowed_images:
+        return True
+    if any(img.split(":")[0] in image for img in allowed_images):
+        return True
+    logger.error(
+        "BLOCKED: instance %s belongs to another project (image=%s, label=%s). Will NOT destroy.",
+        instance_id,
+        image,
+        label,
+    )
+    return False
 
 
 class VastaiRunner(CloudRunner):
@@ -513,81 +525,87 @@ class VastaiRunner(CloudRunner):
         return True
 
     def _rest_destroy(self, instance: CloudInstance) -> None:
-        """Force-destroy via REST API (handles stuck/resurrected instances)."""
+        """Force-destroy via REST API (handles stuck/resurrected instances).
+
+        Four-step flow: read api key → force-stop → DELETE up to 3 times →
+        verify and re-destroy if resurrected.
+        """
+        api_key = _read_vastai_api_key()
+        if not api_key:
+            return
         try:
-            from pathlib import Path as _Path
-
-            import requests
-
-            key_paths = [
-                _Path("~/.config/vastai/vast_api_key").expanduser(),
-                _Path("~/.vast_api_key").expanduser(),
-            ]
-            api_key = ""
-            for kp in key_paths:
-                if kp.exists():
-                    api_key = kp.read_text().strip()
-                    break
-            if not api_key:
-                return
-
-            base = "https://console.vast.ai/api/v0/instances"
             hdrs = {"Authorization": f"Bearer {api_key}"}
-
-            # Step 1: Force-stop (kills Docker pull on still-loading instances)
-            requests.put(
-                f"{base}/{instance.instance_id}/",
-                headers={**hdrs, "Content-Type": "application/json"},
-                json={"state": "stopped"},
-                timeout=10,
-            )
-            time.sleep(2)
-
-            # Step 2: DELETE up to 3 times
-            for del_attempt in range(3):
-                resp = requests.delete(
-                    f"{base}/{instance.instance_id}/",
-                    headers=hdrs,
-                    timeout=15,
-                )
-                if resp.status_code in (200, 204, 404):
-                    logger.info("REST DELETE %s: %d", instance.instance_id, resp.status_code)
-                    break
-                logger.warning(
-                    "REST DELETE %s returned %d (attempt %d/3)",
-                    instance.instance_id,
-                    resp.status_code,
-                    del_attempt + 1,
-                )
-                if del_attempt < 2:
-                    time.sleep(3)
-
-            # Step 3: Verify after 5s
-            time.sleep(5)
-            verify = requests.get(
-                f"{base}/{instance.instance_id}/",
-                headers=hdrs,
-                timeout=10,
-            )
-            if verify.status_code == 200:
-                vstatus = verify.json().get("actual_status", "")
-                if vstatus not in ("", "destroyed"):
-                    logger.warning(
-                        "Instance %s resurrected as '%s' — sending stop+delete again",
-                        instance.instance_id,
-                        vstatus,
-                    )
-                    requests.put(
-                        f"{base}/{instance.instance_id}/",
-                        headers={**hdrs, "Content-Type": "application/json"},
-                        json={"state": "stopped"},
-                        timeout=10,
-                    )
-                    time.sleep(3)
-                    requests.delete(
-                        f"{base}/{instance.instance_id}/",
-                        headers=hdrs,
-                        timeout=10,
-                    )
+            _rest_stop(instance.instance_id, hdrs)
+            _rest_delete_with_retries(instance.instance_id, hdrs)
+            _rest_verify_and_redestroy(instance.instance_id, hdrs)
         except Exception as exc:
             logger.warning("REST destroy failed for %s: %s", instance.instance_id, exc)
+
+
+def _read_vastai_api_key() -> str:
+    """Read the Vast.ai API key from the standard config paths."""
+    from pathlib import Path as _Path
+
+    for kp in (
+        _Path("~/.config/vastai/vast_api_key").expanduser(),
+        _Path("~/.vast_api_key").expanduser(),
+    ):
+        if kp.exists():
+            return kp.read_text().strip()
+    return ""
+
+
+def _rest_stop(instance_id: str, hdrs: dict[str, str]) -> None:
+    """Force-stop an instance via the Vast.ai REST API (kills stuck Docker pulls)."""
+    import requests
+
+    base = "https://console.vast.ai/api/v0/instances"
+    requests.put(
+        f"{base}/{instance_id}/",
+        headers={**hdrs, "Content-Type": "application/json"},
+        json={"state": "stopped"},
+        timeout=10,
+    )
+    time.sleep(2)
+
+
+def _rest_delete_with_retries(instance_id: str, hdrs: dict[str, str]) -> None:
+    """DELETE an instance up to 3 times, pausing 3s between attempts."""
+    import requests
+
+    base = "https://console.vast.ai/api/v0/instances"
+    for del_attempt in range(3):
+        resp = requests.delete(f"{base}/{instance_id}/", headers=hdrs, timeout=15)
+        if resp.status_code in (200, 204, 404):
+            logger.info("REST DELETE %s: %d", instance_id, resp.status_code)
+            return
+        logger.warning(
+            "REST DELETE %s returned %d (attempt %d/3)",
+            instance_id,
+            resp.status_code,
+            del_attempt + 1,
+        )
+        if del_attempt < 2:
+            time.sleep(3)
+
+
+def _rest_verify_and_redestroy(instance_id: str, hdrs: dict[str, str]) -> None:
+    """Wait 5s, then re-destroy if the instance was resurrected."""
+    import requests
+
+    base = "https://console.vast.ai/api/v0/instances"
+    time.sleep(5)
+    verify = requests.get(f"{base}/{instance_id}/", headers=hdrs, timeout=10)
+    if verify.status_code != 200:
+        return
+    vstatus = verify.json().get("actual_status", "")
+    if vstatus in ("", "destroyed"):
+        return
+    logger.warning(
+        "Instance %s resurrected as '%s' — sending stop+delete again",
+        instance_id,
+        vstatus,
+    )
+    _rest_stop(instance_id, hdrs)
+    time.sleep(3)
+    requests.delete(f"{base}/{instance_id}/", headers=hdrs, timeout=10)
