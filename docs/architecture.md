@@ -11,6 +11,7 @@ vastai_gpu_runner/
     ssh.py                # ssh_cmd, scp_upload, scp_download
     state.py              # BatchState/ShardState + JobState/JobBatchState
     orchestrator.py       # sweep_zombies, ensure_detached, check_budget
+    batch.py              # BatchOrchestrator ABC — deploy/poll/collect lifecycle
     providers/
         vastai.py         # VastaiRunner — Vast.ai marketplace implementation
     storage/
@@ -29,7 +30,9 @@ vastai_gpu_runner/
 ┌─────────────────────────────────────────────────┐
 │  CLI (cli.py)                                   │  User-facing commands
 ├─────────────────────────────────────────────────┤
-│  Orchestrator (orchestrator.py)                 │  Zombie sweep, detach, budget
+│  BatchOrchestrator (batch.py)                   │  Deploy/poll/collect many units
+├─────────────────────────────────────────────────┤
+│  Orchestrator utils (orchestrator.py)           │  Zombie sweep, detach, budget
 ├─────────────────────────────────────────────────┤
 │  CloudRunner (runner.py)                        │  Provider-agnostic lifecycle
 ├─────────────────────────────────────────────────┤
@@ -68,6 +71,14 @@ class MyR2Sink(R2Sink):
 ### Atomic state persistence
 
 `BatchState.save()` writes to a temp file then renames. This guarantees the state file is never corrupt — even if the process crashes mid-write, the previous state file is intact.
+
+### Consumer-owned state, orchestrator-driven events
+
+`BatchOrchestrator` never mutates the consumer's `BatchState` / `JobBatchState` directly. Instead, it drives events (`on_unit_deployed`, `on_unit_failed`, `on_unit_completed`, `on_unit_preempted`) and the consumer updates its own fields, status strings, and retry counters. This keeps status-string vocabulary, retry accounting, and persistence format entirely in the consumer — so Boltz-2 and OpenMM can share the orchestration loop without sharing a state schema.
+
+### R2-first poll loop
+
+When an R2 sink is configured, the poll loop checks `unit_is_done_in_r2` *before* any SSH call. This matters in two places: (1) healthy-path completion detection is cheaper and works even if the SSH channel is flaky, and (2) when silent-crash detection fires (`worker_dead`), we re-check R2 one more time before treating the unit as preempted — the worker may have uploaded results and then died between the first R2 check and the SSH probe. Without the re-check, successful-but-crashed workers get unnecessarily re-deployed.
 
 ### SSH hardening
 

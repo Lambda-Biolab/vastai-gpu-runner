@@ -115,7 +115,65 @@ Status flow: `pending` -> `deploying` -> `running` -> `completed` -> `downloaded
 | `check_gpu(min_memory_mib=0, max_temp_c=90)` | `bool` | nvidia-smi temp + ECC + optional VRAM check |
 | `check_r2_connectivity(workspace)` | `bool` | Run `r2_upload.py --check` if script exists |
 
-## Orchestrator (`vastai_gpu_runner.orchestrator`)
+## Batch orchestrator (`vastai_gpu_runner.batch`)
+
+`BatchOrchestrator[UnitT]` is the template-method ABC that coordinates deploy → poll → collect → cleanup across many units in parallel. Sits one layer above `CloudRunner`. Generic over unit type (`ShardState` or `JobState`).
+
+| Constructor parameter | Type | Default | Description |
+|-----------------------|------|---------|-------------|
+| `runner_factory` | `Callable[[], CloudRunner]` | required | Fresh `CloudRunner` per deploy attempt |
+| `label_prefix` | `str` | required | Instance label prefix for zombie-sweep filtering (unique per batch) |
+| `workspace_dir` | `str` | `"/workspace"` | Remote workspace path |
+| `r2_sink` | `R2Sink \| None` | `None` | Optional R2 sink for DONE-marker polling + recovery |
+| `r2_batch_id` | `str` | `""` | Batch ID for R2 marker lookups |
+| `budget_usd` | `float` | `0.0` | Hard cost ceiling (`0` disables) |
+| `max_retries` | `int` | `2` | Max re-deploys per unit on preemption |
+| `max_parallel_deploys` | `int` | `16` | Concurrent deploy threads |
+| `poll_interval_seconds` | `int` | `30` | Base poll cadence (exponential backoff) |
+| `zombie_sweep_every_n_cycles` | `int` | `5` | Run zombie sweep every N poll cycles |
+| `poll_timeout_seconds` | `float` | `0.0` | Hard poll deadline (`0` = no timeout) |
+
+### Domain hooks (subclasses must implement)
+
+| Method | Returns | Purpose |
+|--------|---------|---------|
+| `iter_pending_units()` | `Iterable[UnitT]` | Units to deploy |
+| `iter_active_units()` | `Iterable[UnitT]` | Units to poll |
+| `iter_failed_units()` | `Iterable[UnitT]` | Candidates for R2 recovery |
+| `iter_completed_units()` | `Iterable[UnitT]` | Terminal — skipped |
+| `save_state()` | `None` | Persist batch state atomically |
+| `unit_key(unit)` | `str` | Stable unique identifier |
+| `unit_label(unit)` | `str` | Human-readable label for logs |
+| `build_unit_payload(unit)` | `dict[str, Path]` | Files to upload |
+| `reconstruct_instance(unit)` | `CloudInstance` | Rebuild from persisted fields (resume) |
+| `collect_unit_results(unit, instance)` | `bool` | Download artifacts |
+| `unit_is_done_in_r2(unit)` | `bool` | R2 DONE marker check |
+| `classify_failure(unit, error)` | `"retry" \| "fatal"` | Retryable or permanent |
+
+### State-mutation event callbacks (subclasses must implement)
+
+| Method | Purpose |
+|--------|---------|
+| `on_unit_deployed(unit, instance)` | Set instance fields + status=deployed, save |
+| `on_unit_failed(unit, reason)` | Set status=failed, bump retry, save |
+| `on_unit_completed(unit)` | Set status=downloaded, save |
+| `on_unit_preempted(unit)` | Reset instance_id, status=pending, save |
+
+### Inherited lifecycle
+
+| Method | Description |
+|--------|-------------|
+| `run()` | Entry point: resume → deploy → sweep → poll → collect → cleanup |
+| `_resume_from_state()` | Rebuild live-runner map from persisted active units |
+| `_deploy_phase()` | Parallel deploy via `ThreadPoolExecutor` |
+| `_poll_phase()` | R2-first poll loop with exponential backoff |
+| `_check_unit(runner, instance, unit)` | Single-unit progress check with 3-layer rescue |
+| `_collect_phase()` | R2 recovery for failed-but-uploaded units |
+| `_cleanup_phase()` | Destroy leftover instances + final zombie sweep |
+| `_handle_instance_loss(unit, key, reason)` | Mark preempted; enforces `max_retries` cap |
+| `_sweep_zombies()` | Delegates to `orchestrator.sweep_zombie_instances` |
+
+## Orchestrator utils (`vastai_gpu_runner.orchestrator`)
 
 | Function | Returns | Description |
 |----------|---------|-------------|
