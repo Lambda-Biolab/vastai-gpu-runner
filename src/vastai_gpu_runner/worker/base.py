@@ -59,34 +59,46 @@ class BaseWorker(ABC):
 
         Returns:
             Exit code (0 = success, 1 = workload failure, 3 = preflight gate).
+
+        Self-destruct always runs on exit, including when ``run_workload`` or
+        any earlier step raises an uncaught exception. Without this
+        guarantee, a subclass bug would leak a running Vast.ai instance and
+        keep billing indefinitely.
         """
-        os.chdir(self.workspace)
-        self.write_pid()
+        try:
+            os.chdir(self.workspace)
+            self.write_pid()
 
-        if not check_gpu(
-            min_memory_mib=self.min_gpu_memory_mib,
-            max_temp_c=self.max_gpu_temp_c,
-        ):
+            if not check_gpu(
+                min_memory_mib=self.min_gpu_memory_mib,
+                max_temp_c=self.max_gpu_temp_c,
+            ):
+                self._write_exit(1)
+                return 1
+
+            for gate in self.preflight_gates():
+                if not gate():
+                    gate_name = getattr(gate, "__name__", str(gate))
+                    logger.error("Preflight gate failed: %s", gate_name)
+                    self._write_exit(3)
+                    return 3
+
+            exit_code = self.run_workload()
+
+            self._write_exit(exit_code)
+            self._write_completed(exit_code == 0)
+
+            if exit_code == 0:
+                self.upload_results()
+
+            return exit_code
+        except Exception:
+            logger.exception("Unhandled exception in worker main()")
             self._write_exit(1)
+            self._write_completed(success=False)
             return 1
-
-        for gate in self.preflight_gates():
-            if not gate():
-                gate_name = getattr(gate, "__name__", str(gate))
-                logger.error("Preflight gate failed: %s", gate_name)
-                self._write_exit(3)
-                return 3
-
-        exit_code = self.run_workload()
-
-        self._write_exit(exit_code)
-        self._write_completed(exit_code == 0)
-
-        if exit_code == 0:
-            self.upload_results()
-
-        self.self_destruct()
-        return exit_code
+        finally:
+            self.self_destruct()
 
     # -- Hooks (override in subclasses) ------------------------------------
 
