@@ -159,3 +159,127 @@ class InferenceWorker(BaseWorker):
                 timeout=300, check=False,
             )
 ```
+
+## Building a batch orchestrator
+
+`BatchOrchestrator[UnitT]` is the template-method ABC above `CloudRunner`. Subclass it when you need to deploy many GPU units in parallel with crash-recovery checkpoints, R2-first polling, preemption handling, and per-unit retry accounting. The ABC handles the lifecycle loop; you provide the domain hooks over your own batch-state type (`ShardState` or `JobState`).
+
+```python
+from collections.abc import Iterable
+from pathlib import Path
+from typing import Literal
+
+from vastai_gpu_runner import BatchOrchestrator, CloudRunner
+from vastai_gpu_runner.providers.vastai import VastaiRunner
+from vastai_gpu_runner.state import BatchState, ShardState
+from vastai_gpu_runner.storage.r2 import R2Sink
+from vastai_gpu_runner.types import CloudInstance, DeploymentConfig
+
+
+class MyShardOrchestrator(BatchOrchestrator[ShardState]):
+    """Orchestrator over a shard-based BatchState."""
+
+    def __init__(
+        self,
+        state: BatchState,
+        state_path: Path,
+        output_dir: Path,
+        shard_inputs: dict[int, dict[str, Path]],
+        r2_sink: R2Sink,
+    ) -> None:
+        self._state = state
+        self._state_path = state_path
+        self._output_dir = output_dir
+        self._shard_inputs = shard_inputs
+        super().__init__(
+            runner_factory=lambda: VastaiRunner(DeploymentConfig()),
+            label_prefix=f"myproject-{state.batch_id[:8]}",
+            r2_sink=r2_sink,
+            r2_batch_id=state.batch_id,
+            budget_usd=50.0,
+            max_retries=2,
+        )
+
+    # -- State iteration ---------------------------------------------------
+
+    def iter_pending_units(self) -> Iterable[ShardState]:
+        return list(self._state.pending_shards)
+
+    def iter_active_units(self) -> Iterable[ShardState]:
+        return list(self._state.active_shards)
+
+    def iter_failed_units(self) -> Iterable[ShardState]:
+        return list(self._state.failed_shards)
+
+    def iter_completed_units(self) -> Iterable[ShardState]:
+        return list(self._state.downloaded_shards)
+
+    def save_state(self) -> None:
+        self._state.save(self._state_path)
+
+    def unit_key(self, unit: ShardState) -> str:
+        return str(unit.shard_id)
+
+    def unit_label(self, unit: ShardState) -> str:
+        return f"shard-{unit.shard_id}"
+
+    # -- Domain hooks ------------------------------------------------------
+
+    def build_unit_payload(self, unit: ShardState) -> dict[str, Path]:
+        return self._shard_inputs[unit.shard_id]
+
+    def reconstruct_instance(self, unit: ShardState) -> CloudInstance:
+        return CloudInstance(
+            instance_id=unit.instance_id,
+            ssh_host=unit.ssh_host,
+            ssh_port=unit.ssh_port,
+            cost_per_hour=unit.cost_per_hour,
+        )
+
+    def collect_unit_results(self, unit: ShardState, instance: CloudInstance) -> bool:
+        local = self._output_dir / f"shard_{unit.shard_id}"
+        # Consumer decides whether to use rsync, R2, or a hybrid.
+        return bool(self._r2_sink and self._r2_sink.download_shard(
+            self._state.batch_id, unit.shard_id, local,
+        ))
+
+    def unit_is_done_in_r2(self, unit: ShardState) -> bool:
+        if not self._r2_sink:
+            return False
+        return self._r2_sink.is_shard_done(self._state.batch_id, unit.shard_id)
+
+    def classify_failure(self, unit: ShardState, error: str) -> Literal["retry", "fatal"]:
+        if "input file missing" in error or "preflight" in error:
+            return "fatal"
+        return "retry"
+
+    # -- Event callbacks ---------------------------------------------------
+
+    def on_unit_deployed(self, unit: ShardState, instance: CloudInstance) -> None:
+        unit.instance_id = instance.instance_id
+        unit.ssh_host = instance.ssh_host
+        unit.ssh_port = instance.ssh_port
+        unit.cost_per_hour = instance.cost_per_hour
+        unit.status = "deployed"
+        self.save_state()
+
+    def on_unit_failed(self, unit: ShardState, reason: str) -> None:
+        unit.status = "failed"
+        unit.failure_reason = reason
+        unit.retry_count += 1
+        self.save_state()
+
+    def on_unit_completed(self, unit: ShardState) -> None:
+        unit.status = "downloaded"
+        self.save_state()
+
+    def on_unit_preempted(self, unit: ShardState) -> None:
+        unit.instance_id = ""
+        unit.status = "pending"
+        unit.retry_count += 1
+        self.save_state()
+```
+
+Call `orch.run()` to drive the full lifecycle. Everything else — parallel deploys, exponential-backoff polling, zombie sweeps, budget enforcement, R2-first completion checks, silent-crash detection, `max_retries` enforcement — is inherited.
+
+The same pattern works for job-based workloads: substitute `JobState` for `ShardState`, iterate over `JobBatchState.pending_jobs` / `.active_jobs` / `.completed_jobs`, and map `on_unit_completed` to `status="completed"` or `"downloaded"` to match your persistence format.

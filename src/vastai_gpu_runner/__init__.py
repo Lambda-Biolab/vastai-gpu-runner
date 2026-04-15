@@ -37,6 +37,7 @@ Public API::
     )
 """
 
+from vastai_gpu_runner.batch import BatchOrchestrator, BatchUnit, FailureVerdict
 from vastai_gpu_runner.runner import CloudRunner
 from vastai_gpu_runner.types import (
     CloudInstance,
@@ -48,11 +49,14 @@ from vastai_gpu_runner.types import (
 )
 
 __all__ = [
+    "BatchOrchestrator",
+    "BatchUnit",
     "CloudInstance",
     "CloudRunner",
     "ComputeMode",
     "DeploymentConfig",
     "DeploymentResult",
+    "FailureVerdict",
     "InstanceStatus",
     "Provider",
 ]
