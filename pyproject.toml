@@ -22,6 +22,8 @@ dev = [
     "pytest>=8.0",
     "pytest-cov",
     "hypothesis>=6.100",
+    "complexipy>=3.0",
+    "bump-my-version>=0.25",
 ]
 
 [build-system]
@@ -51,17 +53,25 @@ select = [
     "B",   # flake8-bugbear
     "S",   # flake8-bandit
     "D",   # pydocstyle
+    "SIM", # flake8-simplify
+    "PT",  # flake8-pytest-style
+    "TC", # flake8-type-checking
+    "PGH", # pygrep-hooks
     "RUF", # ruff-specific
 ]
 ignore = [
-    "D100",  # missing module docstring (too noisy for __init__)
-    "D104",  # missing public package docstring
-    "S603",  # subprocess call with shell=False (intentional)
-    "S607",  # partial executable path (intentional for CLI tools)
+    "D100",   # missing module docstring (too noisy for __init__)
+    "D104",   # missing public package docstring
+    "S603",   # subprocess call with shell=False (intentional)
+    "S607",   # partial executable path (intentional for CLI tools)
+    "SIM108", # use ternary (often less readable)
+    "TC001", # first-party import in TYPE_CHECKING block (readability)
+    "TC002", # third-party import in TYPE_CHECKING block (readability)
+    "TC003", # stdlib import in TYPE_CHECKING block (readability)
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["D", "S101", "S108", "ANN"]
+"tests/**" = ["D", "S101", "S108", "ANN", "PT011"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
@@ -69,9 +79,58 @@ convention = "google"
 # --- Pyright ---
 [tool.pyright]
 pythonVersion = "3.11"
-typeCheckingMode = "basic"
+typeCheckingMode = "strict"
 include = ["src"]
+useLibraryCodeForTypes = false
+reportMissingTypeStubs = false
+reportUnknownMemberType = "none"
+reportUnknownVariableType = "none"
+reportUnknownParameterType = "none"
+reportUnknownArgumentType = "none"
+reportUnknownLambdaType = "none"
+reportMissingTypeArgument = "none"
+
+# --- Complexipy ---
+[tool.complexipy]
+max-complexity-allowed = 10
 
 # --- Pytest ---
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "--strict-markers"
+
+# --- Coverage ---
+[tool.coverage.run]
+source = ["src/vastai_gpu_runner"]
+branch = true
+omit = [
+    "src/vastai_gpu_runner/cli.py",  # Typer CLI — thin layer, integration-tested
+]
+
+[tool.coverage.report]
+# No fail_under yet — baseline is 41%. Ratchet upward after
+# storage/r2, providers/vastai, and orchestrator gain integration tests.
+show_missing = true
+skip_covered = false
+exclude_also = [
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "pragma: no cover",
+]
+
+# --- bump-my-version ---
+[tool.bumpversion]
+current_version = "0.1.0"
+parse = "(?P<major>\\d+)\\.(?P<minor>\\d+)\\.(?P<patch>\\d+)"
+serialize = ["{major}.{minor}.{patch}"]
+search = "{current_version}"
+replace = "{new_version}"
+commit = true
+tag = true
+tag_name = "v{new_version}"
+message = "chore: bump version {current_version} → {new_version}"
+
+[[tool.bumpversion.files]]
+filename = "pyproject.toml"
+search = 'version = "{current_version}"'
+replace = 'version = "{new_version}"'

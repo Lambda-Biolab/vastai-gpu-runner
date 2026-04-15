@@ -18,6 +18,7 @@ from vastai_gpu_runner.types import CloudInstance, DeploymentConfig, DeploymentR
 
 if TYPE_CHECKING:
     import threading
+    from collections.abc import Callable
     from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -124,6 +125,7 @@ class CloudRunner:
         Returns:
             DeploymentResult with success status, instance, and any error.
         """
+        del local_output_dir  # reserved for future use
         if offers is None:
             offers = self.search_offers()
         if not offers:
@@ -133,60 +135,82 @@ class CloudRunner:
         for attempt in range(max_retries):
             if attempt >= len(offers):
                 break
-
             offer = offers[attempt]
             machine_id = str(offer.get("machine_id", ""))
-
-            # Skip machines already claimed by other threads
             if used_machine_ids and machine_id in used_machine_ids:
                 continue
-
-            instance: CloudInstance | None = None
-            try:
-                instance = self.create_instance(offer)
-                if not self.wait_for_boot(instance):
-                    last_error = f"Boot timeout (attempt {attempt + 1})"
-                    self.destroy_instance(instance)
-                    continue
-
-                if not self.verify_gpu(instance):
-                    last_error = f"GPU verification failed (attempt {attempt + 1})"
-                    self.destroy_instance(instance)
-                    continue
-
-                if not self.deploy_files(instance, files):
-                    last_error = f"File deploy failed (attempt {attempt + 1})"
-                    self.destroy_instance(instance)
-                    continue
-
-                if not self.setup_environment(instance):
-                    last_error = f"Environment setup failed (attempt {attempt + 1})"
-                    self.destroy_instance(instance)
-                    continue
-
-                if not self.launch_worker(instance):
-                    last_error = f"Worker launch failed (attempt {attempt + 1})"
-                    self.destroy_instance(instance)
-                    continue
-
-                # Register machine to prevent other threads from using it
-                if used_machine_ids is not None and machine_lock is not None:
-                    if hasattr(machine_lock, "__enter__"):
-                        with machine_lock:  # type: ignore[union-attr]
-                            used_machine_ids.add(machine_id)
-                    else:
-                        used_machine_ids.add(machine_id)
-
-                return DeploymentResult(success=True, instance=instance)
-
-            except Exception as exc:
-                last_error = f"Attempt {attempt + 1} failed: {exc}"
-                logger.warning("Deployment attempt %d failed: %s", attempt + 1, exc)
-                if instance:
-                    with contextlib.suppress(Exception):
-                        self.destroy_instance(instance)
+            result, error = self._try_one_offer(offer, files, attempt)
+            if result is not None:
+                self._claim_machine(machine_id, used_machine_ids, machine_lock)
+                return result
+            last_error = error
 
         return DeploymentResult(success=False, error=last_error)
+
+    def _try_one_offer(
+        self,
+        offer: dict[str, object],
+        files: dict[str, Path],
+        attempt: int,
+    ) -> tuple[DeploymentResult | None, str]:
+        """Run the lifecycle on one offer. Returns (result, error).
+
+        ``result`` is a successful ``DeploymentResult`` or ``None`` if the
+        attempt failed (caller should try the next offer). ``error`` is the
+        human-readable failure reason to record when ``result`` is ``None``.
+        """
+        instance: CloudInstance | None = None
+        try:
+            instance = self.create_instance(offer)
+            error = self._run_gate_chain(instance, files, attempt)
+            if error:
+                self.destroy_instance(instance)
+                return None, error
+            return DeploymentResult(success=True, instance=instance), ""
+        except Exception as exc:
+            err = f"Attempt {attempt + 1} failed: {exc}"
+            logger.warning("Deployment attempt %d failed: %s", attempt + 1, exc)
+            if instance:
+                with contextlib.suppress(Exception):
+                    self.destroy_instance(instance)
+            return None, err
+
+    def _run_gate_chain(
+        self,
+        instance: CloudInstance,
+        files: dict[str, Path],
+        attempt: int,
+    ) -> str:
+        """Run boot -> verify -> deploy -> setup -> launch gates in order.
+
+        Returns empty string on success, or the first failing gate's error.
+        """
+        gates: list[tuple[Callable[[], bool], str]] = [
+            (lambda: self.wait_for_boot(instance), "Boot timeout"),
+            (lambda: self.verify_gpu(instance), "GPU verification failed"),
+            (lambda: self.deploy_files(instance, files), "File deploy failed"),
+            (lambda: self.setup_environment(instance), "Environment setup failed"),
+            (lambda: self.launch_worker(instance), "Worker launch failed"),
+        ]
+        for gate, label in gates:
+            if not gate():
+                return f"{label} (attempt {attempt + 1})"
+        return ""
+
+    @staticmethod
+    def _claim_machine(
+        machine_id: str,
+        used_machine_ids: set[str] | None,
+        machine_lock: threading.Lock | object | None,
+    ) -> None:
+        """Record a successfully deployed machine_id under the shared lock."""
+        if used_machine_ids is None:
+            return
+        if machine_lock is not None and hasattr(machine_lock, "__enter__"):
+            with machine_lock:  # type: ignore[union-attr]
+                used_machine_ids.add(machine_id)
+        else:
+            used_machine_ids.add(machine_id)
 
     def download_all_results(
         self,

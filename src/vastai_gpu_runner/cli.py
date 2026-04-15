@@ -52,56 +52,74 @@ def check(
     from rich.console import Console
 
     console = Console()
-    all_ok = True
+    vastai_ok = _check_vastai(console)
+    r2_ok = _check_r2(console, verbose=verbose)
 
-    # --- Vast.ai CLI ---
-    console.print("[bold]Vast.ai CLI[/bold]")
+    if vastai_ok and r2_ok:
+        console.print("\n[bold green]All checks passed.[/bold green]")
+        return
+    console.print("\n[bold red]Some checks failed.[/bold red]")
+    raise typer.Exit(1)
+
+
+def _check_vastai(console: object) -> bool:
+    """Run the Vast.ai API key check. Returns True on success."""
+    from vastai_gpu_runner.providers.vastai import vastai_cmd
+
+    console.print("[bold]Vast.ai CLI[/bold]")  # type: ignore[attr-defined]
     try:
-        from vastai_gpu_runner.providers.vastai import vastai_cmd
-
         raw = vastai_cmd(["show", "instances", "--raw"], timeout=15)
         instances = json.loads(raw)
-        console.print(f"  [green]OK[/green] — API key valid, {len(instances)} instance(s)")
     except RuntimeError as exc:
-        console.print(f"  [red]FAIL[/red] — {exc}")
-        all_ok = False
+        console.print(f"  [red]FAIL[/red] — {exc}")  # type: ignore[attr-defined]
+        return False
     except json.JSONDecodeError:
-        console.print("  [red]FAIL[/red] — API returned invalid JSON")
-        all_ok = False
+        console.print("  [red]FAIL[/red] — API returned invalid JSON")  # type: ignore[attr-defined]
+        return False
+    console.print(  # type: ignore[attr-defined]
+        f"  [green]OK[/green] — API key valid, {len(instances)} instance(s)",
+    )
+    return True
 
-    # --- R2 credentials ---
-    console.print("[bold]R2 Storage[/bold]")
+
+def _check_r2(console: object, *, verbose: bool) -> bool:
+    """Run the R2 credentials + connectivity check. Returns True on success."""
+    console.print("[bold]R2 Storage[/bold]")  # type: ignore[attr-defined]
+    env = _resolve_r2_endpoint(console)
+    if env is None:
+        return False
     try:
-        from vastai_gpu_runner.storage.r2 import get_r2_client, load_r2_env
-
-        env = load_r2_env()
-        if not env.get("R2_ENDPOINT"):
-            import os
-
-            if os.environ.get("R2_ENDPOINT"):
-                env["R2_ENDPOINT"] = os.environ["R2_ENDPOINT"]
-            else:
-                console.print("  [red]FAIL[/red] — R2_ENDPOINT not set in ~/.cloud-credentials")
-                all_ok = False
-                raise typer.Exit(1)
+        from vastai_gpu_runner.storage.r2 import get_r2_client
 
         client = get_r2_client()
-        # Try a lightweight operation to verify connectivity
         client.list_objects_v2(Bucket="dv-results", MaxKeys=1)
-        console.print("  [green]OK[/green] — R2 reachable")
-        if verbose:
-            console.print(f"    Endpoint: {env.get('R2_ENDPOINT', 'N/A')}")
     except Exception as exc:
-        if "FAIL" not in str(exc):
-            console.print(f"  [red]FAIL[/red] — {exc}")
-        all_ok = False
+        console.print(f"  [red]FAIL[/red] — {exc}")  # type: ignore[attr-defined]
+        return False
+    console.print("  [green]OK[/green] — R2 reachable")  # type: ignore[attr-defined]
+    if verbose:
+        console.print(  # type: ignore[attr-defined]
+            f"    Endpoint: {env.get('R2_ENDPOINT', 'N/A')}",
+        )
+    return True
 
-    # --- Summary ---
-    if all_ok:
-        console.print("\n[bold green]All checks passed.[/bold green]")
-    else:
-        console.print("\n[bold red]Some checks failed.[/bold red]")
-        raise typer.Exit(1)
+
+def _resolve_r2_endpoint(console: object) -> dict[str, str] | None:
+    """Resolve R2 endpoint from config file, falling back to env vars."""
+    import os
+
+    from vastai_gpu_runner.storage.r2 import load_r2_env
+
+    env = load_r2_env()
+    if env.get("R2_ENDPOINT"):
+        return env
+    if os.environ.get("R2_ENDPOINT"):
+        env["R2_ENDPOINT"] = os.environ["R2_ENDPOINT"]
+        return env
+    console.print(  # type: ignore[attr-defined]
+        "  [red]FAIL[/red] — R2_ENDPOINT not set in ~/.cloud-credentials",
+    )
+    return None
 
 
 # ---------------------------------------------------------------------------
