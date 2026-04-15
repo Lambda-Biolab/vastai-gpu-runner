@@ -67,7 +67,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING, Generic, Literal, Protocol, TypeVar
 
 from vastai_gpu_runner.orchestrator import check_budget, sweep_zombie_instances
@@ -268,34 +268,42 @@ class BatchOrchestrator(ABC, Generic[UnitT]):
         if not pending:
             logger.info("Deploy phase: no pending units")
             return
-
-        if self._budget_usd > 0 and not check_budget(0.0, self._budget_usd):
-            logger.error("Deploy phase: budget exceeded before deploy")
-            for unit in pending:
-                self.on_unit_failed(unit, "budget exceeded")
+        if not self._deploy_budget_ok(pending):
             return
 
         max_workers = min(self._max_parallel_deploys, len(pending))
-        logger.info(
-            "Deploy phase: %d unit(s) across %d worker(s)",
-            len(pending),
-            max_workers,
-        )
+        logger.info("Deploy phase: %d unit(s) across %d worker(s)", len(pending), max_workers)
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = {pool.submit(self._deploy_one, u): u for u in pending}
             for fut in as_completed(futures):
-                unit = futures[fut]
-                try:
-                    ok = fut.result()
-                except Exception as exc:
-                    logger.exception("Deploy %s raised: %s", self.unit_label(unit), exc)
-                    with self._state_lock:
-                        self.on_unit_failed(unit, f"deploy exception: {exc}")
-                    continue
-                if ok:
-                    logger.info("Deploy %s: success", self.unit_label(unit))
-                else:
-                    logger.warning("Deploy %s: failed", self.unit_label(unit))
+                self._handle_deploy_future(fut, futures[fut])
+
+    def _deploy_budget_ok(self, pending: list[UnitT]) -> bool:
+        """Pre-flight budget check. Marks all pending units failed if exceeded."""
+        if self._budget_usd <= 0 or check_budget(0.0, self._budget_usd):
+            return True
+        logger.error("Deploy phase: budget exceeded before deploy")
+        for unit in pending:
+            self.on_unit_failed(unit, "budget exceeded")
+        return False
+
+    def _handle_deploy_future(
+        self,
+        fut: Future[bool],
+        unit: UnitT,
+    ) -> None:
+        """Translate one deploy future into an event + log line."""
+        try:
+            ok = fut.result()
+        except Exception as exc:
+            logger.exception("Deploy %s raised: %s", self.unit_label(unit), exc)
+            with self._state_lock:
+                self.on_unit_failed(unit, f"deploy exception: {exc}")
+            return
+        if ok:
+            logger.info("Deploy %s: success", self.unit_label(unit))
+        else:
+            logger.warning("Deploy %s: failed", self.unit_label(unit))
 
     def _deploy_one(self, unit: UnitT) -> bool:
         """Deploy a single unit. Thread-safe via ``self._state_lock``."""
@@ -346,18 +354,36 @@ class BatchOrchestrator(ABC, Generic[UnitT]):
 
         while self._live_runners and time.time() < deadline:
             cycle += 1
-            if cycle % self._zombie_sweep_every_n_cycles == 0:
-                self._sweep_zombies()
-            if not self._poll_budget_ok():
+            if not self._poll_pre_iteration(cycle):
                 break
+            any_progress = self._poll_cycle_once()
+            cur_interval = self._advance_poll_interval(
+                any_progress, cur_interval, base, max_interval
+            )
 
-            any_made_progress = self._poll_cycle_once()
-            if any_made_progress:
-                cur_interval = min(base, 5)
-            else:
-                time.sleep(cur_interval)
-                cur_interval = min(cur_interval * 2, max_interval)
+        self._warn_on_poll_timeout(deadline)
 
+    def _poll_pre_iteration(self, cycle: int) -> bool:
+        """Run zombie sweep + budget check. Returns False to abort the loop."""
+        if cycle % self._zombie_sweep_every_n_cycles == 0:
+            self._sweep_zombies()
+        return self._poll_budget_ok()
+
+    @staticmethod
+    def _advance_poll_interval(
+        any_progress: bool,
+        cur_interval: int,
+        base: int,
+        max_interval: int,
+    ) -> int:
+        """Apply exponential backoff: reset on progress, else sleep + double up to cap."""
+        if any_progress:
+            return min(base, 5)
+        time.sleep(cur_interval)
+        return min(cur_interval * 2, max_interval)
+
+    def _warn_on_poll_timeout(self, deadline: float) -> None:
+        """Emit a warning if the poll loop exited on timeout with live units still active."""
         if time.time() >= deadline and self._live_runners:
             logger.warning(
                 "Poll phase: timeout after %.0fs with %d live units",
