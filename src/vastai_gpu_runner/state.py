@@ -15,15 +15,22 @@ Two models:
 from __future__ import annotations
 
 import json
+import logging
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 if TYPE_CHECKING:
     from pathlib import Path
 
+logger = logging.getLogger(__name__)
+
 MAX_SHARD_RETRIES = 2  # Max re-deploys per shard on preemption
+
+# Default terminal statuses — consumers should override per their state machine.
+_DEFAULT_SHARD_TERMINAL_STATUSES: frozenset[str] = frozenset({"downloaded", "destroyed", "failed"})
+_DEFAULT_JOB_TERMINAL_STATUSES: frozenset[str] = frozenset({"completed", "downloaded", "failed"})
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +71,10 @@ class BatchState:
     re-deploys ``failed`` shards.
     """
 
+    # Subclasses may override to customise "is this shard done?" for archive hygiene.
+    # Default matches the ShardState status flow documented above.
+    TERMINAL_STATUSES: ClassVar[frozenset[str]] = _DEFAULT_SHARD_TERMINAL_STATUSES
+
     batch_id: str = ""
     label: str = ""
     num_gpus: int = 0
@@ -85,6 +96,48 @@ class BatchState:
         data = json.loads(path.read_text())
         shards = [ShardState(**s) for s in data.pop("shards", [])]
         return cls(**data, shards=shards)
+
+    @classmethod
+    def archive_if_all_terminal(cls, path: Path) -> None:
+        """Rename ``path`` with a timestamp suffix if every shard is terminal.
+
+        Prevents a finished batch from being re-loaded and re-polled on the
+        next orchestrator run. Corrupt files are left alone — the resume
+        loader (``load_or_none``) handles them.
+        """
+        if not path.exists():
+            return
+        try:
+            old = cls.load(path)
+        except (json.JSONDecodeError, KeyError, TypeError):
+            return
+        if not old.shards:
+            return
+        if not all(s.status in cls.TERMINAL_STATUSES for s in old.shards):
+            return
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        archive = path.with_name(f"{path.stem}_{ts}{path.suffix}")
+        path.rename(archive)
+        logger.info(
+            "Archived terminal batch %s (%d shards) → %s",
+            old.batch_id,
+            len(old.shards),
+            archive.name,
+        )
+
+    @classmethod
+    def load_or_none(cls, path: Path) -> BatchState | None:
+        """Load ``path`` if present and parseable, else return None.
+
+        Corrupt state triggers a warning and a fresh start — never raises.
+        """
+        if not path.exists():
+            return None
+        try:
+            return cls.load(path)
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            logger.warning("Corrupt %s — starting fresh: %s", path.name, exc)
+            return None
 
     @property
     def active_shards(self) -> list[ShardState]:
@@ -152,6 +205,10 @@ class JobState:
 class JobBatchState:
     """Persistent batch state for job-based workloads."""
 
+    # Subclasses may override to customise "is this job done?" for archive hygiene.
+    # Default matches the JobState status flow documented above.
+    TERMINAL_STATUSES: ClassVar[frozenset[str]] = _DEFAULT_JOB_TERMINAL_STATUSES
+
     batch_id: str = ""
     jobs: list[JobState] = field(default_factory=list)
     created_at: str = ""
@@ -174,6 +231,48 @@ class JobBatchState:
         state = cls(**data)
         state.jobs = jobs
         return state
+
+    @classmethod
+    def archive_if_all_terminal(cls, path: Path) -> None:
+        """Rename ``path`` with a timestamp suffix if every job is terminal.
+
+        Prevents a finished batch from being re-loaded and re-polled on the
+        next orchestrator run. Corrupt files are left alone — the resume
+        loader (``load_or_none``) handles them.
+        """
+        if not path.exists():
+            return
+        try:
+            old = cls.load(path)
+        except (json.JSONDecodeError, KeyError, TypeError):
+            return
+        if not old.jobs:
+            return
+        if not all(j.status in cls.TERMINAL_STATUSES for j in old.jobs):
+            return
+        ts = datetime.now(tz=UTC).strftime("%Y%m%d_%H%M%S")
+        archive = path.with_name(f"{path.stem}_{ts}{path.suffix}")
+        path.rename(archive)
+        logger.info(
+            "Archived terminal batch %s (%d jobs) → %s",
+            old.batch_id,
+            len(old.jobs),
+            archive.name,
+        )
+
+    @classmethod
+    def load_or_none(cls, path: Path) -> JobBatchState | None:
+        """Load ``path`` if present and parseable, else return None.
+
+        Corrupt state triggers a warning and a fresh start — never raises.
+        """
+        if not path.exists():
+            return None
+        try:
+            return cls.load(path)
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            logger.warning("Corrupt %s — starting fresh: %s", path.name, exc)
+            return None
 
     @property
     def pending_jobs(self) -> list[JobState]:

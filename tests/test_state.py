@@ -134,3 +134,107 @@ class TestJobBatchState:
         ]
         batch = JobBatchState(batch_id="cost", jobs=jobs)
         assert abs(batch.total_cost - 0.90) < 0.01
+
+
+class TestBatchStateArchive:
+    """archive_if_all_terminal + load_or_none — shared hygiene for resuming batches."""
+
+    def test_archive_all_terminal(self, tmp_path: Path) -> None:
+        path = tmp_path / "batch_state.json"
+        BatchState(
+            batch_id="terminal",
+            shards=[
+                ShardState(shard_id=0, status="downloaded"),
+                ShardState(shard_id=1, status="failed"),
+            ],
+        ).save(path)
+        BatchState.archive_if_all_terminal(path)
+        assert not path.exists()
+        archives = list(tmp_path.glob("batch_state_*.json"))
+        assert len(archives) == 1
+
+    def test_no_archive_when_active_shard(self, tmp_path: Path) -> None:
+        path = tmp_path / "batch_state.json"
+        BatchState(
+            batch_id="active",
+            shards=[
+                ShardState(shard_id=0, status="downloaded"),
+                ShardState(shard_id=1, status="running"),
+            ],
+        ).save(path)
+        BatchState.archive_if_all_terminal(path)
+        assert path.exists()
+        assert list(tmp_path.glob("batch_state_*.json")) == []
+
+    def test_no_archive_when_file_missing(self, tmp_path: Path) -> None:
+        BatchState.archive_if_all_terminal(tmp_path / "absent.json")
+        # no error, no files created
+
+    def test_no_archive_when_corrupt(self, tmp_path: Path) -> None:
+        path = tmp_path / "corrupt.json"
+        path.write_text("{ not json")
+        BatchState.archive_if_all_terminal(path)
+        assert path.exists()  # corrupt file preserved for load_or_none to warn
+
+    def test_load_or_none_present(self, tmp_path: Path) -> None:
+        path = tmp_path / "batch_state.json"
+        BatchState(batch_id="ok", shards=[ShardState(shard_id=0)]).save(path)
+        loaded = BatchState.load_or_none(path)
+        assert loaded is not None
+        assert loaded.batch_id == "ok"
+
+    def test_load_or_none_absent(self, tmp_path: Path) -> None:
+        assert BatchState.load_or_none(tmp_path / "absent.json") is None
+
+    def test_load_or_none_corrupt(self, tmp_path: Path) -> None:
+        path = tmp_path / "corrupt.json"
+        path.write_text("not json")
+        assert BatchState.load_or_none(path) is None
+
+    def test_subclass_custom_terminal_statuses(self, tmp_path: Path) -> None:
+        """Subclass narrows TERMINAL_STATUSES — archive only fires for its set."""
+
+        class NarrowBatch(BatchState):
+            TERMINAL_STATUSES = frozenset({"failed"})
+
+        path = tmp_path / "narrow_state.json"
+        NarrowBatch(
+            batch_id="narrow",
+            shards=[ShardState(shard_id=0, status="downloaded")],
+        ).save(path)
+        NarrowBatch.archive_if_all_terminal(path)
+        assert path.exists()  # "downloaded" not in subclass's terminal set
+
+
+class TestJobBatchStateArchive:
+    """Parallel coverage for the job-based variant."""
+
+    def test_archive_all_terminal(self, tmp_path: Path) -> None:
+        path = tmp_path / "md_batch_state.json"
+        JobBatchState(
+            batch_id="terminal",
+            jobs=[
+                JobState(job_name="a", status="completed"),
+                JobState(job_name="b", status="downloaded"),
+            ],
+        ).save(path)
+        JobBatchState.archive_if_all_terminal(path)
+        assert not path.exists()
+        assert len(list(tmp_path.glob("md_batch_state_*.json"))) == 1
+
+    def test_no_archive_when_pending_job(self, tmp_path: Path) -> None:
+        path = tmp_path / "md_batch_state.json"
+        JobBatchState(
+            batch_id="active",
+            jobs=[JobState(job_name="a", status="pending")],
+        ).save(path)
+        JobBatchState.archive_if_all_terminal(path)
+        assert path.exists()
+
+    def test_load_or_none_absent(self, tmp_path: Path) -> None:
+        assert JobBatchState.load_or_none(tmp_path / "absent.json") is None
+
+    def test_load_or_none_corrupt(self, tmp_path: Path) -> None:
+        path = tmp_path / "corrupt.json"
+        path.write_text("]")
+        assert JobBatchState.load_or_none(path) is None
