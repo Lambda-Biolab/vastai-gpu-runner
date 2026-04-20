@@ -385,6 +385,143 @@ class TestCheckUnit:
 
 
 # ---------------------------------------------------------------------------
+# capture_preempt_diagnostics — silent worker crash forensics (#164)
+#
+# Before the fix: a "worker died silently" verdict fired destroy_instance
+# without any log capture, so the orchestrator only recorded the single
+# "worker died silently" log line. 3 of 5 instances in a 2026-04-20 MD
+# batch crashed this way ~60-180 s after Deploy success, and there was
+# no diagnostic trail to investigate why. After the fix: the default
+# implementation pulls /workspace/worker.log (+ worker.exitcode +
+# dmesg tail) via SSH and writes it to
+# batch_diagnostics/{unit}_{instance}_{timestamp}.log before destroy.
+# A raise inside the capture must not block destroy — leaked instances
+# keep burning dollars.
+# ---------------------------------------------------------------------------
+
+
+class TestCapturePreemptDiagnostics:
+    """Preempted path captures worker.log before destroy, swallows errors."""
+
+    @staticmethod
+    def _preempted_poll() -> dict[str, object]:
+        return {"complete": False, "running": False, "worker_dead": True}
+
+    def _orch_with_preempted_unit(
+        self,
+    ) -> tuple[FakeOrchestrator, CloudRunner, CloudInstance, FakeUnit]:
+        unit = FakeUnit(key="u1", status="deployed", instance_id="i1")
+        orch = FakeOrchestrator(
+            units=[unit],
+            runner_factory=_mock_runner_factory(deploy_result=_ok_deploy()),
+            label_prefix="test",
+        )
+        runner = MagicMock(spec=CloudRunner)
+        runner.check_progress = MagicMock(return_value=self._preempted_poll())
+        runner.destroy_instance = MagicMock(return_value=True)
+        instance = CloudInstance(
+            instance_id="i1",
+            ssh_host="1.2.3.4",
+            ssh_port=22,
+            ssh_user="root",
+        )
+        orch._live_runners[unit.key] = (runner, instance, unit)
+        return orch, runner, instance, unit
+
+    def test_capture_called_before_destroy_on_preempted(self) -> None:
+        """capture_preempt_diagnostics fires before destroy_instance."""
+        orch, runner, instance, unit = self._orch_with_preempted_unit()
+
+        call_order: list[str] = []
+        orch.capture_preempt_diagnostics = MagicMock(  # type: ignore[method-assign]
+            side_effect=lambda *_a, **_k: call_order.append("capture")
+        )
+        runner.destroy_instance = MagicMock(
+            side_effect=lambda *_a, **_k: call_order.append("destroy")
+        )
+
+        verdict = orch._check_unit(runner, instance, unit)
+
+        assert verdict == "preempted"
+        assert call_order == ["capture", "destroy"]
+        orch.capture_preempt_diagnostics.assert_called_once_with(runner, instance, unit)
+
+    def test_capture_exception_does_not_block_destroy(self) -> None:
+        """A raising capture must not prevent the instance from being destroyed."""
+        orch, runner, instance, unit = self._orch_with_preempted_unit()
+        orch.capture_preempt_diagnostics = MagicMock(  # type: ignore[method-assign]
+            side_effect=RuntimeError("SSH network is on fire")
+        )
+
+        verdict = orch._check_unit(runner, instance, unit)
+
+        assert verdict == "preempted"
+        runner.destroy_instance.assert_called_once()
+        assert unit.status == "pending"  # instance-loss bookkeeping still happened
+
+    def test_default_capture_writes_diagnostics_file(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Default implementation SSH-cats worker.log into batch_diagnostics/."""
+        orch, runner, instance, unit = self._orch_with_preempted_unit()
+        monkeypatch.chdir(tmp_path)
+
+        def fake_ssh(_instance: CloudInstance, cmd: str, *, timeout: int = 30) -> tuple[int, str]:
+            del timeout
+            if "worker.log" in cmd and "exitcode" not in cmd:
+                return 0, "Starting production\nCUDA error: driver initialization failed\n"
+            if "worker.exitcode" in cmd:
+                return 0, "1"
+            if "dmesg" in cmd:
+                return 0, "[12345.678] nvidia-smi: GPU has fallen off the bus"
+            return 1, ""
+
+        with patch("vastai_gpu_runner.ssh.ssh_cmd", side_effect=fake_ssh):
+            orch._check_unit(runner, instance, unit)
+
+        diag_dir = tmp_path / "batch_diagnostics"
+        assert diag_dir.is_dir()
+        logs = list(diag_dir.glob("u1_i1_*.log"))
+        assert len(logs) == 1
+        content = logs[0].read_text()
+        assert "worker.log" in content
+        assert "CUDA error" in content
+        assert "exitcode" in content
+        assert "GPU has fallen off the bus" in content
+
+    def test_successful_completion_does_not_capture(self) -> None:
+        """Happy path (complete=True) must never trigger diagnostic capture."""
+        unit = FakeUnit(key="u1", status="deployed", instance_id="i1", collect_result=True)
+        orch = FakeOrchestrator(
+            units=[unit],
+            runner_factory=_mock_runner_factory(deploy_result=_ok_deploy()),
+            label_prefix="test",
+        )
+        orch.capture_preempt_diagnostics = MagicMock()  # type: ignore[method-assign]
+        runner = MagicMock(spec=CloudRunner)
+        runner.check_progress = MagicMock(return_value={"complete": True, "running": False})
+        runner.destroy_instance = MagicMock(return_value=True)
+        instance = CloudInstance(instance_id="i1")
+        orch._live_runners[unit.key] = (runner, instance, unit)
+
+        orch._check_unit(runner, instance, unit)
+
+        orch.capture_preempt_diagnostics.assert_not_called()
+
+    def test_poll_cycle_once_also_captures_on_preempted(self) -> None:
+        """The parallel-poll path (``_poll_cycle_once``) must also capture."""
+        orch, runner, instance, unit = self._orch_with_preempted_unit()
+        orch.capture_preempt_diagnostics = MagicMock()  # type: ignore[method-assign]
+
+        orch._poll_cycle_once()
+
+        orch.capture_preempt_diagnostics.assert_called_once_with(runner, instance, unit)
+        runner.destroy_instance.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
 # Retry cap
 # ---------------------------------------------------------------------------
 
