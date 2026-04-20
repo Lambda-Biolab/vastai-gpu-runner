@@ -68,13 +68,12 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import TYPE_CHECKING, Generic, Literal, Protocol, TypeVar
 
 from vastai_gpu_runner.orchestrator import check_budget, sweep_zombie_instances
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from vastai_gpu_runner.runner import CloudRunner
     from vastai_gpu_runner.storage.r2 import R2Sink
     from vastai_gpu_runner.types import CloudInstance
@@ -218,6 +217,73 @@ class BatchOrchestrator(ABC, Generic[UnitT]):
     @abstractmethod
     def classify_failure(self, unit: UnitT, error: str) -> FailureVerdict:
         """Classify a failure as retryable or fatal."""
+
+    # -- Optional hooks (default-implemented, override when needed) --------
+
+    def capture_preempt_diagnostics(
+        self,
+        runner: CloudRunner,
+        instance: CloudInstance,
+        unit: UnitT,
+    ) -> None:
+        """Persist ``worker.log`` (and tail context) before the instance is destroyed.
+
+        Called from the preempted path on every silent worker death so the
+        next debugging session has real evidence instead of the single
+        "worker died silently" log line. The default implementation
+        SSH-cats ``{workspace}/worker.log`` and a short ``dmesg -T``
+        tail into
+        ``batch_diagnostics/{unit_key}_{instance_id}_{timestamp}.log``
+        under the current working directory. Subclasses can override to
+        redirect the capture into domain-specific paths (e.g. a
+        per-target results dir).
+
+        Swallows every exception — a diagnostic capture MUST NEVER
+        block destroy, because a leaked instance keeps burning dollars.
+        """
+        from vastai_gpu_runner.ssh import ssh_cmd
+
+        _ = runner  # reserved for subclass overrides that need runner state
+        try:
+            diag_dir = Path.cwd() / "batch_diagnostics"
+            diag_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+            unit_key = self.unit_key(unit)
+            iid = instance.instance_id or "unknown"
+            out_path = diag_dir / f"{unit_key}_{iid}_{timestamp}.log"
+
+            sections: list[str] = [
+                f"# preempt diagnostics for {self.unit_label(unit)}",
+                f"# instance_id: {iid}",
+                f"# ssh: {instance.ssh_user}@{instance.ssh_host}:{instance.ssh_port}",
+                f"# workspace: {self._workspace_dir}",
+                f"# captured_at: {timestamp}",
+                "",
+                "## worker.log (full) ##",
+            ]
+            rc, worker_log = ssh_cmd(instance, f"cat {self._workspace_dir}/worker.log", timeout=20)
+            sections.append(worker_log if rc == 0 else f"[ssh rc={rc}] {worker_log}")
+            sections.extend(("", "## worker.exitcode ##"))
+            rc2, exitcode = ssh_cmd(
+                instance, f"cat {self._workspace_dir}/worker.exitcode 2>/dev/null", timeout=10
+            )
+            sections.append(exitcode if rc2 == 0 else f"[ssh rc={rc2}] {exitcode}")
+            sections.extend(("", "## dmesg tail ##"))
+            rc3, dmesg = ssh_cmd(instance, "dmesg -T 2>&1 | tail -40", timeout=10)
+            sections.append(dmesg if rc3 == 0 else f"[ssh rc={rc3}] {dmesg}")
+
+            out_path.write_text("\n".join(sections) + "\n")
+            logger.info(
+                "Captured preempt diagnostics for %s → %s",
+                self.unit_label(unit),
+                out_path,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to capture preempt diagnostics for %s: %s",
+                self.unit_label(unit),
+                exc,
+            )
 
     # -- State-mutation events (subclasses override) -----------------------
 
@@ -443,6 +509,8 @@ class BatchOrchestrator(ABC, Generic[UnitT]):
 
         for unit_key, runner, instance, unit in preempted:
             with contextlib.suppress(Exception):
+                self.capture_preempt_diagnostics(runner, instance, unit)
+            with contextlib.suppress(Exception):
                 runner.destroy_instance(instance)
             with self._state_lock:
                 self._handle_instance_loss(unit, unit_key, "worker died silently")
@@ -512,6 +580,8 @@ class BatchOrchestrator(ABC, Generic[UnitT]):
         if verdict == "running":
             return "running"
         if verdict == "preempted":
+            with contextlib.suppress(Exception):
+                self.capture_preempt_diagnostics(runner, instance, unit)
             with contextlib.suppress(Exception):
                 runner.destroy_instance(instance)
             with self._state_lock:
