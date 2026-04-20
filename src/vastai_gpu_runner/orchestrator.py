@@ -88,14 +88,6 @@ def sweep_zombie_instances(
     return killed
 
 
-# Minimum age before a tracked instance can be destroyed as a zombie.
-# Vast.ai's ``cur_state`` briefly transitions through ``stopped`` while a
-# container boots and its long-running worker process attaches. Destroying
-# during that window kills healthy instances.  Five minutes comfortably
-# exceeds the longest observed boot-to-worker transition (~2 min).
-_ZOMBIE_GRACE_SECONDS = 300.0
-
-
 def _is_zombie(
     inst: dict[str, object],
     label_prefix: str,
@@ -103,34 +95,37 @@ def _is_zombie(
     r2_sink: R2Sink | None,
     r2_batch_id: str,
 ) -> bool:
-    """Classify whether an instance should be destroyed by the sweep."""
+    """Classify whether an instance should be destroyed by the sweep.
+
+    The sweep is for **orphans only** — instances whose label matches our
+    batch prefix but which we are NOT tracking. Tracked instances must
+    never be destroyed here, because Vast.ai's ``cur_state`` API is
+    unreliable for this purpose: it reports ``stopped`` / ``exited``
+    persistently for containers whose long-running OpenMM worker is
+    still running fine (confirmed via SSH 2026-04-20). The orchestrator's
+    normal collect/destroy flow handles tracked-instance cleanup.
+
+    The one exception is the R2 DONE marker path: if R2 confirms a
+    tracked instance has uploaded its final results, the sweep still
+    skips the destroy so the collect phase can harvest cleanly.
+    """
     iid = str(inst.get("id", ""))
     label = str(inst.get("label", ""))
     status = str(inst.get("cur_state", ""))
 
     if not label.startswith(label_prefix):
         return False
-    if iid in tracked_ids and status == "running":
-        return False
-    if iid in tracked_ids and _within_grace_period(inst):
-        logger.debug("Zombie sweep: %s stopped but within grace period — skipping", iid)
-        return False
-    if _r2_says_done(iid, label, label_prefix, status, tracked_ids, r2_sink, r2_batch_id):
-        return False
-    return status in ("stopped", "exited") or iid not in tracked_ids
 
-
-def _within_grace_period(inst: dict[str, object]) -> bool:
-    """Return True if ``inst`` is younger than ``_ZOMBIE_GRACE_SECONDS``.
-
-    Uses Vast.ai's ``start_date`` unix timestamp. Returns False when the
-    field is missing or unparseable so the caller falls through to its
-    normal classification.
-    """
-    start_date = inst.get("start_date")
-    if not isinstance(start_date, (int, float)):
+    # Tracked instances: NEVER destroy via sweep. Collect phase owns them.
+    if iid in tracked_ids:
         return False
-    return (time.time() - float(start_date)) < _ZOMBIE_GRACE_SECONDS
+
+    # Untracked instances that match our label prefix are orphans — an
+    # instance we launched but lost track of (e.g. crash between create and
+    # register). Always safe to destroy unless R2 marks the job done, in
+    # which case the collect phase needs the instance alive briefly to
+    # download the final chunk.
+    return not _r2_says_done(iid, label, label_prefix, status, tracked_ids, r2_sink, r2_batch_id)
 
 
 def _r2_says_done(

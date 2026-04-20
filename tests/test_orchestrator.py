@@ -2,142 +2,81 @@
 
 from __future__ import annotations
 
-import time
-
-from vastai_gpu_runner.orchestrator import (
-    _ZOMBIE_GRACE_SECONDS,
-    _is_zombie,
-    _within_grace_period,
-)
+from vastai_gpu_runner.orchestrator import _is_zombie
 
 
-def _inst(
-    iid: str,
-    label: str,
-    status: str,
-    *,
-    start_date: float | None = None,
-) -> dict[str, object]:
+def _inst(iid: str, label: str, status: str) -> dict[str, object]:
     """Build a minimal Vast.ai-API-shaped instance dict for classifier tests."""
-    d: dict[str, object] = {"id": iid, "label": label, "cur_state": status}
-    if start_date is not None:
-        d["start_date"] = start_date
-    return d
+    return {"id": iid, "label": label, "cur_state": status}
 
 
 LABEL_PREFIX = "oralamp-md-abc123"
 
 
 class TestIsZombie:
-    """Covers the ``_is_zombie`` decision tree."""
+    """Covers the ``_is_zombie`` decision tree.
+
+    Policy (2026-04-20 hardening): the sweep is for **orphans only**.
+    Tracked instances are always spared because Vast.ai's ``cur_state`` is
+    an unreliable indicator of actual container health: confirmed via SSH
+    that workers keep running at 80% GPU utilisation while the API
+    persistently reports ``stopped`` / ``exited``. The orchestrator's
+    collect/destroy flow owns tracked-instance cleanup.
+    """
 
     def test_label_prefix_mismatch_never_zombie(self) -> None:
         # An instance belonging to a different batch must never be swept.
-        inst = _inst("1", "someone-elses-batch-xyz", "stopped", start_date=time.time() - 3600)
-        assert (
-            _is_zombie(inst, LABEL_PREFIX, tracked_ids={"1"}, r2_sink=None, r2_batch_id="") is False
-        )
+        inst = _inst("1", "someone-elses-batch-xyz", "stopped")
+        assert _is_zombie(inst, LABEL_PREFIX, {"1"}, r2_sink=None, r2_batch_id="") is False
 
     def test_tracked_running_is_not_zombie(self) -> None:
-        inst = _inst("1", f"{LABEL_PREFIX}-x", "running", start_date=time.time() - 3600)
-        assert (
-            _is_zombie(inst, LABEL_PREFIX, tracked_ids={"1"}, r2_sink=None, r2_batch_id="") is False
-        )
+        inst = _inst("1", f"{LABEL_PREFIX}-x", "running")
+        assert _is_zombie(inst, LABEL_PREFIX, {"1"}, r2_sink=None, r2_batch_id="") is False
 
-    def test_tracked_stopped_within_grace_is_not_zombie(self) -> None:
-        """Regression for the cascading destroy bug seen on 2026-04-20.
+    def test_tracked_stopped_is_not_zombie(self) -> None:
+        """Load-bearing regression for the 2026-04-20 cascade.
 
-        Vast.ai briefly reports cur_state=stopped during container boot. A
-        tracked instance younger than the grace period must be spared even
-        if the API currently shows it as stopped.
+        Vast.ai reported ``cur_state=stopped`` repeatedly for a tracked
+        instance whose OpenMM worker was running at 90% GPU utilisation,
+        confirmed via SSH. The sweep must not destroy tracked instances.
         """
-        inst = _inst(
-            "42",
-            f"{LABEL_PREFIX}-candidate-x",
-            "stopped",
-            start_date=time.time() - 60,  # 1 min old
-        )
-        assert (
-            _is_zombie(inst, LABEL_PREFIX, tracked_ids={"42"}, r2_sink=None, r2_batch_id="")
-            is False
-        )
+        inst = _inst("42", f"{LABEL_PREFIX}-still-running", "stopped")
+        assert _is_zombie(inst, LABEL_PREFIX, {"42"}, r2_sink=None, r2_batch_id="") is False
 
-    def test_tracked_stopped_past_grace_is_zombie(self) -> None:
-        """Stopped for real: past the grace window with no running worker."""
-        inst = _inst(
-            "42",
-            f"{LABEL_PREFIX}-candidate-x",
-            "stopped",
-            start_date=time.time() - (_ZOMBIE_GRACE_SECONDS + 60),
-        )
-        assert (
-            _is_zombie(inst, LABEL_PREFIX, tracked_ids={"42"}, r2_sink=None, r2_batch_id="") is True
-        )
-
-    def test_tracked_exited_past_grace_is_zombie(self) -> None:
-        inst = _inst(
-            "42",
-            f"{LABEL_PREFIX}-candidate-x",
-            "exited",
-            start_date=time.time() - (_ZOMBIE_GRACE_SECONDS + 60),
-        )
-        assert (
-            _is_zombie(inst, LABEL_PREFIX, tracked_ids={"42"}, r2_sink=None, r2_batch_id="") is True
-        )
+    def test_tracked_exited_is_not_zombie(self) -> None:
+        """Even if Vast.ai reports the container as exited, the sweep must
+        spare tracked instances. Real exits are harvested by the collect phase."""
+        inst = _inst("42", f"{LABEL_PREFIX}-tracked", "exited")
+        assert _is_zombie(inst, LABEL_PREFIX, {"42"}, r2_sink=None, r2_batch_id="") is False
 
     def test_untracked_with_matching_label_is_zombie(self) -> None:
-        """Orphans whose label matches our batch prefix but aren't in tracked_ids."""
-        inst = _inst("999", f"{LABEL_PREFIX}-orphan", "running", start_date=time.time() - 60)
-        assert (
-            _is_zombie(inst, LABEL_PREFIX, tracked_ids={"1"}, r2_sink=None, r2_batch_id="") is True
-        )
+        """Orphan: label matches our prefix but not in tracked_ids."""
+        inst = _inst("999", f"{LABEL_PREFIX}-orphan", "running")
+        assert _is_zombie(inst, LABEL_PREFIX, {"1"}, r2_sink=None, r2_batch_id="") is True
 
-    def test_r2_done_marker_spares_stopped_instance(self) -> None:
-        """When R2 confirms the job is done, the sweep should not destroy the instance."""
-        inst = _inst(
-            "42",
-            f"{LABEL_PREFIX}-done-job",
-            "stopped",
-            start_date=time.time() - (_ZOMBIE_GRACE_SECONDS + 60),
-        )
+    def test_untracked_stopped_is_zombie(self) -> None:
+        """Orphan with stopped state is still a zombie."""
+        inst = _inst("999", f"{LABEL_PREFIX}-orphan", "stopped")
+        assert _is_zombie(inst, LABEL_PREFIX, {"1"}, r2_sink=None, r2_batch_id="") is True
+
+    def test_r2_done_marker_path_inert_for_untracked(self) -> None:
+        """R2 DONE check returns False for untracked instances (only applies to
+        tracked stopped/exited — which the new policy already spares). The R2
+        check path is effectively dead for orphans; orphans still get destroyed."""
+        inst = _inst("999", f"{LABEL_PREFIX}-orphan", "stopped")
 
         class _FakeR2:
-            def is_job_done(self, _batch_id: str, _job: str) -> bool:
+            @staticmethod
+            def is_job_done(_batch_id: str, _job: str) -> bool:
                 return True
 
         assert (
             _is_zombie(
                 inst,
                 LABEL_PREFIX,
-                tracked_ids={"42"},
+                tracked_ids={"1"},
                 r2_sink=_FakeR2(),
                 r2_batch_id="batch-xyz",
             )
-            is False
+            is True
         )
-
-    def test_missing_start_date_does_not_grant_grace(self) -> None:
-        """Instances missing ``start_date`` fall back to the normal rule."""
-        inst = _inst("42", f"{LABEL_PREFIX}-x", "stopped")
-        assert (
-            _is_zombie(inst, LABEL_PREFIX, tracked_ids={"42"}, r2_sink=None, r2_batch_id="") is True
-        )
-
-
-class TestWithinGracePeriod:
-    """Unit tests for the ``_within_grace_period`` helper."""
-
-    def test_recent_start(self) -> None:
-        assert _within_grace_period({"start_date": time.time() - 30}) is True
-
-    def test_past_grace(self) -> None:
-        assert (
-            _within_grace_period({"start_date": time.time() - (_ZOMBIE_GRACE_SECONDS + 60)})
-            is False
-        )
-
-    def test_missing_field(self) -> None:
-        assert _within_grace_period({}) is False
-
-    def test_non_numeric_field(self) -> None:
-        assert _within_grace_period({"start_date": "not a number"}) is False
