@@ -11,3 +11,4 @@ build/
 .coverage
 htmlcov/
 coverage.xml
+batch_diagnostics/
