@@ -88,6 +88,14 @@ def sweep_zombie_instances(
     return killed
 
 
+# Minimum age before a tracked instance can be destroyed as a zombie.
+# Vast.ai's ``cur_state`` briefly transitions through ``stopped`` while a
+# container boots and its long-running worker process attaches. Destroying
+# during that window kills healthy instances.  Five minutes comfortably
+# exceeds the longest observed boot-to-worker transition (~2 min).
+_ZOMBIE_GRACE_SECONDS = 300.0
+
+
 def _is_zombie(
     inst: dict[str, object],
     label_prefix: str,
@@ -104,9 +112,25 @@ def _is_zombie(
         return False
     if iid in tracked_ids and status == "running":
         return False
+    if iid in tracked_ids and _within_grace_period(inst):
+        logger.debug("Zombie sweep: %s stopped but within grace period — skipping", iid)
+        return False
     if _r2_says_done(iid, label, label_prefix, status, tracked_ids, r2_sink, r2_batch_id):
         return False
     return status in ("stopped", "exited") or iid not in tracked_ids
+
+
+def _within_grace_period(inst: dict[str, object]) -> bool:
+    """Return True if ``inst`` is younger than ``_ZOMBIE_GRACE_SECONDS``.
+
+    Uses Vast.ai's ``start_date`` unix timestamp. Returns False when the
+    field is missing or unparseable so the caller falls through to its
+    normal classification.
+    """
+    start_date = inst.get("start_date")
+    if not isinstance(start_date, (int, float)):
+        return False
+    return (time.time() - float(start_date)) < _ZOMBIE_GRACE_SECONDS
 
 
 def _r2_says_done(
