@@ -95,6 +95,43 @@ class CloudRunner:
         """Destroy a cloud instance."""
         raise NotImplementedError
 
+    # -- Diagnostic hooks (override in subclasses) -------------------------
+
+    def capture_deploy_failure_diagnostics(
+        self,
+        instance: CloudInstance,
+        error: str,
+        attempt: int,
+    ) -> None:
+        """Hook: capture diagnostics on a deploy-phase failure before destroy.
+
+        Called from ``run_full_cycle`` / ``_try_one_offer`` immediately
+        before ``destroy_instance`` when a gate in ``_run_gate_chain``
+        fails (boot timeout, GPU verify failure, file deploy failure,
+        environment setup failure, worker launch failure) OR an
+        exception escapes the gate chain.
+
+        Providers like Vast.ai do NOT retain container logs after the
+        instance is destroyed — ``vastai logs <id>`` returns 404 on the
+        underlying docker container. SSH is still up at this hook point
+        (the boot/verify gates passed at least partially), which gives
+        the subclass its one chance to pull ``worker.log``, ``dmesg``,
+        ``nvidia-smi``, or provider-level container logs before destroy.
+
+        Default implementation: no-op. Override in subclasses (see
+        ``vastai_gpu_runner.providers.vastai.VastaiRunner`` for an
+        example that SSH-cats the workspace log tail).
+
+        Swallows every exception — a diagnostic capture MUST NEVER
+        block destroy, because a leaked instance keeps burning dollars.
+
+        Args:
+            instance: The cloud instance that failed to deploy.
+            error: Human-readable error message from the failed gate.
+            attempt: Zero-indexed attempt number (for logging + filenames).
+        """
+        _ = instance, error, attempt  # default no-op
+
     # -- Orchestrated lifecycle --------------------------------------------
 
     def run_full_cycle(
@@ -158,12 +195,19 @@ class CloudRunner:
         ``result`` is a successful ``DeploymentResult`` or ``None`` if the
         attempt failed (caller should try the next offer). ``error`` is the
         human-readable failure reason to record when ``result`` is ``None``.
+
+        On any gate failure (or exception escape) we call
+        ``capture_deploy_failure_diagnostics`` *before* destroying the
+        instance so subclasses can pull ``worker.log`` / provider logs
+        while SSH is still up and the container still exists.
         """
         instance: CloudInstance | None = None
         try:
             instance = self.create_instance(offer)
             error = self._run_gate_chain(instance, files, attempt)
             if error:
+                with contextlib.suppress(Exception):
+                    self.capture_deploy_failure_diagnostics(instance, error, attempt)
                 self.destroy_instance(instance)
                 return None, error
             return DeploymentResult(success=True, instance=instance), ""
@@ -171,6 +215,8 @@ class CloudRunner:
             err = f"Attempt {attempt + 1} failed: {exc}"
             logger.warning("Deployment attempt %d failed: %s", attempt + 1, exc)
             if instance:
+                with contextlib.suppress(Exception):
+                    self.capture_deploy_failure_diagnostics(instance, err, attempt)
                 with contextlib.suppress(Exception):
                     self.destroy_instance(instance)
             return None, err

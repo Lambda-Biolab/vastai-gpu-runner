@@ -20,7 +20,7 @@ import logging
 import re
 import subprocess
 import time
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 from vastai_gpu_runner.runner import CloudRunner
 from vastai_gpu_runner.ssh import scp_download, scp_upload, ssh_cmd
@@ -30,9 +30,6 @@ from vastai_gpu_runner.types import (
     InstanceStatus,
     Provider,
 )
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -324,11 +321,16 @@ class VastaiRunner(CloudRunner):
             time.sleep(5)
 
         logger.warning(
-            "Instance %s stuck in boot after %ds — destroying",
+            "Instance %s stuck in boot after %ds",
             instance.instance_id,
             self.config.boot_timeout_seconds,
         )
-        self.destroy_instance(instance)
+        # Caller (_try_one_offer) now owns the cleanup path: it calls
+        # capture_deploy_failure_diagnostics BEFORE destroy_instance so
+        # subclasses can pull ``vastai logs`` / ssh diagnostics while
+        # the instance still exists. Previously we destroyed here
+        # inline, which erased the container before diagnostics could
+        # run and made boot-timeout failures unobservable.
         instance.status = InstanceStatus.FAILED
         return False
 
@@ -498,6 +500,80 @@ class VastaiRunner(CloudRunner):
         """Download a single file via SCP."""
         remote_path = f"{self.config.workspace_dir}/{remote_name}"
         return scp_download(instance, remote_path, local_path)
+
+    def capture_deploy_failure_diagnostics(
+        self,
+        instance: CloudInstance,
+        error: str,
+        attempt: int,
+    ) -> None:
+        """Pull ``vastai logs`` + SSH dmesg/nvidia-smi before destroy.
+
+        Vast.ai does not retain container logs after ``destroy_instance``
+        (``vastai logs <id>`` returns 404 on the underlying docker
+        container). This is our one chance to capture why a deploy gate
+        failed. Saves to ``batch_diagnostics/deploy__{unit_or_id}_{ts}.log``
+        under the current working directory — mirrors the layout used by
+        ``BatchOrchestrator.capture_preempt_diagnostics``.
+
+        Always swallows exceptions; a diagnostic capture must NEVER block
+        the destroy that follows.
+        """
+        try:
+            diag_dir = Path.cwd() / "batch_diagnostics"
+            diag_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+            iid = instance.instance_id or "unknown"
+            out_path = diag_dir / f"deploy__{iid}_{timestamp}.log"
+
+            sections: list[str] = [
+                f"# deploy-failure diagnostics for instance {iid}",
+                f"# attempt: {attempt}",
+                f"# error: {error}",
+                f"# ssh: {instance.ssh_user}@{instance.ssh_host}:{instance.ssh_port}",
+                f"# captured_at: {timestamp}",
+            ]
+
+            # vastai-level container logs (fetched from Vast's log storage,
+            # which holds content for some seconds after container stop).
+            try:
+                vlogs = vastai_cmd(["logs", iid], timeout=30)
+                sections.extend(["", "## vastai logs ##", vlogs])
+            except Exception as exc:
+                sections.extend(["", "## vastai logs FAILED ##", str(exc)])
+
+            # SSH-level diagnostics: workspace worker.log if it exists,
+            # plus dmesg tail + nvidia-smi for kernel/driver state.
+            ws = self.config.workspace_dir
+            rc, output = ssh_cmd(
+                instance,
+                (
+                    f"cat {ws}/worker.log 2>/dev/null; "
+                    f"echo '---DMESG---'; dmesg -T 2>/dev/null | tail -50; "
+                    f"echo '---NVIDIA-SMI---'; nvidia-smi 2>&1 | head -30; "
+                    f"echo '---DF---'; df -h {ws} 2>/dev/null || df -h"
+                ),
+                timeout=20,
+            )
+            sections.extend(
+                [
+                    "",
+                    f"## ssh diagnostics (rc={rc}) ##",
+                    output or "(empty)",
+                ]
+            )
+
+            out_path.write_text("\n".join(sections) + "\n")
+            logger.info(
+                "Deploy-failure diagnostics captured (%d sections) → %s",
+                len(sections),
+                out_path,
+            )
+        except Exception as exc:
+            logger.warning(
+                "capture_deploy_failure_diagnostics swallowed exception: %s",
+                exc,
+            )
 
     def destroy_instance(self, instance: CloudInstance) -> bool:
         """Destroy a Vast.ai instance (with ownership safety guard).
