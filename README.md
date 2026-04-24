@@ -1,5 +1,7 @@
 # vastai-gpu-runner
 
+![vastai-gpu-runner — Cloud GPU batches for Vast.ai.](.github/social-preview.png)
+
 Cloud GPU orchestration framework for [Vast.ai](https://vast.ai) — batch deployment, R2 storage, worker lifecycle, crash recovery.
 
 ## Features
