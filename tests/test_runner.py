@@ -99,6 +99,106 @@ class TestCloudRunner:
         assert result.success is True
         assert "m2" in used
 
+    def test_atomic_claim_prevents_parallel_collision(self) -> None:
+        """Regression: parallel ``run_full_cycle`` calls must not land on
+        the same physical machine.
+
+        Pre-fix the claim happened only after a successful deploy, so
+        every thread that started before any other completed could pick
+        ``offers[0]`` simultaneously. Two co-located workers then fight
+        for the GPU and both fail boot/verify — exactly what we observed
+        on phase5e-lac_10_11-scramble-controls-N8N7-20260427.
+
+        The fix claims the machine_id atomically before deploying and
+        releases on failure. Under that contract, two concurrent
+        ``run_full_cycle`` calls with overlapping offer lists must end up
+        on distinct machines (one wins, the other moves on to the next
+        offer).
+        """
+        import threading
+
+        used: set[str] = set()
+        lock = threading.Lock()
+
+        # Two offers, both initially free. Two threads start in parallel
+        # — without the atomic claim, both pick offers[0] and the dedup
+        # filter is too coarse to catch it.
+        offers = [
+            {"id": "1", "machine_id": "m1"},
+            {"id": "2", "machine_id": "m2"},
+        ]
+
+        results: list[CloudInstance | None] = []
+
+        def deploy_thread() -> None:
+            runner = CloudRunner()
+            # Each thread gets its own runner but shares used + lock.
+            # All gates pass — the only thing that should differ between
+            # threads is which machine they end up claiming.
+            runner.create_instance = MagicMock(
+                side_effect=lambda offer: CloudInstance(instance_id=str(offer["id"]))
+            )
+            runner.wait_for_boot = MagicMock(return_value=True)
+            runner.verify_gpu = MagicMock(return_value=True)
+            runner.deploy_files = MagicMock(return_value=True)
+            runner.setup_environment = MagicMock(return_value=True)
+            runner.launch_worker = MagicMock(return_value=True)
+            r = runner.run_full_cycle(
+                {},
+                Path("/tmp/test"),
+                offers=list(offers),  # shallow copy per thread
+                used_machine_ids=used,
+                machine_lock=lock,
+            )
+            results.append(r.instance if r.success else None)
+
+        threads = [threading.Thread(target=deploy_thread) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # Both deploys should succeed — and on DIFFERENT machines. The
+        # failure mode this test pins is when both threads return the
+        # same instance_id (i.e. both picked offers[0] = m1).
+        successful = [r for r in results if r is not None]
+        assert len(successful) == 2
+        ids = {r.instance_id for r in successful}
+        assert ids == {"1", "2"}, (
+            f"Expected distinct machine assignments, got {ids} — "
+            "atomic-claim race condition has regressed."
+        )
+        assert used == {"m1", "m2"}
+
+    def test_release_on_failure_returns_machine_to_pool(self) -> None:
+        """A deploy failure must release the tentative claim so the next
+        attempt can use the same machine. Without release, a host that
+        failed to boot once would be permanently shadowed for the
+        remainder of the batch — wasting capacity.
+        """
+        import threading
+
+        used: set[str] = set()
+        lock = threading.Lock()
+
+        runner = CloudRunner()
+        runner.create_instance = MagicMock(return_value=CloudInstance(instance_id="x"))
+        runner.wait_for_boot = MagicMock(return_value=False)  # boot fails
+        runner.destroy_instance = MagicMock(return_value=True)
+
+        offers = [{"id": "1", "machine_id": "m1"}]
+        result = runner.run_full_cycle(
+            {},
+            Path("/tmp/test"),
+            offers=offers,
+            max_retries=1,
+            used_machine_ids=used,
+            machine_lock=lock,
+        )
+        assert result.success is False
+        # Critical: the failed claim must NOT linger.
+        assert "m1" not in used
+
 
 class TestCaptureDeployFailureDiagnostics:
     """New hook ``capture_deploy_failure_diagnostics`` — fires before
