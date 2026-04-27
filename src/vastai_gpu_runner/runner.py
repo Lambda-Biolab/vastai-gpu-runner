@@ -174,12 +174,24 @@ class CloudRunner:
                 break
             offer = offers[attempt]
             machine_id = str(offer.get("machine_id", ""))
-            if used_machine_ids and machine_id in used_machine_ids:
+            # Atomically claim the machine_id BEFORE deploying. The previous
+            # claim-on-success pattern raced when many parallel threads
+            # started together: each read ``used_machine_ids`` (still empty)
+            # at offer-selection time and all picked offers[0], landing
+            # multiple instances on the same physical host. Two co-located
+            # workers fight for the GPU → boot-timeout / GPU-verify failures.
+            # The fix is a tentative claim under the lock now, with a
+            # release on deploy failure so the host comes back into the
+            # pool for retry.
+            if not self._try_claim_machine(machine_id, used_machine_ids, machine_lock):
                 continue
             result, error = self._try_one_offer(offer, files, attempt)
             if result is not None:
-                self._claim_machine(machine_id, used_machine_ids, machine_lock)
                 return result
+            # Deploy failed — release the tentative claim so future attempts
+            # (this thread's next iteration or another thread's next pick)
+            # can re-use the machine.
+            self._release_machine(machine_id, used_machine_ids, machine_lock)
             last_error = error
 
         return DeploymentResult(success=False, error=last_error)
@@ -244,12 +256,62 @@ class CloudRunner:
         return ""
 
     @staticmethod
+    def _try_claim_machine(
+        machine_id: str,
+        used_machine_ids: set[str] | None,
+        machine_lock: threading.Lock | object | None,
+    ) -> bool:
+        """Atomically claim a machine_id under the shared lock.
+
+        Returns ``True`` if the claim succeeded (machine was free and is
+        now reserved by this caller), ``False`` if the machine was already
+        taken by a parallel thread. ``None`` set / lock means there is
+        no shared coordination, so the claim trivially succeeds.
+
+        Pair with :func:`_release_machine` on deploy failure so the host
+        rejoins the pool for retry.
+        """
+        if used_machine_ids is None or not machine_id:
+            return True
+        if machine_lock is not None and hasattr(machine_lock, "__enter__"):
+            with machine_lock:  # type: ignore[union-attr]
+                if machine_id in used_machine_ids:
+                    return False
+                used_machine_ids.add(machine_id)
+                return True
+        if machine_id in used_machine_ids:
+            return False
+        used_machine_ids.add(machine_id)
+        return True
+
+    @staticmethod
+    def _release_machine(
+        machine_id: str,
+        used_machine_ids: set[str] | None,
+        machine_lock: threading.Lock | object | None,
+    ) -> None:
+        """Release a tentative machine_id claim after a failed deploy."""
+        if used_machine_ids is None or not machine_id:
+            return
+        if machine_lock is not None and hasattr(machine_lock, "__enter__"):
+            with machine_lock:  # type: ignore[union-attr]
+                used_machine_ids.discard(machine_id)
+        else:
+            used_machine_ids.discard(machine_id)
+
+    @staticmethod
     def _claim_machine(
         machine_id: str,
         used_machine_ids: set[str] | None,
         machine_lock: threading.Lock | object | None,
     ) -> None:
-        """Record a successfully deployed machine_id under the shared lock."""
+        """Backwards-compatible alias for the post-deploy claim path.
+
+        Kept for callers that still want the claim-on-success pattern;
+        the in-tree :meth:`run_full_cycle` now uses the atomic
+        :meth:`_try_claim_machine` + :meth:`_release_machine` pair to
+        prevent same-machine collisions across parallel deploys.
+        """
         if used_machine_ids is None:
             return
         if machine_lock is not None and hasattr(machine_lock, "__enter__"):
