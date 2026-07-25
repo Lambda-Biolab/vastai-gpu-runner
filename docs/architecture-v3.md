@@ -15,7 +15,7 @@ Diff vs v2:
 
 - **+** `src/vastai_gpu_runner/unit_lifecycle.py` — `decide_next_action`, `Action` enum, `Continue | Complete | Preempt` plan types, `PreemptCause` enum, `ProgressSnapshot` dataclass
 - **+** `src/vastai_gpu_runner/providers/destroy.py` — `VerifyVerdict` + `DestroyVerdict` + `DestroyRefusal` (incl. `CREDENTIALS_DISABLED`) enums, `VerifyResult` + `DestroyResult` (with `verify_error` field + refusal invariants) + `DestroyPolicy` dataclasses, `belt_and_suspenders()` function
-- **+** `src/vastai_gpu_runner/providers/destroy_adapters/vastai.py` — `CredentialState` + `CredentialResolution` types, `read_vastai_api_key` (three-state env-first precedence), `verify_instance_ownership_rest` (REST-based ownership using same headers as destroy), Vast.ai REST callbacks (`stop_fn`, `delete_fn`, `verify_fn`), `destroy_vastai_instance`, `VASTAI_POLICY`
+- **+** `src/vastai_gpu_runner/providers/destroy_adapters/vastai.py` — `CredentialState` + `CredentialResolution` types (with `__post_init__` invariants + blank-file / read-error handling), `read_vastai_api_key` (three-state env-first precedence), `verify_instance_ownership_rest` (REST-based ownership using same headers as destroy, parses nested `instances.image_uuid`), Vast.ai REST callbacks (`stop_fn`, `delete_fn`, `verify_fn`, the latter parses nested `instances.actual_status`), `destroy_vastai_instance`, `VASTAI_POLICY`
 - **~** `BatchOrchestrator.__init__` adds `allowed_images: AbstractSet[str] | None = None` (normalised to `frozenset` internally; matches the existing `VastaiRunner.allowed_images: frozenset[str] | None` contract) so the zombie sweep can apply the same image allowlist as the runner
 - **~** `BatchOrchestrator._poll_cycle_once` keeps its two-stage shape (classify-all → preemptions → parallel finalise) using the shared `decide_next_action` primitive
 - **~** `BatchOrchestrator._check_unit` becomes a thin wrapper (one deprecation cycle only — the API reference documents it as inherited lifecycle surface) that delegates to `decide_next_action`. `_classify_live_unit` is **deleted**, not wrapped.
@@ -311,10 +311,11 @@ class VerifyVerdict(StrEnum):
     only answers: "is the instance present at this URL right now?"
     The protocol translates this into ``DestroyVerdict``.
     """
-    GONE = "gone"       # 404 OR 200 + actual_status == "destroyed"
-    PRESENT = "present" # 200 + actual_status != "destroyed" (incl. empty)
-    UNKNOWN = "unknown" # any other HTTP status, JSON parse failure,
-                        # network error, or non-string status
+    GONE = "gone"       # 404 OR 200 + instances.actual_status == "destroyed"
+    PRESENT = "present" # 200 + instances.actual_status != "destroyed" (incl. empty,
+                        # missing, non-string, or missing/malformed envelope —
+                        # the instance is still listed; we cannot prove it is gone)
+    UNKNOWN = "unknown" # any other HTTP status, JSON parse failure, network error
 
 
 class DestroyVerdict(StrEnum):
@@ -707,13 +708,32 @@ class CredentialState(StrEnum):
 class CredentialResolution:
     """The outcome of credential lookup.
 
-    ``key`` is set only when ``state == AVAILABLE``. For
-    ``ABSENT`` and ``EXPLICITLY_DISABLED`` the ``key`` field is
-    empty by convention; callers must branch on ``state``
-    rather than on ``key``.
+    Invariants (enforced in ``__post_init__``):
+
+    * When ``state == AVAILABLE``, ``key`` is a non-empty
+      stripped string.
+    * When ``state != AVAILABLE``, ``key`` is exactly ``""``.
+
+    Callers must branch on ``state`` rather than on the key's
+    truthiness — ``EXPLICITLY_DISABLED`` and ``ABSENT`` both
+    have an empty key but different semantics.
     """
     state: CredentialState
     key: str = ""
+
+    def __post_init__(self) -> None:
+        if self.state == CredentialState.AVAILABLE:
+            if not self.key.strip():
+                raise ValueError(
+                    f"CredentialResolution: state=AVAILABLE but key is empty "
+                    f"(or whitespace-only): {self.key!r}"
+                )
+        else:
+            if self.key:
+                raise ValueError(
+                    f"CredentialResolution: state={self.state} but key is "
+                    f"set: {self.key!r}"
+                )
 
 
 def read_vastai_api_key() -> CredentialResolution:
@@ -727,12 +747,22 @@ def read_vastai_api_key() -> CredentialResolution:
       2. ``~/.config/vastai/vast_api_key`` file.
       3. ``~/.vast_api_key`` file.
 
+    File contents:
+      * Blank or whitespace-only file → ``ABSENT`` with a warning
+        (the file exists but is effectively empty; treat as
+        no-credentials rather than as an empty key).
+      * ``OSError`` on read (permission denied, transient I/O
+        error, etc.) → ``ABSENT`` with a warning. File-read
+        errors do not escape from this function. The
+        ``CredentialResolution`` invariant would otherwise
+        reject an empty key with ``state=AVAILABLE`` and
+        surface the failure as a hard ``ValueError`` inside
+        ``destroy_vastai_instance``.
+
     Returns:
-        ``CredentialResolution`` with state and (when available)
-        the resolved key. Callers must branch on ``state`` rather
-        than on the key's truthiness — ``EXPLICITLY_DISABLED``
-        and ``ABSENT`` both have an empty key but different
-        semantics.
+        ``CredentialResolution`` satisfying the dataclass
+        invariants. Callers must branch on ``state`` rather
+        than on the key's truthiness.
     """
     env_key = os.environ.get("VASTAI_API_KEY")
     if env_key is not None:
@@ -749,10 +779,26 @@ def read_vastai_api_key() -> CredentialResolution:
         Path("~/.config/vastai/vast_api_key").expanduser(),
         Path("~/.vast_api_key").expanduser(),
     ):
-        if path.exists():
-            return CredentialResolution(
-                state=CredentialState.AVAILABLE, key=path.read_text().strip(),
+        if not path.exists():
+            continue
+        try:
+            raw = path.read_text()
+        except OSError as exc:
+            logger.warning(
+                "read_vastai_api_key: could not read %s: %s — treating as ABSENT",
+                path, exc,
             )
+            continue
+        stripped = raw.strip()
+        if not stripped:
+            logger.warning(
+                "read_vastai_api_key: %s exists but is blank — treating as ABSENT",
+                path,
+            )
+            continue
+        return CredentialResolution(
+            state=CredentialState.AVAILABLE, key=stripped,
+        )
     return CredentialResolution(state=CredentialState.ABSENT)
 
 
@@ -787,9 +833,17 @@ def verify_instance_ownership_rest(
     in ``providers/vastai.py`` (separate auth context).
 
     Returns ``True`` when the instance's image is in the allowlist
-    or when the lookup fails open (the instance does not exist,
-    or the API call fails). Returns ``False`` only when the
-    instance genuinely exists and its image is not allowed.
+    or when the instance does not exist (404). Returns ``False``
+    on every other failure (network error, non-200 status, JSON
+    parse failure, missing `instances` envelope, missing
+    `image_uuid` field, or the image genuinely not in the
+    allowlist). **Fail-closed**: any uncertainty in the lookup
+    rejects the destroy.
+
+    The Vast.ai ``GET /api/v0/instances/{id}/`` response wraps the
+    instance under an ``instances`` object, and the Docker image
+    field is ``image_uuid`` (not ``image``). Both are required
+    for a correct parse.
     """
     try:
         resp = requests.get(f"{BASE_URL}/{instance_id}/", headers=hdrs, timeout=10)
@@ -805,9 +859,29 @@ def verify_instance_ownership_rest(
         )
         return False
     try:
-        image = resp.json().get("image", "")
+        payload = resp.json()
     except Exception as exc:
         logger.warning("verify_instance_ownership_rest: JSON parse raised %s", exc)
+        return False
+    if not isinstance(payload, dict):
+        logger.warning(
+            "verify_instance_ownership_rest: response is not a dict: %r",
+            type(payload).__name__,
+        )
+        return False
+    instance = payload.get("instances")
+    if not isinstance(instance, dict):
+        logger.warning(
+            "verify_instance_ownership_rest: missing or non-dict 'instances' "
+            "envelope in response",
+        )
+        return False
+    image = instance.get("image_uuid")
+    if not isinstance(image, str):
+        logger.warning(
+            "verify_instance_ownership_rest: image_uuid missing or non-string: %r",
+            image,
+        )
         return False
     return _image_is_allowed(image, allowed_images)
 
@@ -836,17 +910,25 @@ def vastai_verify(instance_id: str, hdrs: dict[str, str]) -> VerifyResult:
     HTTP context. The mapping:
 
     * 404 → ``GONE`` (instance is not in the dashboard).
-    * 200 with ``actual_status == "destroyed"`` → ``GONE``.
-    * 200 with ``actual_status`` empty, missing, non-string, or
-      any value other than ``"destroyed"`` → ``PRESENT`` (the
-      instance is still listed; we cannot prove it is gone).
+    * 200 with nested ``instances.actual_status == "destroyed"`` → ``GONE``.
+    * 200 with nested ``instances.actual_status`` empty, missing,
+      non-string, or any other value → ``PRESENT`` (the instance
+      is still listed; we cannot prove it is gone).
     * Any other HTTP status (401, 403, 429, 5xx) → ``UNKNOWN``.
     * Any exception (network, parse) → ``UNKNOWN``.
+    * 200 with missing/non-dict ``instances`` envelope → ``PRESENT``
+      (the response is well-formed JSON but doesn't carry the
+      status field; we cannot prove the instance is gone).
 
     The empty-status case is intentionally NOT ``GONE``: the
     Vast.ai dashboard API may return empty status for transient
     states (just-booted, just-stopped, error). Only an explicit
     "destroyed" status is affirmative evidence.
+
+    The Vast.ai ``GET /api/v0/instances/{id}/`` response wraps the
+    instance under an ``instances`` object, and the status field
+    is ``actual_status``. Both the envelope and the nested field
+    are required for a correct parse.
     """
     try:
         verify = requests.get(f"{BASE_URL}/{instance_id}/", headers=hdrs, timeout=10)
@@ -866,7 +948,7 @@ def vastai_verify(instance_id: str, hdrs: dict[str, str]) -> VerifyResult:
             error=f"http {verify.status_code}",
         )
     try:
-        raw_status = verify.json().get("actual_status")
+        payload = verify.json()
     except Exception as exc:
         logger.warning("vastai_verify: JSON parse raised %s — UNKNOWN", exc)
         return VerifyResult(
@@ -874,16 +956,38 @@ def vastai_verify(instance_id: str, hdrs: dict[str, str]) -> VerifyResult:
             status_code=200,
             error=str(exc),
         )
-    if not isinstance(raw_status, str):
+    if not isinstance(payload, dict):
         logger.warning(
-            "vastai_verify: actual_status is not a string: %r — PRESENT",
+            "vastai_verify: response is not a dict: %r — UNKNOWN",
+            type(payload).__name__,
+        )
+        return VerifyResult(
+            verdict=VerifyVerdict.UNKNOWN,
+            status_code=200,
+            error="non-dict response",
+        )
+    instance = payload.get("instances")
+    if not isinstance(instance, dict):
+        # Well-formed JSON but missing the `instances` envelope.
+        # We cannot prove the instance is gone; treat as PRESENT
+        # so the protocol does not falsely report DESTROYED.
+        logger.warning(
+            "vastai_verify: missing or non-dict 'instances' envelope — PRESENT",
+        )
+        return VerifyResult(verdict=VerifyVerdict.PRESENT, status_code=200)
+    raw_status = instance.get("actual_status")
+    if not isinstance(raw_status, str):
+        # Empty, missing, or non-string: the instance is still listed
+        # and we cannot prove it is gone.
+        logger.warning(
+            "vastai_verify: actual_status missing or non-string: %r — PRESENT",
             raw_status,
         )
         return VerifyResult(verdict=VerifyVerdict.PRESENT, status_code=200)
     if raw_status == "destroyed":
         return VerifyResult(verdict=VerifyVerdict.GONE, status_code=200)
-    # Empty string, missing key, or any other value: the instance is
-    # still listed. We cannot prove it is gone.
+    # Any other non-"destroyed" status (running, stopped, exited, ...):
+    # the instance is still listed. We cannot prove it is gone.
     return VerifyResult(verdict=VerifyVerdict.PRESENT, status_code=200)
 
 
@@ -1037,6 +1141,16 @@ The zombie sweep lives in `orchestrator.py:sweep_zombie_instances` as today. The
 
 ```python
 # In orchestrator.py — sweep_zombie_instances, after the refactor:
+#
+# Existing import: ``from vastai_gpu_runner.providers.vastai import vastai_cmd``.
+# New import:        ``from vastai_gpu_runner.providers.vastai import
+#                     verify_instance_ownership`` (the existing CLI-backed
+#                     ownership check, used in the CLI fallback path).
+# New import:        ``from collections.abc import AbstractSet``.
+# New import:        ``from vastai_gpu_runner.providers.destroy import
+#                     DestroyRefusal, DestroyVerdict``.
+# New import:        ``from vastai_gpu_runner.providers.destroy_adapters.vastai
+#                     import destroy_vastai_instance``.
 
 def sweep_zombie_instances(
     live_runners: dict[int, tuple[CloudRunner, CloudInstance]],
@@ -1058,7 +1172,11 @@ def sweep_zombie_instances(
 
     The CLI fallback is opportunistic: it runs only for
     ``DestroyResult.refusal == NO_CREDENTIALS`` and is recorded
-    in a separate counter (``cli_attempted``). Ownership and
+    in a separate counter (``cli_attempted``). The CLI fallback
+    MUST run ``verify_instance_ownership`` (CLI-backed) before
+    invoking the CLI destroy — without this check, the CLI
+    path bypasses the allowlist on the REST-disabled code path.
+    Ownership and
     credentials-disabled refusals are never bypassed by the CLI.
     The ``killed`` counter is incremented only on confirmed
     destroy (``verdict == DESTROYED``).
@@ -1106,10 +1224,27 @@ def sweep_zombie_instances(
                 iid,
             )
         elif result.refusal == DestroyRefusal.NO_CREDENTIALS:
-            # CLI fallback permitted. The CLI may have its own auth
-            # independent of the Python loader. The killed counter
-            # does not increment because we cannot verify the result
-            # through the CLI without significant work.
+            # CLI fallback permitted — the CLI may have its own auth
+            # independent of the Python loader. The ownership guard
+            # MUST run before the CLI destroy. The CLI-based
+            # ``verify_instance_ownership`` queries through the CLI's
+            # own authentication context and checks the instance's
+            # ``image_uuid`` against the allowlist. Without this,
+            # the CLI fallback would bypass the allowlist on the
+            # REST-disabled path.
+            if allowed_images is not None and not verify_instance_ownership(
+                iid, allowed_images=frozenset(allowed_images),
+            ):
+                logger.error(
+                    "Zombie sweep: CLI ownership check refused destroy of %s "
+                    "(allowed_images has %d entries). Skipping.",
+                    iid, len(allowed_images),
+                )
+                continue
+            # Ownership passes (or no allowlist was configured).
+            # The killed counter does not increment because we
+            # cannot verify the result through the CLI without
+            # significant work.
             try:
                 vastai_cmd(["destroy", "instance", iid], timeout=15)
                 cli_attempted += 1
@@ -1188,7 +1323,7 @@ The `allowed_images` field is intentionally distinct from the label-prefix bound
 
 The fresh `allowed_images` is normalised to `frozenset` at construction so downstream calls (which all use `AbstractSet[str]`) work identically whether the caller passed a `set`, `frozenset`, or any other `AbstractSet` implementation. This matches the existing `VastaiRunner.allowed_images` contract, which is `frozenset[str] | None`.
 
-**Known limitation (to be addressed in a follow-up issue).** Adding `allowed_images` directly to the provider-neutral `BatchOrchestrator` weakens its "no provider coupling" principle and creates a second independently configured copy of the runner's ownership policy. The longer-term shape is a `destroy_zombie` callback or a provider cleanup policy on the runner — the orchestrator would invoke the callback per orphan rather than carrying the allowlist. See the tracking issue for the proposal.
+**Known limitation (tracked in [#19](https://github.com/Lambda-Biolab/vastai-gpu-runner/issues/19)).** Adding `allowed_images` directly to the provider-neutral `BatchOrchestrator` weakens its "no provider coupling" principle and creates a second independently configured copy of the runner's ownership policy. The longer-term shape is a `destroy_zombie` callback or a provider cleanup policy on the runner — the orchestrator would invoke the callback per orphan rather than carrying the allowlist. See issue #19 for the proposal, the open questions, and the acceptance criteria. Issue #19 also notes that Option A (per-runner `destroy_zombie` method) needs more design work because a zombie candidate is by definition not in the live-runner map; Option B (`ProviderCleanupPolicy` dataclass) is the more directly implementable proposal.
 
 ## Two-stage poll loop
 
@@ -1434,7 +1569,7 @@ The following test cases must be enumerated in the implementation PR. The design
 - **DestroyResult invariants.**
   - `DestroyResult()` (neither field) raises `ValueError`.
   - `DestroyResult(verdict=DESTROYED, refusal=NO_CREDENTIALS)` (both fields) raises `ValueError`.
-  - `DestroyResult(verdict=DESTROYED, attempts=0)` (verdict set, non-zero attempts) is fine — `attempts` is per-protocol-attempt.
+  - `DestroyResult(verdict=DESTROYED, attempts=0)` (verdict set, `attempts=0`) is fine — `attempts` is per-protocol-attempt and may legitimately be 0 on a successful first-try delete where no retries ran.
   - `DestroyResult(refusal=NO_CREDENTIALS, attempts=1)` raises `ValueError` (refusal set, attempts must be 0).
   - `DestroyResult(refusal=NO_CREDENTIALS, last_status_code=500)` raises `ValueError` (refusal set, last_status_code must be None).
   - `DestroyResult(refusal=NO_CREDENTIALS, verify_error="...")` raises `ValueError` (refusal set, verify_error must be None).
@@ -1448,19 +1583,68 @@ The following test cases must be enumerated in the implementation PR. The design
 - **Matching allowlist.** Instance image is in the set. Proceeds.
 - **Non-matching allowlist.** Instance image is not in the set. Returns `DestroyResult(refusal=OWNERSHIP)` with refusal logged.
 - **REST ownership check uses same headers as destroy.** When a REST key is available, `verify_instance_ownership_rest` is called with the same `hdrs` used for `vastai_stop`/`vastai_delete`/`vastai_verify`. The CLI-based `verify_instance_ownership` is only called in the CLI fallback path. (Test: spy on the requests call to assert the auth header is shared.)
-- **`VASTAI_API_KEY` env unset, no file.** `read_vastai_api_key()` returns `CredentialResolution(state=CredentialState.ABSENT, key="")`. The adapter returns `DestroyResult(refusal=NO_CREDENTIALS)`.
-- **`VASTAI_API_KEY` env empty.** `read_vastai_api_key()` returns `CredentialResolution(state=CredentialState.EXPLICITLY_DISABLED, key="")`. The adapter returns `DestroyResult(refusal=CREDENTIALS_DISABLED)`. **This is the safety-critical test for the credential-state blocker fix.** The file credentials are NEVER consulted.
-- **`VASTAI_API_KEY` env unset, file present.** `read_vastai_api_key()` returns `CredentialResolution(state=CredentialState.AVAILABLE, key="<file content>")`. Protocol runs.
-- **`VASTAI_API_KEY` env set.** `read_vastai_api_key()` returns `CredentialResolution(state=CredentialState.AVAILABLE, key="<env value>")`. Protocol runs.
+
+**Schema contract tests.** All ownership and verification tests use the production-shaped Vast.ai response payload, NOT a flat mock:
+
+```python
+def _make_response(
+    *,
+    status_code: int = 200,
+    payload: dict | None = None,
+) -> dict:
+    """Build a production-shaped Vast.ai response payload."""
+    if payload is None:
+        payload = {
+            "instances": {
+                "id": 123,
+                "image_uuid": "nvidia/cuda:12.4.0-devel-ubuntu22.04",
+                "actual_status": "running",
+            }
+        }
+    return {"status_code": status_code, "json": payload}
+```
+
+The following tests assert the **nested** `instances.image_uuid` and `instances.actual_status` fields:
+
+- **REST ownership 200 with nested `image_uuid` matching the allowlist.** Returns `True`.
+- **REST ownership 200 with nested `image_uuid` not matching.** Returns `False`.
+- **REST ownership 200 with missing `instances` envelope.** Returns `False` (fail-closed).
+- **REST ownership 200 with non-dict `instances`.** Returns `False`.
+- **REST ownership 200 with missing `image_uuid`.** Returns `False`.
+- **REST ownership 200 with non-string `image_uuid`.** Returns `False`.
+- **Vast.ai verify 200 with nested `instances.actual_status == "destroyed"`.** Returns `VerifyResult(verdict=GONE, status_code=200)`. **This is the safety-critical test for the schema fix.**
+- **Vast.ai verify 200 with nested `instances.actual_status == "running"`.** Returns `VerifyResult(verdict=PRESENT, status_code=200)`.
+- **Vast.ai verify 200 with nested empty `instances.actual_status`.** Returns `VerifyResult(verdict=PRESENT, status_code=200)`.
+- **Vast.ai verify 200 with missing `instances` envelope.** Returns `VerifyResult(verdict=PRESENT, status_code=200)` — the response is well-formed JSON but doesn't carry the status; we cannot prove the instance is gone.
+- **Vast.ai verify 200 with non-dict `instances` (e.g. a list or string).** Returns `VerifyResult(verdict=PRESENT, status_code=200)`.
+- **Vast.ai verify 200 with `instances.actual_status` missing.** Returns `VerifyResult(verdict=PRESENT, status_code=200)`.
+- **Vast.ai verify 200 with non-string `instances.actual_status` (e.g. None).** Returns `VerifyResult(verdict=PRESENT, status_code=200)`.
+
+> Do not write tests with flat payloads like `{"image": ...}` or `{"actual_status": ...}` — those do not match the production API and would pass against the wrong (top-level) parser. The mock helper above enforces the production shape.
+
 - **Vast.ai verify 404.** Returns `VerifyResult(verdict=GONE, status_code=404)`.
-- **Vast.ai verify 200 with `actual_status == "destroyed"`.** Returns `VerifyResult(verdict=GONE, status_code=200)`.
-- **Vast.ai verify 200 with empty `actual_status`.** Returns `VerifyResult(verdict=PRESENT, status_code=200)`. **This is the safety-critical test for the empty-status fix.**
-- **Vast.ai verify 200 with missing `actual_status` key.** Returns `VerifyResult(verdict=PRESENT, status_code=200)`.
-- **Vast.ai verify 200 with non-string `actual_status` (e.g. None).** Returns `VerifyResult(verdict=PRESENT, status_code=200)`.
-- **Vast.ai verify 200 with `actual_status == "running"`.** Returns `VerifyResult(verdict=PRESENT, status_code=200)`.
 - **Vast.ai verify 401 / 403 / 429 / 500.** Returns `VerifyResult(verdict=UNKNOWN, status_code=X, error="http X")`.
 - **Vast.ai verify JSON parse failure.** Returns `VerifyResult(verdict=UNKNOWN, status_code=200, error=...)`.
 - **Vast.ai verify network error.** Returns `VerifyResult(verdict=UNKNOWN, error=...)`.
+
+**Credential loader tests.** All `read_vastai_api_key` tests are direct unit tests, not integration tests:
+
+- **`VASTAI_API_KEY` env unset, no file.** Returns `CredentialResolution(state=CredentialState.ABSENT, key="")`. The adapter returns `DestroyResult(refusal=NO_CREDENTIALS)`.
+- **`VASTAI_API_KEY` env empty.** Returns `CredentialResolution(state=CredentialState.EXPLICITLY_DISABLED, key="")`. The adapter returns `DestroyResult(refusal=CREDENTIALS_DISABLED)`. **This is the safety-critical test for the credential-state blocker fix.** The file credentials are NEVER consulted.
+- **`VASTAI_API_KEY` env unset, file present.** Returns `CredentialResolution(state=CredentialState.AVAILABLE, key="<file content>")`. Protocol runs.
+- **`VASTAI_API_KEY` env set.** Returns `CredentialResolution(state=CredentialState.AVAILABLE, key="<env value>")`. Protocol runs.
+- **Blank file contents (`~/.config/vastai/vast_api_key` exists but is empty).** Returns `CredentialResolution(state=CredentialState.ABSENT, key="")` with a logged warning. **This is the safety-critical test for the blank-file fix.**
+- **Whitespace-only file contents.** Returns `CredentialResolution(state=CredentialState.ABSENT, key="")` with a logged warning.
+- **File read error (permission denied, transient I/O).** Returns `CredentialResolution(state=CredentialState.ABSENT, key="")` with a logged warning. The `OSError` does not escape from `read_vastai_api_key`. The adapter does not raise.
+
+**CredentialResolution invariant tests:**
+
+- `CredentialResolution(state=AVAILABLE, key="real-key")` is valid.
+- `CredentialResolution(state=AVAILABLE, key="")` raises `ValueError` (AVAILABLE requires non-empty key).
+- `CredentialResolution(state=AVAILABLE, key="   ")` raises `ValueError` (whitespace-only is not non-empty).
+- `CredentialResolution(state=ABSENT, key="")` is valid.
+- `CredentialResolution(state=ABSENT, key="leak")` raises `ValueError` (non-AVAILABLE must have empty key).
+- `CredentialResolution(state=EXPLICITLY_DISABLED, key="leak")` raises `ValueError`.
 
 ### Runner integration tests
 
@@ -1477,7 +1661,11 @@ The following test cases must be enumerated in the implementation PR. The design
 - **Sweep with `allowed_images=set()` and orphan candidate.** `destroy_vastai_instance` returns `OWNERSHIP`. The sweep skips the instance. CLI fallback does NOT fire. `killed` does not increment.
 - **Sweep with `allowed_images=None` and orphan candidate.** Protocol runs. `DESTROYED` increments `killed`. `LEAKED` and `UNKNOWN` are logged.
 - **Sweep with `CREDENTIALS_DISABLED` and orphan candidate.** The sweep logs the skip and does NOT invoke the CLI. `killed` does not increment; `cli_attempted` does not increment. **This is the safety-critical test for the credential-state blocker fix.**
-- **Sweep with `NO_CREDENTIALS` and orphan candidate.** CLI fallback fires. `cli_attempted` increments. `killed` does not increment.
+- **Sweep with `NO_CREDENTIALS` and orphan candidate (empty allowlist).** `destroy_vastai_instance` returns `NO_CREDENTIALS`. The sweep runs the CLI-based `verify_instance_ownership` first; the empty allowlist rejects; the sweep logs the refusal and does NOT invoke the CLI. `killed` does not increment; `cli_attempted` does not increment. **This is the safety-critical test for the CLI-fallback ownership fix.**
+- **Sweep with `NO_CREDENTIALS` and orphan candidate (non-matching allowlist).** Same as above: the CLI-based ownership check rejects; the CLI is not invoked. Test: spy on `vastai_cmd` to assert it is NOT called.
+- **Sweep with `NO_CREDENTIALS` and orphan candidate (matching allowlist).** The CLI-based ownership check passes; the CLI is invoked; `cli_attempted` increments.
+- **Sweep with `NO_CREDENTIALS` and orphan candidate (CLI ownership lookup fails, e.g. transient CLI error).** The sweep logs the failure and does NOT invoke the CLI. `cli_attempted` does not increment. (The CLI ownership check itself returns `False` on lookup failure — fail-closed.)
+- **Sweep with `allowed_images=None` and `NO_CREDENTIALS` (no allowlist, REST path is no-credentials).** The sweep invokes the CLI fallback directly (no ownership check to run). `cli_attempted` increments.
 - **Sweep with `OWNERSHIP` and `NO_CREDENTIALS` simultaneously (impossible in practice but documents the precedence).** `OWNERSHIP` takes precedence. CLI fallback does NOT fire.
 - **Sweep with `CREDENTIALS_DISABLED` and `NO_CREDENTIALS` simultaneously (impossible in practice but documents the precedence).** `CREDENTIALS_DISABLED` takes precedence. CLI fallback does NOT fire.
 
@@ -1496,7 +1684,7 @@ For the implementer (one PR, one PR-number):
 9. Update `BatchOrchestrator._poll_cycle_once` to use the two-stage shape (classify-all → preemptions → parallel finalise). Add `_handle_preempt`. Update `BatchOrchestrator._check_unit` to use the same primitive. Delete `_classify_live_unit`. Mark `_check_unit` deprecated.
 10. New tests `tests/test_unit_lifecycle.py`, `tests/test_destroy.py`, `tests/test_destroy_adapters_vastai.py`, `tests/test_zombie_sweep.py`. Update `tests/test_batch.py` and `tests/test_batch_orchestrator.py`. The critical regression tests for this revision: empty `actual_status` returns `PRESENT`, `VASTAI_API_KEY=""` returns `CREDENTIALS_DISABLED` and the CLI fallback does not fire, `verify_error` is propagated from `verify_fn` to `DestroyResult`, `DestroyResult` invariants reject refusal with non-zero `attempts` / `last_status_code` / `stop_error` / `verify_error`.
 11. Update `CHANGELOG.md` with the v3 changes.
-12. File the tracking issue for the longer-term zombie-destroy callback / provider cleanup policy (the `allowed_images` parameter on `BatchOrchestrator` is the immediate fix; the deeper shape is a callback the orchestrator invokes per orphan).
+12. (Already done in this design PR.) The tracking issue is [#19](https://github.com/Lambda-Biolab/vastai-gpu-runner/issues/19) "Replace `BatchOrchestrator.allowed_images` with a zombie-destroy callback or provider cleanup policy." The issue documents the two candidate shapes, the open questions (CLI fallback location, runner factory reconciliation, `_handle_preempt` interaction, `LocalRunner` accommodation), and the acceptance criteria. Do not block the v3 implementation on this; revisit before the second adapter ships.
 
 ## Review process
 
@@ -1515,8 +1703,12 @@ This design is published as a PR for review before implementation begins. Review
 - **CLI fallback honesty.** Is the `cli_attempted` counter separate from `killed` the right way to encode the opportunistic nature of the CLI fallback?
 - **Credential precedence.** Does the env-first + three-state semantics match the project's intent for Vast.ai credentials? Does the `CREDENTIALS_DISABLED` refusal correctly propagate to the zombie sweep and prevent CLI fallback?
 - **REST ownership uses same auth identity.** When REST is available, does `verify_instance_ownership_rest` use the same `hdrs` as `destroy_vastai_instance`?
+- **Schema correctness.** Do the adapter tests use the production-shaped nested `instances.image_uuid` / `instances.actual_status` payload (not flat `image` / `actual_status` at the top level)? Do the implementation tests assert the nested parse?
+- **CLI fallback ownership.** Does the zombie sweep's `NO_CREDENTIALS` branch call `verify_instance_ownership` (CLI-backed) before invoking the CLI destroy, with all four ownership outcomes tested (empty allowlist, non-matching, matching, lookup failure)?
 - **`verify_error` preservation.** Does the `verify_error` field on `DestroyResult` correctly carry the most recent `verify_fn` error through the protocol?
 - **`DestroyResult` invariants.** Do the `__post_init__` checks correctly reject `refusal`-with-non-zero-`attempts` / `last_status_code` / `stop_error` / `verify_error`?
+- **`CredentialResolution` invariants.** Do the `__post_init__` checks reject `AVAILABLE` with empty/whitespace key, and `non-AVAILABLE` with non-empty key?
+- **Blank-file / read-error handling.** Does `read_vastai_api_key` return `ABSENT` (with warning) for blank files and `OSError` on read, rather than `AVAILABLE` with empty key or escaping exceptions?
 - **Biolab-runners precedent.** The biolab-runners v15 PR ([#88](https://github.com/Lambda-Biolab/biolab-runners/pull/88)) and v14 PR ([#82](https://github.com/Lambda-Biolab/biolab-runners/pull/82)) are the precedent. Does this design match v15's discipline (localised observation sequence, frozen dataclass plans, ClassVar action enum) and v14's discipline (one protocol module, one adapter per provider, callbacks + policy over class hierarchy)?
 
 Discussion thread: the PR comments.
