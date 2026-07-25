@@ -449,10 +449,37 @@ class DestroyResult:
                     f"DestroyResult.refusal={self.refusal} but verify_error is set "
                     "(protocol never ran; verify_error must be None)"
                 )
+        else:
+            # Protocol ran. ``belt_and_suspenders`` increments
+            # ``attempts`` before the first DELETE in phase 2,
+            # so every protocol-produced result has
+            # ``attempts >= 1``. Independently constructed
+            # results with ``verdict`` set and ``attempts=0``
+            # are not produced by the protocol and are
+            # rejected as a contract violation.
+            if self.attempts < 1:
+                raise ValueError(
+                    f"DestroyResult.verdict={self.verdict} but attempts={self.attempts} "
+                    "(protocol always increments attempts to >=1 before the first DELETE)"
+                )
 
 
 class StopFn(Protocol):
-    """Best-effort stop (kills stuck Docker pulls). Must not raise."""
+    """Best-effort stop (kills stuck Docker pulls).
+
+    May raise on transport failures (network errors, HTTP
+    4xx/5xx from the dashboard). The protocol catches the
+    exception and records it in
+    ``DestroyResult.stop_error``; DELETE still runs.
+
+    The previous wording ("Must not raise") was incorrect: the
+    protocol's try/except block in phase 1 explicitly handles
+    stop failures by recording them and continuing. HTTP
+    failures must be raised so the protocol can record them;
+    a silent success on a 401 would mean the stop never
+    happened but the protocol would proceed to DELETE without
+    a recorded error.
+    """
     def __call__(self) -> None: ...
 
 
@@ -711,8 +738,17 @@ class CredentialResolution:
     Invariants (enforced in ``__post_init__``):
 
     * When ``state == AVAILABLE``, ``key`` is a non-empty
-      stripped string.
+      string and is already stripped (no leading/trailing
+      whitespace).
     * When ``state != AVAILABLE``, ``key`` is exactly ``""``.
+
+    The "already stripped" rule prevents a caller from
+    constructing ``CredentialResolution(state=AVAILABLE,
+    key=" real-key ")`` and accidentally passing a
+    whitespace-padded key to a downstream check that compares
+    against a stripped expected value. The loader itself
+    always strips before construction, so this rule
+    primarily protects direct construction.
 
     Callers must branch on ``state`` rather than on the key's
     truthiness — ``EXPLICITLY_DISABLED`` and ``ABSENT`` both
@@ -723,10 +759,19 @@ class CredentialResolution:
 
     def __post_init__(self) -> None:
         if self.state == CredentialState.AVAILABLE:
+            if not self.key:
+                raise ValueError(
+                    f"CredentialResolution: state=AVAILABLE but key is empty: {self.key!r}"
+                )
             if not self.key.strip():
                 raise ValueError(
-                    f"CredentialResolution: state=AVAILABLE but key is empty "
-                    f"(or whitespace-only): {self.key!r}"
+                    f"CredentialResolution: state=AVAILABLE but key is "
+                    f"whitespace-only: {self.key!r}"
+                )
+            if self.key != self.key.strip():
+                raise ValueError(
+                    f"CredentialResolution: state=AVAILABLE but key has "
+                    f"leading/trailing whitespace (must be pre-stripped): {self.key!r}"
                 )
         else:
             if self.key:
@@ -802,23 +847,81 @@ def read_vastai_api_key() -> CredentialResolution:
     return CredentialResolution(state=CredentialState.ABSENT)
 
 
+def _repository(ref: str) -> str:
+    """Strip the tag and digest from a Docker image reference.
+
+    Returns the bare repository name suitable for equality
+    comparison against an allowlist entry. A tag is only
+    stripped when the final colon appears after the final
+    slash (so ``registry:5000/myorg/app:1.0`` parses to
+    ``registry:5000/myorg/app``, not ``registry``). A digest
+    (``@sha256:...``) is always stripped. Empty or malformed
+    references return ``""``.
+
+    Examples::
+
+        >>> _repository("myorg/app:1.0")
+        'myorg/app'
+        >>> _repository("registry:5000/myorg/app:1.0")
+        'registry:5000/myorg/app'
+        >>> _repository("myorg/app@sha256:abcdef...")
+        'myorg/app'
+        >>> _repository("myorg/app")
+        'myorg/app'
+        >>> _repository("")  # malformed
+        ''
+    """
+    if not ref:
+        return ""
+    without_digest = ref.split("@", 1)[0]
+    last_slash = without_digest.rfind("/")
+    last_colon = without_digest.rfind(":")
+    if last_colon > last_slash:
+        return without_digest[:last_colon]
+    return without_digest
+
+
 def _image_is_allowed(image: str, allowed_images: AbstractSet[str]) -> bool:
     """Check whether the instance's image matches the allowlist.
 
-    The matching rules match the existing
-    ``verify_instance_ownership`` semantics: exact match first,
-    then prefix match (where the prefix is the part before the
-    first ``:`` in the allowlist entry, supporting image tags).
+    Matching rules:
+
+    1. **Exact reference match** — the image string equals an
+       allowlist entry character-for-character. Covers
+       ``myorg/app:1.0`` against allowlist entry
+       ``myorg/app:1.0``.
+
+    2. **Tag-insensitive repository match** — the bare
+       repository of the image equals the bare repository of
+       an allowlist entry. Covers ``myorg/app:latest`` against
+       allowlist entry ``myorg/app:1.0``: both reduce to
+       ``myorg/app``. This is the practical policy for
+       ``"any tag of myorg/app is OK"`` allowlists.
+
+    Rules that are explicitly NOT supported (would be
+    ownership-safety defects):
+
+    * **Substring/prefix match** — ``myorg/app:1.0`` must
+      not match ``myorg/app-malicious:latest`` (a
+      privilege-escalation risk).
+    * **Registry-port-as-prefix** — ``registry:5000/myorg/app:1.0``
+      must not produce prefix ``registry`` and match every
+      image starting with ``registry``.
+
+    Returns ``False`` for empty or malformed image strings
+    (fail-closed).
     """
     if not image:
         return False
     if image in allowed_images:
         return True
-    for entry in allowed_images:
-        prefix = entry.split(":", 1)[0]
-        if prefix and image.startswith(prefix):
-            return True
-    return False
+    image_repo = _repository(image)
+    if not image_repo:
+        return False
+    return any(
+        image_repo == _repository(allowed)
+        for allowed in allowed_images
+    )
 
 
 def verify_instance_ownership_rest(
@@ -887,14 +990,27 @@ def verify_instance_ownership_rest(
 
 
 def vastai_stop(instance_id: str, hdrs: dict[str, str]) -> None:
-    """Best-effort stop. Raises on transport failures (caught by
-    ``belt_and_suspenders``)."""
-    requests.put(
+    """Best-effort stop. Raises on transport failures and HTTP
+    4xx/5xx so the protocol records them in
+    ``DestroyResult.stop_error``.
+
+    ``requests.put`` does not raise on HTTP error statuses; the
+    response must be inspected explicitly. A 401, 403, 429, or
+    5xx response is a real stop failure — the stop never
+    happened, but a silent return would let DELETE proceed
+    without a recorded error.
+    """
+    resp = requests.put(
         f"{BASE_URL}/{instance_id}/",
         headers={**hdrs, "Content-Type": "application/json"},
         json={"state": "stopped"},
         timeout=10,
     )
+    if resp.status_code not in (200, 204):
+        raise RuntimeError(
+            f"vastai_stop: PUT {instance_id} returned {resp.status_code}: "
+            f"{resp.text[:200]}"
+        )
 
 
 def vastai_delete(instance_id: str, hdrs: dict[str, str]) -> bool:
@@ -1170,6 +1286,18 @@ def sweep_zombie_instances(
     the image allowlist determines *whether* each candidate may
     be destroyed.
 
+    Short-circuit: if the operator has set ``VASTAI_API_KEY=""``
+    (``CredentialState.EXPLICITLY_DISABLED``), the function
+    returns 0 immediately with a logged warning. The sweep
+    would otherwise enumerate instances through the CLI
+    (``vastai_cmd(["show", "instances", "--raw"])``) which uses
+    file credentials — the very credentials the operator
+    meant to disable. Returning early is the consistent
+    behaviour: the operator's intent is "no credentials
+    anywhere, including enumeration." Orphans must be cleaned
+    up by the operator manually after re-enabling
+    credentials.
+
     The CLI fallback is opportunistic: it runs only for
     ``DestroyResult.refusal == NO_CREDENTIALS`` and is recorded
     in a separate counter (``cli_attempted``). The CLI fallback
@@ -1181,6 +1309,17 @@ def sweep_zombie_instances(
     The ``killed`` counter is incremented only on confirmed
     destroy (``verdict == DESTROYED``).
     """
+    # Short-circuit on operator-disabled credentials. The
+    # enumeration step would otherwise use file credentials
+    # via the CLI, contradicting the operator's intent.
+    resolution = read_vastai_api_key()
+    if resolution.state == CredentialState.EXPLICITLY_DISABLED:
+        logger.warning(
+            "Zombie sweep: VASTAI_API_KEY='' — EXPLICITLY_DISABLED. "
+            "Skipping enumeration and orphan cleanup. Operator "
+            "must re-enable credentials or clean up manually."
+        )
+        return 0
     # ... existing enumeration via vastai_cmd (unchanged) ...
     killed = 0
     cli_attempted = 0
@@ -1323,7 +1462,7 @@ The `allowed_images` field is intentionally distinct from the label-prefix bound
 
 The fresh `allowed_images` is normalised to `frozenset` at construction so downstream calls (which all use `AbstractSet[str]`) work identically whether the caller passed a `set`, `frozenset`, or any other `AbstractSet` implementation. This matches the existing `VastaiRunner.allowed_images` contract, which is `frozenset[str] | None`.
 
-**Known limitation (tracked in [#19](https://github.com/Lambda-Biolab/vastai-gpu-runner/issues/19)).** Adding `allowed_images` directly to the provider-neutral `BatchOrchestrator` weakens its "no provider coupling" principle and creates a second independently configured copy of the runner's ownership policy. The longer-term shape is a `destroy_zombie` callback or a provider cleanup policy on the runner — the orchestrator would invoke the callback per orphan rather than carrying the allowlist. See issue #19 for the proposal, the open questions, and the acceptance criteria. Issue #19 also notes that Option A (per-runner `destroy_zombie` method) needs more design work because a zombie candidate is by definition not in the live-runner map; Option B (`ProviderCleanupPolicy` dataclass) is the more directly implementable proposal.
+**Known limitation (tracked in [#19](https://github.com/Lambda-Biolab/vastai-gpu-runner/issues/19)).** Adding `allowed_images` directly to the provider-neutral `BatchOrchestrator` weakens its "no provider coupling" principle and creates a second independently configured copy of the runner's ownership policy. The longer-term shape is a `destroy_zombie` callback or a `ProviderCleanupPolicy` dataclass. See issue #19 for the proposal, the open questions, and the acceptance criteria. Issue #19 also notes that Option A (per-runner `destroy_zombie` method) needs more design work because a zombie candidate is by definition not in the live-runner map; Option B (`ProviderCleanupPolicy` dataclass) is the more directly implementable proposal. The Option B polish (single canonical provider config shared between runner factory and cleanup policy, rather than re-constructing runners on every destroy) is also tracked in #19.
 
 ## Two-stage poll loop
 
@@ -1569,7 +1708,10 @@ The following test cases must be enumerated in the implementation PR. The design
 - **DestroyResult invariants.**
   - `DestroyResult()` (neither field) raises `ValueError`.
   - `DestroyResult(verdict=DESTROYED, refusal=NO_CREDENTIALS)` (both fields) raises `ValueError`.
-  - `DestroyResult(verdict=DESTROYED, attempts=0)` (verdict set, `attempts=0`) is fine — `attempts` is per-protocol-attempt and may legitimately be 0 on a successful first-try delete where no retries ran.
+  - `DestroyResult(verdict=DESTROYED, attempts=0)` raises `ValueError` (verdict set, `attempts >= 1` is required — the protocol always increments before the first DELETE).
+  - `DestroyResult(verdict=LEAKED, attempts=0)` raises `ValueError` (same rule).
+  - `DestroyResult(verdict=UNKNOWN, attempts=0)` raises `ValueError` (same rule).
+  - `DestroyResult(verdict=DESTROYED, attempts=1)` is valid.
   - `DestroyResult(refusal=NO_CREDENTIALS, attempts=1)` raises `ValueError` (refusal set, attempts must be 0).
   - `DestroyResult(refusal=NO_CREDENTIALS, last_status_code=500)` raises `ValueError` (refusal set, last_status_code must be None).
   - `DestroyResult(refusal=NO_CREDENTIALS, verify_error="...")` raises `ValueError` (refusal set, verify_error must be None).
@@ -1583,6 +1725,33 @@ The following test cases must be enumerated in the implementation PR. The design
 - **Matching allowlist.** Instance image is in the set. Proceeds.
 - **Non-matching allowlist.** Instance image is not in the set. Returns `DestroyResult(refusal=OWNERSHIP)` with refusal logged.
 - **REST ownership check uses same headers as destroy.** When a REST key is available, `verify_instance_ownership_rest` is called with the same `hdrs` used for `vastai_stop`/`vastai_delete`/`vastai_verify`. The CLI-based `verify_instance_ownership` is only called in the CLI fallback path. (Test: spy on the requests call to assert the auth header is shared.)
+
+**Image-matching contract tests** (CONTRACT TESTS for the image-allowlist safety fix). The matching policy is exact-reference OR tag-insensitive repository equality. Substring / prefix / registry-port-as-prefix matches are forbidden (ownership-safety defects).
+
+- **`myorg/app:1.0` in allowlist, instance `myorg/app:1.0`.** Returns `True` (exact reference match).
+- **`myorg/app:1.0` in allowlist, instance `myorg/app:latest`.** Returns `True` (tag-insensitive repository match: both reduce to `myorg/app`).
+- **`myorg/app:1.0` in allowlist, instance `myorg/app@sha256:abc...`.** Returns `True` (tag-insensitive repository match after digest strip).
+- **`myorg/app:1.0` in allowlist, instance `myorg/app-malicious:latest`.** Returns **`False`**. **This is the safety-critical test for the prefix-defect fix.** A naive prefix match would accept this image.
+- **`myorg/app:1.0` in allowlist, instance `myorg/app-malicious`.** Returns `False` (no tag, repository is `myorg/app-malicious`, not `myorg/app`).
+- **`registry:5000/myorg/app:1.0` in allowlist, instance `registry:5000/myorg/app:1.0`.** Returns `True`.
+- **`registry:5000/myorg/app:1.0` in allowlist, instance `registry:6000/myorg/app:1.0`.** Returns `False` (different registry host;port).
+- **`registry:5000/myorg/app:1.0` in allowlist, instance `registry-malicious/myorg/app:1.0`.** Returns `False` (different registry; this is the safety-critical test that a naive "prefix = part before first colon" implementation would have accepted because `registry` is a prefix of `registry-malicious`).
+- **`myorg/app:1.0` in allowlist, instance `myorg/other:1.0`.** Returns `False` (different repository).
+- **Empty image string.** Returns `False` (fail-closed).
+- **Empty allowlist entry.** Returns `False` (the `if not image` guard).
+
+**`vastai_stop` HTTP error tests** (CONTRACT TESTS for the HTTP-failure fix).
+
+- **`vastai_stop` on 401 response.** Raises `RuntimeError` with the status code. The protocol records it in `stop_error`; DELETE still runs.
+- **`vastai_stop` on 403 response.** Same.
+- **`vastai_stop` on 429 response.** Same.
+- **`vastai_stop` on 500 response.** Same.
+- **`vastai_stop` on 200 response.** Returns `None` (no exception).
+- **`vastai_stop` on network error.** Raises the underlying exception; the protocol records it.
+
+**`CredentialResolution` strict-strip test** (CONTRACT TEST for the strict-strip invariant).
+
+- `CredentialResolution(state=AVAILABLE, key=" real-key ")` raises `ValueError` (leading/trailing whitespace).
 
 **Schema contract tests.** All ownership and verification tests use the production-shaped Vast.ai response payload, NOT a flat mock:
 
@@ -1660,7 +1829,8 @@ The following tests assert the **nested** `instances.image_uuid` and `instances.
 
 - **Sweep with `allowed_images=set()` and orphan candidate.** `destroy_vastai_instance` returns `OWNERSHIP`. The sweep skips the instance. CLI fallback does NOT fire. `killed` does not increment.
 - **Sweep with `allowed_images=None` and orphan candidate.** Protocol runs. `DESTROYED` increments `killed`. `LEAKED` and `UNKNOWN` are logged.
-- **Sweep with `CREDENTIALS_DISABLED` and orphan candidate.** The sweep logs the skip and does NOT invoke the CLI. `killed` does not increment; `cli_attempted` does not increment. **This is the safety-critical test for the credential-state blocker fix.**
+- **Sweep with `VASTAI_API_KEY=""` (EXPLICITLY_DISABLED), no candidates enumerated.** The sweep's short-circuit fires at the top of the function: `read_vastai_api_key()` returns `EXPLICITLY_DISABLED`, the sweep logs the warning, and returns 0 BEFORE the CLI enumeration step. Test: spy on `vastai_cmd(["show", "instances", "--raw"])` to assert it is NOT called. The CLI (which would otherwise use file credentials) is never invoked. **This is the safety-critical test for the EXPLICITLY_DISABLED-scope fix.**
+- **Sweep with `CREDENTIALS_DISABLED` after the short-circuit (e.g. via the adapter on a non-existent orphan).** The adapter's `CREDENTIALS_DISABLED` refusal is still produced for the per-orphan path; the sweep logs the skip and does not invoke the CLI. `killed` does not increment; `cli_attempted` does not increment. **This is the safety-critical test for the credential-state blocker fix.** (The short-circuit prevents the per-orphan path from being reached in practice; this test exists to document the precedence.)
 - **Sweep with `NO_CREDENTIALS` and orphan candidate (empty allowlist).** `destroy_vastai_instance` returns `NO_CREDENTIALS`. The sweep runs the CLI-based `verify_instance_ownership` first; the empty allowlist rejects; the sweep logs the refusal and does NOT invoke the CLI. `killed` does not increment; `cli_attempted` does not increment. **This is the safety-critical test for the CLI-fallback ownership fix.**
 - **Sweep with `NO_CREDENTIALS` and orphan candidate (non-matching allowlist).** Same as above: the CLI-based ownership check rejects; the CLI is not invoked. Test: spy on `vastai_cmd` to assert it is NOT called.
 - **Sweep with `NO_CREDENTIALS` and orphan candidate (matching allowlist).** The CLI-based ownership check passes; the CLI is invoked; `cli_attempted` increments.
