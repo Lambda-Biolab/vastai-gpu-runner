@@ -9,25 +9,26 @@ motivated this doc see the [HTML report][review].
 
 ## What changes vs v2
 
-In one paragraph: the unit-lifecycle decision tree (R2 → SSH → worker_dead re-check → action) moves out of `BatchOrchestrator` into a new `unit_lifecycle` deep module exposing one function `decide_next_action(unit, runner, instance, is_done_in_r2) -> UnitAction`, where `UnitAction` is a tagged union of three frozen dataclasses (`Continue | Complete | Preempt`). The four-step belt-and-suspenders destroy protocol (stop → DELETE×retry → verify → re-destroy, with a second verification after resurrection cleanup) moves out of `VastaiRunner._rest_destroy` and the standalone helpers in `providers/vastai.py` into a new `providers/destroy` deep module exposing `belt_and_suspenders(stop_fn, delete_fn, verify_fn, *, policy: DestroyPolicy) -> DestroyResult`. The destroy protocol returns a typed `DestroyResult` (verdict + error context + attempt count), not a boolean; the request that started the refactor ("hide the timing constants in the protocol module") is reversed — the Vast.ai-discovered timings live in a `DestroyPolicy` so the loop in the generic module is provider-neutral. Two latent bugs disappear with the move: the orchestrator's zombie-sweep `_destroy_via_rest` (orchestrator.py:173) is a simplified copy that cannot handle resurrected instances and silently treats HTTP errors as "instance gone"; and the `BatchOrchestrator._check_unit` dispatch is mixed with state mutations, lock acquisition, and side effects across three methods. Both are corrected by the new module boundaries.
+In one paragraph: the unit-lifecycle decision tree (R2 → SSH → worker_dead re-check → action) moves out of `BatchOrchestrator` into a new `unit_lifecycle` deep module exposing one function `decide_next_action(unit, runner, instance, is_done_in_r2) -> UnitAction`, where `UnitAction` is a tagged union of three frozen dataclasses (`Continue | Complete | Preempt`). The four-step belt-and-suspenders destroy protocol moves out of `VastaiRunner._rest_destroy` and the standalone helpers in `providers/vastai.py` into a new `providers/destroy` deep module exposing `belt_and_suspenders`. The destroy protocol has two distinct enums: `VerifyVerdict` (the verifier's observation: `GONE | PRESENT | UNKNOWN`) and `DestroyVerdict` (the protocol's outcome: `DESTROYED | LEAKED | UNKNOWN`). The `VerifyFn` callback returns a `VerifyResult` carrying `verdict` + `status_code` + `error`. The protocol returns a `DestroyResult` carrying `verdict` (protocol outcome) or `refusal` (pre-protocol outcome: `OWNERSHIP | NO_CREDENTIALS`), but never both. This split makes the CLI fallback in the zombie sweep safe: a refusal for `OWNERSHIP` cannot be bypassed by falling back to the CLI. The destroy module owns the loop shape; provider-specific timing policy lives in a `DestroyPolicy` dataclass supplied by the adapter. Two latent bugs are corrected: the orchestrator's `_destroy_via_rest` silently treats HTTP errors as "instance gone," and the current `VastaiRunner.destroy_instance` ignores the destroy result and unconditionally returns `True`.
 
 Diff vs v2:
 
 - **+** `src/vastai_gpu_runner/unit_lifecycle.py` — `decide_next_action`, `Action` enum, `Continue | Complete | Preempt` plan types, `PreemptCause` enum, `ProgressSnapshot` dataclass
-- **+** `src/vastai_gpu_runner/providers/destroy.py` — `DestroyResult` / `DestroyVerdict` dataclasses, `DestroyPolicy` dataclass, `belt_and_suspenders()` function
-- **+** `src/vastai_gpu_runner/providers/destroy_adapters/vastai.py` — Vast.ai REST callbacks (`stop_fn`, `delete_fn`, `verify_fn`), `destroy_vastai_instance`, `read_vastai_api_key` (env-first precedence)
-- **~** `BatchOrchestrator._check_unit` becomes a thin wrapper (one deprecation cycle only — the API reference documents it as inherited lifecycle surface) that delegates to `decide_next_action` and a shared dispatch helper. `_classify_live_unit` is **deleted**, not wrapped.
-- **~** `BatchOrchestrator._poll_cycle_once` and `_check_unit` share a single dispatch helper so their logic cannot diverge
-- **~** `BatchOrchestrator._sweep_zombies` routes through `destroy_vastai_instance` (with CLI fallback when no API key) and increments `killed` on confirmed destroy only
+- **+** `src/vastai_gpu_runner/providers/destroy.py` — `VerifyVerdict` + `DestroyVerdict` + `DestroyRefusal` enums, `VerifyResult` + `DestroyResult` + `DestroyPolicy` dataclasses, `belt_and_suspenders()` function
+- **+** `src/vastai_gpu_runner/providers/destroy_adapters/vastai.py` — Vast.ai REST callbacks (`stop_fn`, `delete_fn`, `verify_fn`), `destroy_vastai_instance`, `read_vastai_api_key` (env-first precedence, fail-closed), `VASTAI_POLICY`
+- **~** `BatchOrchestrator.__init__` adds `allowed_images: set[str] | None = None` so the zombie sweep can apply the same image allowlist as the runner
+- **~** `BatchOrchestrator._poll_cycle_once` keeps its two-stage shape (classify-all → preemptions → parallel finalise) using the shared `decide_next_action` primitive
+- **~** `BatchOrchestrator._check_unit` becomes a thin wrapper (one deprecation cycle only — the API reference documents it as inherited lifecycle surface) that delegates to `decide_next_action`. `_classify_live_unit` is **deleted**, not wrapped.
+- **~** `BatchOrchestrator._sweep_zombies` routes through `destroy_vastai_instance` and branches on `DestroyResult.verdict` vs `DestroyResult.refusal`; CLI fallback only fires for `NO_CREDENTIALS`, never for `OWNERSHIP`
+- **~** `VastaiRunner.destroy_instance` returns `True` only when `DestroyResult.verdict == DESTROYED`. LEAKED and UNKNOWN return `False` with logged error/warning. `InstanceStatus.DESTROYED` is set only on confirmed destruction.
 - **~** `VastaiRunner._rest_destroy` delegates to `destroy_vastai_instance` with the `allowed_images` ownership guard preserved
 - **—** `orchestrator.py:_destroy_via_rest` (simplified copy, latent bug) **deleted**
 - **—** `orchestrator.py:poll_instance_progress` (dead public API, no callers anywhere) **deleted**
 - **—** `orchestrator.py:ensure_detached` (dead public API, no callers anywhere) **deleted**
-- **—** `orchestrator.py:load_vastai_api_key` (byte-for-byte duplicate of `_read_vastai_api_key`) **deleted**; `_read_vastai_api_key` promoted to public `read_vastai_api_key()` with env-first precedence and fail-closed semantics
+- **—** `orchestrator.py:load_vastai_api_key` (byte-for-byte duplicate of `_read_vastai_api_key`) **deleted**; credential loading moves to `providers/destroy_adapters/vastai.py` with env-first precedence and fail-closed semantics
 - **—** `providers/vastai.py:_rest_stop`, `_rest_delete_with_retries`, `_rest_verify_and_redestroy` **deleted**; absorbed into the Vast.ai adapter
 - **—** `BatchOrchestrator._classify_live_unit` **deleted** (not wrapped); its tests move to `test_unit_lifecycle.py`
-- **—** No changes to `runner.py` ABC signature
-- **—** No changes to `state.py`, `storage/r2.py`, `worker/base.py`, `estimator/`
+- **—** No changes to `runner.py` ABC signature, `storage/r2.py`, `worker/base.py`, `estimator/`
 
 ## Module taxonomy
 
@@ -45,13 +46,13 @@ Does **not** own: side effects (destroy, collect, capture_preempt_diagnostics, o
 
 ### New: `providers/destroy` — owns the belt-and-suspenders destroy protocol
 
-Owns: the loop shape (stop → DELETE×retry → verify → re-destroy, with second verification after resurrection cleanup). The generic loop takes a `DestroyPolicy` for timing/retry constants so the loop itself is policy-agnostic. Returns a typed `DestroyResult`, never a boolean.
+Owns: the loop shape (stop → DELETE×retry → verify → re-destroy, with second verification after resurrection cleanup). The generic loop takes a `DestroyPolicy` for timing/retry constants so the loop itself is policy-agnostic. Returns a typed `DestroyResult` with `verdict` (protocol outcome) or `refusal` (pre-protocol outcome), never both.
 
 Does **not** own: REST URLs, API key paths, image-ownership guard, timing constants. The constants live in the policy (supplied by the adapter); the URLs and credentials live in the adapter.
 
 ### New: `providers/destroy_adapters/vastai.py` — Vast.ai REST callbacks
 
-Owns: the three Vast.ai REST endpoints (`PUT state=stopped`, `DELETE`, `GET for verify`), the `read_vastai_api_key` call with env-first precedence and fail-closed semantics, the `allowed_images` ownership guard with `is not None` semantics, the `DestroyPolicy` constants (the Vast.ai-discovered 5s verify delay, 3s retry sleep, 3 max delete attempts).
+Owns: the three Vast.ai REST endpoints (`PUT state=stopped`, `DELETE`, `GET for verify`), the `read_vastai_api_key` call with env-first precedence and fail-closed semantics, the `allowed_images` ownership guard with `is not None` semantics, the `DestroyPolicy` constants (the Vast.ai-discovered 5s verify delay, 3s retry sleep, 3 max delete attempts), the `destroy_vastai_instance` function that wraps the protocol with pre-protocol refusals.
 
 The RunPod adapter lands separately when `RunPodRunner` ships (roadmap item 2). It will register its own `stop_fn` / `delete_fn` / `verify_fn` callbacks and its own `DestroyPolicy` (different retry timing may be appropriate for RunPod's API).
 
@@ -63,6 +64,8 @@ The RunPod adapter lands separately when `RunPodRunner` ships (roadmap item 2). 
 ├─────────────────────────────────────────────────┤
 │  BatchOrchestrator (batch.py)                   │  Phase loop + side-effect dispatchers
 │    └── calls unit_lifecycle.decide_next_action  │  (per-unit decision is delegated)
+│    └── _poll_cycle_once: two-stage shape        │
+│        (classify-all → preemptions → parallel)  │
 ├─────────────────────────────────────────────────┤
 │  unit_lifecycle (unit_lifecycle.py)             │  NEW: decision tree, no side effects
 │    └── Action enum + Continue/Complete/Preempt  │
@@ -73,6 +76,7 @@ The RunPod adapter lands separately when `RunPodRunner` ships (roadmap item 2). 
 ├─────────────────────────────────────────────────┤
 │  providers/destroy (providers/destroy.py)       │  NEW: belt-and-suspenders protocol
 │    └── belt_and_suspenders → DestroyResult      │
+│    └── VerifyVerdict + DestroyVerdict + Refusal │
 ├─────────────────────────────────────────────────┤
 │  providers/destroy_adapters/vastai.py           │  NEW: Vast.ai REST callbacks + policy
 │  providers/destroy_adapters/runpod.py (future)  │  [roadmap item 2]
@@ -138,7 +142,9 @@ class ProgressSnapshot:
     (``decide_next_action``) pass the snapshot through ``normalise``
     first, which coerces missing or malformed fields to safe
     defaults. Missing or contradictory fields never trigger a
-    destructive action — the conservative result is "still running".
+    destructive action — the conservative result is "still running":
+    both ``complete`` and ``worker_dead`` are set to False on
+    contradiction.
     """
     complete: bool = False
     worker_dead: bool = False
@@ -159,12 +165,15 @@ class ProgressSnapshot:
             logger.warning("check_progress.worker_dead is not bool: %r", worker_dead)
             worker_dead = False
         if complete and worker_dead:
-            # Contradictory — prefer the conservative read.
+            # Contradictory. Do not act on this — neither flag is
+            # trustworthy. Return "still running" with both flags
+            # cleared (the conservative read).
             logger.warning("check_progress has complete=True and worker_dead=True")
+            complete = False
             worker_dead = False
         if not isinstance(log_tail, str):
             log_tail = ""
-        return cls(complete=bool(complete), worker_dead=bool(worker_dead), log_tail=log_tail)
+        return cls(complete=complete, worker_dead=worker_dead, log_tail=log_tail)
 
 
 @dataclass(frozen=True)
@@ -274,13 +283,13 @@ Why the `is_done_in_r2` callable. The current `_classify_live_unit` is a method 
 
 Why the protocol type for `runner`. Injecting the full `CloudRunner` class would couple the decision module to the `runner.py` hierarchy. A structural protocol with one method (`check_progress`) lets tests pass a tiny stub without dragging in the rest of the ABC.
 
-Why `ProgressSnapshot` normaliser. The current `_classify_live_unit` does `progress.get("complete")` and `progress.get("worker_dead")` — both default to falsy if missing. A missing `complete` key, a `None` value, or a contradictory `complete=True, worker_dead=True` all silently propagate to the wrong verdict. The normaliser guards each coercion and logs every malformed response.
+Why `ProgressSnapshot` normaliser. The current `_classify_live_unit` does `progress.get("complete")` and `progress.get("worker_dead")` — both default to falsy if missing. A missing `complete` key, a `None` value, or a contradictory `complete=True, worker_dead=True` all silently propagate to the wrong verdict. The normaliser guards each coercion and logs every malformed response. Contradictory flags downgrades to "still running" (both flags clear) so no destructive action fires on the malformed input.
 
 Why `PreemptCause` not a free string. `classify_failure` (the consumer's hook) may eventually branch on the cause. A `str` reason field becomes an unstable policy API the moment two consumers want to dispatch differently. The enum is the stable contract; `detail` carries the human-readable context.
 
 ## `providers/destroy` shape
 
-Single public entry point, three callbacks per provider, structured `DestroyResult` return type, policy-supplied timings.
+Two distinct enums for two distinct concerns, plus a structured `DestroyResult` whose `verdict` and `refusal` fields are mutually exclusive.
 
 ```python
 # src/vastai_gpu_runner/providers/destroy.py
@@ -290,24 +299,60 @@ import logging
 import time
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Callable, Protocol, TYPE_CHECKING
-
-if TYPE_CHECKING:
-    pass
+from typing import Callable, Protocol
 
 logger = logging.getLogger(__name__)
 
 
-class DestroyVerdict(StrEnum):
-    """What the destroy attempt actually achieved.
+class VerifyVerdict(StrEnum):
+    """The verifier's observation at one instant in time.
 
-    Never collapse these into a bool. The Vast.ai dashboard API
+    The verifier does not know about the protocol's outcome — it
+    only answers: "is the instance present at this URL right now?"
+    The protocol translates this into ``DestroyVerdict``.
+    """
+    GONE = "gone"       # 404 OR 200 + actual_status == "destroyed"
+    PRESENT = "present" # 200 + actual_status != "destroyed" (incl. empty)
+    UNKNOWN = "unknown" # any other HTTP status, JSON parse failure,
+                        # network error, or non-string status
+
+
+class DestroyVerdict(StrEnum):
+    """The protocol's final outcome of a belt-and-suspenders attempt.
+
+    Never collapse this into a bool. The Vast.ai dashboard API
     returns 4xx and 5xx on transient issues; treating those as
     "destroyed" silently leaks running instances.
     """
     DESTROYED = "destroyed"  # confirmed gone on first verification
     LEAKED = "leaked"        # verified PRESENT after resurrection cleanup
-    UNKNOWN = "unknown"      # verification was uncertain (auth, network, etc.)
+    UNKNOWN = "unknown"      # verification was uncertain at any point
+
+
+class DestroyRefusal(StrEnum):
+    """Pre-protocol refusals — the belt-and-suspenders loop did not run.
+
+    The zombie sweep uses these to decide whether to fall back to
+    the CLI: ``NO_CREDENTIALS`` allows the fallback; ``OWNERSHIP``
+    forbids it (the image allowlist is the destruction-safety
+    boundary regardless of credentials).
+    """
+    OWNERSHIP = "ownership"           # image allowlist rejected the instance
+    NO_CREDENTIALS = "no_credentials" # no API key configured to run the protocol
+
+
+@dataclass(frozen=True)
+class VerifyResult:
+    """The verifier's observation plus HTTP context.
+
+    ``status_code`` is the HTTP status of the verify call (or
+    None if the verifier never made one). ``error`` carries the
+    exception message for transport failures or JSON parse
+    failures; None on success.
+    """
+    verdict: VerifyVerdict
+    status_code: int | None = None
+    error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -324,21 +369,48 @@ class DestroyPolicy:
     max_delete_attempts: int
     verify_after_resurrection: bool = True
 
+    def __post_init__(self) -> None:
+        if self.verify_delay_s < 0:
+            raise ValueError(
+                f"DestroyPolicy.verify_delay_s must be >= 0, got {self.verify_delay_s}"
+            )
+        if self.retry_delay_s < 0:
+            raise ValueError(
+                f"DestroyPolicy.retry_delay_s must be >= 0, got {self.retry_delay_s}"
+            )
+        if self.max_delete_attempts < 1:
+            raise ValueError(
+                f"DestroyPolicy.max_delete_attempts must be >= 1, got {self.max_delete_attempts}"
+            )
+
 
 @dataclass(frozen=True)
 class DestroyResult:
     """Outcome of a belt-and-suspenders destroy attempt.
 
-    Carries the verdict plus enough context for the caller to
-    surface unresolved leaks to the user. ``stop_error`` is None
-    unless the best-effort stop call failed; ``last_status_code``
-    is the HTTP status of the most recent verify call (or None);
-    ``attempts`` is the total number of DELETE attempts made.
+    Exactly one of ``verdict`` and ``refusal`` is set. The
+    invariant is enforced in ``__post_init__``.
+
+    * ``verdict`` set → the protocol ran; result is one of
+      DESTROYED / LEAKED / UNKNOWN.
+    * ``refusal`` set → the protocol did not run; one of
+      OWNERSHIP / NO_CREDENTIALS applies.
+
+    The zombie sweep branches on which field is set. CLI fallback
+    is only permitted for ``refusal == NO_CREDENTIALS``.
     """
-    verdict: DestroyVerdict
+    verdict: DestroyVerdict | None = None
+    refusal: DestroyRefusal | None = None
     attempts: int = 0
     stop_error: str | None = None
     last_status_code: int | None = None
+
+    def __post_init__(self) -> None:
+        if (self.verdict is None) == (self.refusal is None):
+            raise ValueError(
+                "DestroyResult: exactly one of verdict or refusal must be set, "
+                f"got verdict={self.verdict} refusal={self.refusal}"
+            )
 
 
 class StopFn(Protocol):
@@ -352,17 +424,9 @@ class DeleteFn(Protocol):
 
 
 class VerifyFn(Protocol):
-    """Verify the instance is gone.
-
-    Returns a ``DestroyVerdict``:
-      * ``DESTROYED`` when the instance is confirmed gone (404,
-        explicit ``actual_status == "destroyed"``, empty status).
-      * ``PRESENT`` when the instance is still alive.
-      * ``UNKNOWN`` for any other HTTP status (401, 403, 429, 5xx)
-        or any exception. May also set ``last_status_code`` via
-        the wrapped return (see adapter).
-    """
-    def __call__(self) -> DestroyVerdict: ...
+    """Verify the instance is gone. Returns a ``VerifyResult`` carrying
+    the verifier's observation and HTTP context."""
+    def __call__(self) -> VerifyResult: ...
 
 
 def belt_and_suspenders(
@@ -374,6 +438,10 @@ def belt_and_suspenders(
 ) -> DestroyResult:
     """Four-step belt-and-suspenders destroy with structured result.
 
+    Returns a ``DestroyResult`` with ``verdict`` set (never
+    ``refusal``; refusals are produced by the adapter or caller
+    before invoking this function).
+
     1. ``stop_fn()`` — best-effort. Its error is recorded in
        ``DestroyResult.stop_error`` but does not block the
        subsequent DELETE call. A stop failure alone never causes
@@ -382,17 +450,17 @@ def belt_and_suspenders(
        times with ``policy.retry_delay_s`` between attempts.
     3. After ``policy.verify_delay_s``, ``verify_fn()`` checks
        whether the instance is gone.
-    4. If the first verification is ``PRESENT``, run stop + delete
-       once more (no retries) and verify again. If the second
-       verification is still ``PRESENT``, return ``LEAKED``; if
-       ``DESTROYED``, return ``DESTROYED``; if ``UNKNOWN``, return
-       ``UNKNOWN``.
+    4. If the first verification is ``PRESENT``, run stop (best-
+       effort, separately from delete) + delete (separately from
+       stop) + re-verify. If the second verification is still
+       ``PRESENT``, return ``LEAKED``; if ``DESTROYED``, return
+       ``DESTROYED``; if ``UNKNOWN``, return ``UNKNOWN``.
 
-    Returns ``DestroyResult`` with verdict + error context + attempt
-    count. Never raises from the protocol layer.
+    Never raises from the protocol layer.
     """
     attempts = 0
     stop_error: str | None = None
+    last_status_code: int | None = None
 
     # Phase 1: best-effort stop. Must not block DELETE.
     try:
@@ -418,86 +486,112 @@ def belt_and_suspenders(
     # Phase 3: first verification.
     time.sleep(policy.verify_delay_s)
     try:
-        verdict = verify_fn()
+        first_verify = verify_fn()
     except Exception as exc:
-        logger.warning("belt_and_suspenders: verify_fn raised %s — returning UNKNOWN", exc)
+        logger.warning("belt_and_suspenders: verify_fn raised %s — UNKNOWN", exc)
         return DestroyResult(
             verdict=DestroyVerdict.UNKNOWN,
             attempts=attempts,
             stop_error=stop_error,
         )
+    last_status_code = first_verify.status_code
 
-    if verdict == DestroyVerdict.DESTROYED:
+    if first_verify.verdict == VerifyVerdict.GONE:
         return DestroyResult(
             verdict=DestroyVerdict.DESTROYED,
             attempts=attempts,
             stop_error=stop_error,
+            last_status_code=last_status_code,
         )
-    if verdict == DestroyVerdict.UNKNOWN:
+    if first_verify.verdict == VerifyVerdict.UNKNOWN:
         return DestroyResult(
             verdict=DestroyVerdict.UNKNOWN,
             attempts=attempts,
             stop_error=stop_error,
+            last_status_code=last_status_code,
         )
 
-    # Phase 4: resurrection cleanup, then re-verify.
+    # Phase 4: resurrection cleanup. Stop is best-effort; delete
+    # is mandatory. They are independent try/excepts so a stop
+    # failure does not block the second DELETE.
     if not policy.verify_after_resurrection:
         return DestroyResult(
             verdict=DestroyVerdict.LEAKED,
             attempts=attempts,
             stop_error=stop_error,
+            last_status_code=last_status_code,
         )
     try:
         stop_fn()
-        time.sleep(policy.retry_delay_s)
-        attempts += 1
+    except Exception as exc:
+        logger.warning(
+            "belt_and_suspenders: resurrection stop_fn raised %s — continuing",
+            exc,
+        )
+        if stop_error is None:
+            stop_error = f"resurrection: {type(exc).__name__}: {exc}"
+    time.sleep(policy.retry_delay_s)
+    attempts += 1
+    try:
         delete_fn()
     except Exception as exc:
-        logger.warning("belt_and_suspenders: resurrection cleanup raised %s", exc)
+        logger.warning("belt_and_suspenders: resurrection delete_fn raised %s", exc)
         return DestroyResult(
             verdict=DestroyVerdict.UNKNOWN,
             attempts=attempts,
             stop_error=stop_error,
+            last_status_code=last_status_code,
         )
 
     # Phase 5: second verification.
     time.sleep(policy.verify_delay_s)
     try:
-        verdict = verify_fn()
+        second_verify = verify_fn()
     except Exception as exc:
         logger.warning("belt_and_suspenders: second verify_fn raised %s — UNKNOWN", exc)
         return DestroyResult(
             verdict=DestroyVerdict.UNKNOWN,
             attempts=attempts,
             stop_error=stop_error,
+            last_status_code=last_status_code,
         )
+    last_status_code = second_verify.status_code
 
-    if verdict == DestroyVerdict.DESTROYED:
+    if second_verify.verdict == VerifyVerdict.GONE:
         return DestroyResult(
             verdict=DestroyVerdict.DESTROYED,
             attempts=attempts,
             stop_error=stop_error,
+            last_status_code=last_status_code,
         )
-    if verdict == DestroyVerdict.PRESENT:
+    if second_verify.verdict == VerifyVerdict.PRESENT:
         return DestroyResult(
             verdict=DestroyVerdict.LEAKED,
             attempts=attempts,
             stop_error=stop_error,
+            last_status_code=last_status_code,
         )
     return DestroyResult(
         verdict=DestroyVerdict.UNKNOWN,
         attempts=attempts,
         stop_error=stop_error,
+        last_status_code=last_status_code,
     )
 ```
 
 Why callback-based, not subclassed. v14's `checkpoint.py` is a single concrete module (no adapters) because the checkpoint format is provider-agnostic. The destroy protocol is provider-agnostic in its *loop* but provider-specific in its *endpoints* and *timing policy*. By accepting `stop_fn`, `delete_fn`, `verify_fn` callbacks plus a `DestroyPolicy`, the protocol stays portable across Vast.ai, RunPod, and any future adapter without forcing a class hierarchy.
+
+Why `VerifyVerdict` and `DestroyVerdict` are separate. The verifier answers "is the instance present right now?"; the protocol answers "did we destroy it?" Collapsing them into one enum forces the protocol to run a `verify_fn` interpretation on every observation, which is exactly the bug that made the previous design return `DestroyVerdict.UNKNOWN` (then "destroyed") on HTTP errors. The split lets the producer of each verdict be unambiguous.
+
+Why `DestroyRefusal` is separate from `DestroyVerdict`. The CLI fallback only makes sense for `NO_CREDENTIALS` (no API key to do the work). It is a safety violation for `OWNERSHIP` (the image allowlist rejected the instance). Putting both into one enum would force the zombie sweep to inspect string values to decide fallback, which is the kind of fragile dispatch the typed shape is meant to prevent.
 
 Why typed `DestroyResult`, not bool. The current `_rest_verify_and_redestroy` returns `None` on the happy path and "logs a warning" on the resurrection path. The caller cannot distinguish "destroyed" from "leaked" from "verify was uncertain." A 401 or 500 from the dashboard API is silently treated as "destroyed." The structured `DestroyResult` makes these outcomes distinguishable.
 
 Why `stop_fn` is best-effort. A stop timeout or 401 must not prevent the more important DELETE attempt. The stop call's purpose is to kill stuck Docker pulls; if it fails, DELETE is still the durable teardown. Recording the error in the result preserves observability without breaking the protocol.
 
 Why `DestroyPolicy` is adapter-supplied. The 5s verify delay and 3s retry sleep are Vast.ai production discoveries. RunPod may need different values (faster retry, no resurrection check). Hardcoding them in the generic module would bake Vast.ai assumptions into the protocol. The policy is the place for that knowledge.
+
+Why `DestroyPolicy.__post_init__` validates. A negative sleep value would silently violate the "never raises" claim on the protocol. Zero delete attempts would silently skip deletion. The invariants are enforced at construction so the protocol can stay naive.
 
 ## Vast.ai adapter shape
 
@@ -513,8 +607,11 @@ import requests
 
 from vastai_gpu_runner.providers.destroy import (
     DestroyPolicy,
+    DestroyRefusal,
     DestroyResult,
     DestroyVerdict,
+    VerifyResult,
+    VerifyVerdict,
     belt_and_suspenders,
 )
 from vastai_gpu_runner.providers.vastai import verify_instance_ownership
@@ -582,34 +679,62 @@ def vastai_delete(instance_id: str, hdrs: dict[str, str]) -> bool:
     return resp.status_code in (200, 204, 404)
 
 
-def vastai_verify(instance_id: str, hdrs: dict[str, str]) -> DestroyVerdict:
+def vastai_verify(instance_id: str, hdrs: dict[str, str]) -> VerifyResult:
     """Verify the instance is gone.
 
-    404 → DESTROYED. 200 with ``actual_status in ("", "destroyed")``
-    → DESTROYED. 200 with any other status → PRESENT. Any other
-    HTTP status (401, 403, 429, 5xx) or any exception → UNKNOWN.
+    Returns a ``VerifyResult`` with the verifier's observation plus
+    HTTP context. The mapping:
+
+    * 404 → ``GONE`` (instance is not in the dashboard).
+    * 200 with ``actual_status == "destroyed"`` → ``GONE``.
+    * 200 with ``actual_status`` empty, missing, non-string, or
+      any value other than ``"destroyed"`` → ``PRESENT`` (the
+      instance is still listed; we cannot prove it is gone).
+    * Any other HTTP status (401, 403, 429, 5xx) → ``UNKNOWN``.
+    * Any exception (network, parse) → ``UNKNOWN``.
+
+    The empty-status case is intentionally NOT ``GONE``: the
+    Vast.ai dashboard API may return empty status for transient
+    states (just-booted, just-stopped, error). Only an explicit
+    "destroyed" status is affirmative evidence.
     """
     try:
         verify = requests.get(f"{BASE_URL}/{instance_id}/", headers=hdrs, timeout=10)
     except Exception as exc:
         logger.warning("vastai_verify: GET raised %s — UNKNOWN", exc)
-        return DestroyVerdict.UNKNOWN
+        return VerifyResult(verdict=VerifyVerdict.UNKNOWN, error=str(exc))
     if verify.status_code == 404:
-        return DestroyVerdict.DESTROYED
+        return VerifyResult(verdict=VerifyVerdict.GONE, status_code=404)
     if verify.status_code != 200:
         logger.warning(
             "vastai_verify: GET %s returned %d — UNKNOWN",
             instance_id, verify.status_code,
         )
-        return DestroyVerdict.UNKNOWN
+        return VerifyResult(
+            verdict=VerifyVerdict.UNKNOWN,
+            status_code=verify.status_code,
+            error=f"http {verify.status_code}",
+        )
     try:
-        vstatus = verify.json().get("actual_status", "")
+        raw_status = verify.json().get("actual_status")
     except Exception as exc:
         logger.warning("vastai_verify: JSON parse raised %s — UNKNOWN", exc)
-        return DestroyVerdict.UNKNOWN
-    if vstatus in ("", "destroyed"):
-        return DestroyVerdict.DESTROYED
-    return DestroyVerdict.PRESENT
+        return VerifyResult(
+            verdict=VerifyVerdict.UNKNOWN,
+            status_code=200,
+            error=str(exc),
+        )
+    if not isinstance(raw_status, str):
+        logger.warning(
+            "vastai_verify: actual_status is not a string: %r — PRESENT",
+            raw_status,
+        )
+        return VerifyResult(verdict=VerifyVerdict.PRESENT, status_code=200)
+    if raw_status == "destroyed":
+        return VerifyResult(verdict=VerifyVerdict.GONE, status_code=200)
+    # Empty string, missing key, or any other value: the instance is
+    # still listed. We cannot prove it is gone.
+    return VerifyResult(verdict=VerifyVerdict.PRESENT, status_code=200)
 
 
 def destroy_vastai_instance(
@@ -622,13 +747,17 @@ def destroy_vastai_instance(
     The ownership guard is applied first: if ``allowed_images`` is
     not None (note: an empty set *rejects every image*, not skips
     the guard) and the instance's image is not in the set, return
-    ``DestroyResult(verdict=DESTROYED, ...)`` with a logged
-    refusal — no API call is made. This protects against
-    cross-project accidents on shared Vast.ai accounts.
+    ``DestroyResult(refusal=OWNERSHIP)`` with a logged refusal —
+    no API call is made. This protects against cross-project
+    accidents on shared Vast.ai accounts.
 
-    If no API key is configured, returns ``DestroyResult(verdict=UNKNOWN)``
-    and the caller (the zombie sweep) is responsible for falling
-    back to the CLI ``vastai destroy instance`` path.
+    If no API key is configured, return
+    ``DestroyResult(refusal=NO_CREDENTIALS)``. The zombie sweep
+    uses this refusal to decide whether the CLI fallback is
+    permitted; the runner's ``destroy_instance`` path should
+    treat NO_CREDENTIALS as a hard failure (return False) since
+    the runner manages the unit-tracked lifecycle and cannot
+    rely on the opportunistic CLI fallback.
     """
     if allowed_images is not None and not verify_instance_ownership(
         instance_id, allowed_images=allowed_images
@@ -637,10 +766,10 @@ def destroy_vastai_instance(
             "REFUSED to destroy instance %s — ownership check failed.",
             instance_id,
         )
-        return DestroyResult(verdict=DestroyVerdict.UNKNOWN)
+        return DestroyResult(refusal=DestroyRefusal.OWNERSHIP)
     api_key = read_vastai_api_key()
     if not api_key:
-        return DestroyResult(verdict=DestroyVerdict.UNKNOWN)
+        return DestroyResult(refusal=DestroyRefusal.NO_CREDENTIALS)
     hdrs = {"Authorization": f"Bearer {api_key}"}
     return belt_and_suspenders(
         stop_fn=lambda: vastai_stop(instance_id, hdrs),
@@ -650,29 +779,118 @@ def destroy_vastai_instance(
     )
 ```
 
-The existing `VastaiRunner._rest_destroy` collapses into `destroy_vastai_instance(instance_id, allowed_images=self.allowed_images)`. The `allowed_images` ownership guard is preserved — it lives at the adapter layer, not in the protocol module, because the guard is Vast.ai-specific (the other providers do not currently have an image-allowlist feature).
-
 The `is not None` guard (not `if allowed_images and ...`) is the safety-critical fix. An empty `set()` passed as `allowed_images` rejects every image, which is the correct conservative behaviour; the previous `if allowed_images and ...` shape would silently skip the guard on an empty set and allow cross-project deletion.
+
+## `VastaiRunner.destroy_instance` integration
+
+The runner's `destroy_instance` is the unit-tracked path. It must use the typed `DestroyResult` directly — not just call the protocol and discard the output.
+
+```python
+# In providers/vastai.py — VastaiRunner.destroy_instance, after the refactor:
+
+def destroy_instance(self, instance: CloudInstance) -> bool:
+    """Destroy a Vast.ai instance (with ownership safety guard).
+
+    Returns True only when the belt-and-suspenders protocol confirmed
+    destruction. Returns False on refusal (ownership), leakage
+    (resurrected after cleanup), or unknown verification — each
+    with an explanatory log message. ``InstanceStatus.DESTROYED``
+    is set only on confirmed destruction.
+    """
+    api_key = read_vastai_api_key()
+    if not api_key:
+        logger.error(
+            "VastaiRunner.destroy_instance: no API key for %s — refusing",
+            instance.instance_id,
+        )
+        return False  # runner path is unit-tracked; no CLI fallback
+    result = destroy_vastai_instance(
+        instance.instance_id, allowed_images=self.allowed_images
+    )
+    if result.refusal == DestroyRefusal.OWNERSHIP:
+        logger.error(
+            "VastaiRunner.destroy_instance: %s refused by ownership guard",
+            instance.instance_id,
+        )
+        return False
+    if result.refusal == DestroyRefusal.NO_CREDENTIALS:
+        logger.error(
+            "VastaiRunner.destroy_instance: %s — no API key",
+            instance.instance_id,
+        )
+        return False
+    if result.verdict == DestroyVerdict.DESTROYED:
+        instance.status = InstanceStatus.DESTROYED
+        logger.info("Destroyed instance %s", instance.instance_id)
+        return True
+    if result.verdict == DestroyVerdict.LEAKED:
+        logger.error(
+            "VastaiRunner.destroy_instance: %s LEAKED after resurrection "
+            "cleanup — operator intervention required "
+            "(attempts=%d, last_status=%s, stop_error=%s)",
+            instance.instance_id,
+            result.attempts, result.last_status_code, result.stop_error,
+        )
+        return False
+    logger.warning(
+        "VastaiRunner.destroy_instance: %s destroy result UNKNOWN "
+        "(attempts=%d, last_status=%s, stop_error=%s)",
+        instance.instance_id,
+        result.attempts, result.last_status_code, result.stop_error,
+    )
+    return False
+```
+
+The current code's "CLI destroy + REST + always return True" pattern is replaced. The CLI fallback is *only* available in the zombie sweep (the orphan path), and only for `NO_CREDENTIALS`. The runner's `destroy_instance` is the unit-tracked path and treats missing credentials as a hard failure.
 
 ## Zombie sweep integration
 
-The orchestrator's `_sweep_zombies` routes through `destroy_vastai_instance` and falls back to the CLI when no API key is configured. The `killed` counter is incremented on confirmed destroy only — unresolved leaks are surfaced, not hidden.
+The orchestrator's `_sweep_zombies` routes through `destroy_vastai_instance` and branches on the `DestroyResult.verdict` vs `DestroyResult.refusal` distinction. The CLI fallback only fires for `NO_CREDENTIALS`; ownership refusals are never bypassed.
 
 ```python
-# In BatchOrchestrator._sweep_zombies (after the refactor):
+# In BatchOrchestrator, after the refactor:
+
+def __init__(
+    self,
+    *,
+    runner_factory: RunnerFactory,
+    label_prefix: str,
+    allowed_images: set[str] | None = None,
+    workspace_dir: str = "/workspace",
+    r2_sink: R2Sink | None = None,
+    r2_batch_id: str = "",
+    budget_usd: float = 0.0,
+    max_retries: int = 2,
+    max_parallel_deploys: int = 16,
+    max_parallel_collects: int = 1,
+    poll_interval_seconds: int = 30,
+    zombie_sweep_every_n_cycles: int = 5,
+    poll_timeout_seconds: float = 0.0,
+) -> None:
+    # ... existing assignments ...
+    self._allowed_images = allowed_images
+    # ... rest unchanged ...
 
 def _sweep_zombies(self) -> int:
     """Destroy Vast.ai instances not tracked by live_runners.
 
     Each candidate instance is destroyed via the belt-and-suspenders
-    adapter. If no API key is configured, the sweep falls back to
-    the CLI ``vastai destroy instance`` path. The ``killed`` counter
-    is incremented only on confirmed destroy (DestroyResult.verdict
-    == DESTROYED). Unresolved leaks (LEAKED, UNKNOWN) are logged
-    so the user can investigate.
+    adapter. The image allowlist (``self._allowed_images``) is the
+    destruction-safety boundary; the batch-label prefix is the
+    orphan-detection boundary. The two boundaries are independent:
+    the label prefix determines *which* instances are candidates;
+    the image allowlist determines *whether* each candidate may
+    be destroyed.
+
+    The CLI fallback is opportunistic: it runs only for
+    ``DestroyResult.refusal == NO_CREDENTIALS`` and is recorded
+    in a separate counter (``cli_attempted``). Ownership refusals
+    are never bypassed by the CLI. The ``killed`` counter is
+    incremented only on confirmed destroy (``verdict == DESTROYED``).
     """
-    # ... enumerate candidates via api_call (existing logic) ...
+    # ... enumerate candidates via vastai_cmd (existing logic) ...
     killed = 0
+    cli_attempted = 0
     for iid in zombie_candidates:
         result = destroy_vastai_instance(
             iid,
@@ -682,39 +900,137 @@ def _sweep_zombies(self) -> int:
             killed += 1
         elif result.verdict == DestroyVerdict.LEAKED:
             logger.error(
-                "Zombie sweep: instance %s could not be destroyed after "
-                "resurrection cleanup — operator intervention required",
-                iid,
+                "Zombie sweep: instance %s LEAKED after resurrection cleanup "
+                "— operator intervention required (attempts=%d, "
+                "last_status=%s, stop_error=%s)",
+                iid, result.attempts, result.last_status_code, result.stop_error,
             )
         elif result.verdict == DestroyVerdict.UNKNOWN:
-            if not read_vastai_api_key():
-                # Fall back to CLI when no API key is configured.
-                try:
-                    vastai_cmd(["destroy", "instance", iid], timeout=15)
-                    killed += 1
-                except Exception as exc:
-                    logger.warning(
-                        "Zombie sweep: CLI fallback failed for %s: %s",
-                        iid, exc,
-                    )
-            else:
+            logger.warning(
+                "Zombie sweep: instance %s destroy result UNKNOWN "
+                "(attempts=%d, last_status=%s, stop_error=%s)",
+                iid, result.attempts, result.last_status_code, result.stop_error,
+            )
+        elif result.refusal == DestroyRefusal.OWNERSHIP:
+            logger.info(
+                "Zombie sweep: skipped %s (ownership refusal). "
+                "The label-prefix selection and the image allowlist "
+                "disagree — reconcile before next sweep.",
+                iid,
+            )
+        elif result.refusal == DestroyRefusal.NO_CREDENTIALS:
+            # CLI fallback permitted. The CLI command is opportunistic;
+            # the killed counter does not increment because we cannot
+            # verify the result through the CLI without significant work.
+            try:
+                vastai_cmd(["destroy", "instance", iid], timeout=15)
+                cli_attempted += 1
                 logger.warning(
-                    "Zombie sweep: instance %s destroy result was UNKNOWN "
-                    "(stop_error=%s, last_status=%s, attempts=%d)",
-                    iid, result.stop_error, result.last_status_code, result.attempts,
+                    "Zombie sweep: CLI fallback for %s — verify manually. "
+                    "CLI success does not count as confirmed destroy.",
+                    iid,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Zombie sweep: CLI fallback failed for %s: %s",
+                    iid, exc,
                 )
     if killed:
         logger.info("Zombie sweep: confirmed-destroyed %d instance(s)", killed)
+    if cli_attempted:
+        logger.warning(
+            "Zombie sweep: %d CLI fallback(s) attempted — verify manually",
+            cli_attempted,
+        )
     return killed
 ```
 
-## Thin-wrapper plan
+The `allowed_images` field is intentionally distinct from the label-prefix boundary. The label prefix identifies orphans (instances we created but lost track of); the image allowlist is the safety guard against cross-project deletion. Both must agree for the CLI fallback to be safe — if they disagree, the operator has misconfigured something and the instance is logged but not destroyed.
 
-The v15 precedent was *deletion*, not wrapper retention. This v3 follows v15's discipline.
+## Two-stage poll loop
+
+The shared primitive is `decide_next_action` (pure). The orchestrator's poll loop keeps the existing two-stage structure: classify all units, handle preemptions, then parallel finalise terminals. There is no single synchronous dispatcher that loses the parallelisation.
 
 ```python
 # In BatchOrchestrator, after the refactor:
 
+def _poll_cycle_once(self) -> bool:
+    """One sweep over live units. Returns True if any unit made progress.
+
+    Stage 1 (classify all): invoke ``decide_next_action`` for each
+    live unit. No side effects. The actions are collected for stage 2+
+    3 to act on.
+
+    Stage 2 (preemptions serial): for each ``Preempt`` action, capture
+    diagnostics + destroy + instance-loss bookkeeping. Serial because
+    these are cheap but touch shared state.
+
+    Stage 3 (finalise terminals parallel): for each ``Complete``
+    action, gather into the batch and call ``_finalise_terminal_units``
+    which fans out via ``max_parallel_collects``.
+    """
+    from vastai_gpu_runner.unit_lifecycle import (
+        decide_next_action,
+        Continue, Complete, Preempt,
+    )
+
+    # Stage 1: classify all units (pure, no side effects).
+    classified: list[tuple[
+        str, "UnitAction", CloudRunner, CloudInstance, UnitT,
+    ]] = []
+    for unit_key in list(self._live_runners.keys()):
+        entry = self._live_runners.get(unit_key)
+        if entry is None:
+            continue
+        runner, instance, unit = entry
+        action = decide_next_action(
+            unit, runner, instance, self.unit_is_done_in_r2,
+        )
+        classified.append((unit_key, action, runner, instance, unit))
+
+    # Stage 2: handle preemptions (serial).
+    preempted_count = 0
+    for unit_key, action, runner, instance, unit in classified:
+        if isinstance(action, Preempt):
+            self._handle_preempt(
+                runner, instance, unit, unit_key, action.cause, action.detail,
+            )
+            preempted_count += 1
+
+    # Stage 3: collect terminals (parallel via _finalise_terminal_units).
+    terminals = [
+        (unit_key, runner, instance, unit)
+        for unit_key, action, runner, instance, unit in classified
+        if isinstance(action, Complete)
+    ]
+    if terminals:
+        self._finalise_terminal_units(terminals)
+
+    return bool(terminals or preempted_count)
+
+
+def _handle_preempt(
+    self,
+    runner: CloudRunner,
+    instance: CloudInstance,
+    unit: UnitT,
+    unit_key: str,
+    cause: PreemptCause,
+    detail: str | None,
+) -> None:
+    """Preempt a single unit: capture diagnostics, destroy, mark loss."""
+    with contextlib.suppress(Exception):
+        self.capture_preempt_diagnostics(runner, instance, unit)
+    with contextlib.suppress(Exception):
+        runner.destroy_instance(instance)
+    reason = f"{cause.value}" + (f": {detail}" if detail else "")
+    with self._state_lock:
+        self._handle_instance_loss(unit, unit_key, reason)
+```
+
+The `_check_unit` thin wrapper (kept for one deprecation cycle) uses the same primitive directly:
+
+```python
 def _check_unit(
     self,
     runner: CloudRunner,
@@ -723,28 +1039,17 @@ def _check_unit(
 ) -> Literal["completed", "running", "preempted", "failed"]:
     """Deprecated. Will be removed in the next minor release.
 
-    The docstring on the previous version said: "Kept for
-    backwards-compat with direct callers (unit tests, consumers
-    that prefer synchronous single-unit polling)." The two
-    call sites (this method and ``_poll_cycle_once``) now share
-    a single dispatch helper so their logic cannot diverge. This
-    thin wrapper is retained for one deprecation cycle only.
+    Kept for one deprecation cycle because the API reference
+    documents it as inherited lifecycle surface. Uses the same
+    ``decide_next_action`` primitive as the main poll loop.
     """
+    warnings.warn(
+        "_check_unit is deprecated; use unit_lifecycle.decide_next_action "
+        "directly. Will be removed in the next minor release.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     unit_key = self.unit_key(unit)
-    return self._dispatch_unit(runner, instance, unit, unit_key)
-
-
-def _dispatch_unit(
-    self,
-    runner: CloudRunner,
-    instance: CloudInstance,
-    unit: UnitT,
-    unit_key: str,
-) -> Literal["completed", "running", "preempted", "failed"]:
-    """Single dispatch helper for both ``_check_unit`` and
-    ``_poll_cycle_once``. They cannot diverge because they call
-    this and only this.
-    """
     from vastai_gpu_runner.unit_lifecycle import (
         decide_next_action,
         Continue, Complete, Preempt,
@@ -752,30 +1057,23 @@ def _dispatch_unit(
     action = decide_next_action(
         unit, runner, instance, self.unit_is_done_in_r2,
     )
-    match action:
-        case Continue():
-            return "running"
-        case Complete():
-            return self._finalise_completed(runner, instance, unit, unit_key)
-        case Preempt(cause=cause, detail=detail):
-            with contextlib.suppress(Exception):
-                self.capture_preempt_diagnostics(runner, instance, unit)
-            with contextlib.suppress(Exception):
-                runner.destroy_instance(instance)
-            with self._state_lock:
-                self._handle_instance_loss(
-                    unit, unit_key, _format_preempt_reason(cause, detail),
-                )
-            return "preempted"
+    if isinstance(action, Continue):
+        return "running"
+    if isinstance(action, Preempt):
+        self._handle_preempt(
+            runner, instance, unit, unit_key, action.cause, action.detail,
+        )
+        return "preempted"
+    return self._finalise_completed(runner, instance, unit, unit_key)
 ```
 
-`_classify_live_unit` is **deleted** (not wrapped). Its tests move to `test_unit_lifecycle.py` against the new `decide_next_action` interface. The v15 deletion is the right precedent — the wrapper added no value over a direct delegate, and tests that mock the dispatcher at the string level can be re-pointed at the new module.
-
-The match statement is the v15-faithful shape: the runner is a thin dispatcher that matches on the plan type. The deprecation warning on `_check_unit` is emitted via `warnings.warn(..., DeprecationWarning, stacklevel=2)` so static analysers and unit tests can flag it.
+`_classify_live_unit` is **deleted** (not wrapped). Its tests move to `test_unit_lifecycle.py` against the new `decide_next_action` interface.
 
 ## ABC changes required
 
 **None.** `CloudRunner` keeps its public interface. The new `unit_lifecycle` module does not subclass the runner; it takes a `runner` parameter via protocol. The new `providers/destroy` module takes callbacks plus a `DestroyPolicy`; `VastaiRunner` still calls `destroy_vastai_instance` from its own `destroy_instance` method.
+
+The new `BatchOrchestrator` constructor parameter `allowed_images: set[str] | None = None` is additive (default `None` preserves existing behaviour for callers that did not set it).
 
 The RunPod adapter does not exist yet. When `RunPodRunner` ships (roadmap item 2), it gets a sibling `providers/destroy_adapters/runpod.py` with the same callback shape and its own `DestroyPolicy`. No ABC change.
 
@@ -789,15 +1087,20 @@ The RunPod adapter does not exist yet. When `RunPodRunner` ships (roadmap item 2
 | `Complete` | Plan dataclass; the unit has finished (R2 or SSH confirms). Orchestrator should finalise. |
 | `Preempt` | Plan dataclass; the worker died silently. Orchestrator should capture diagnostics, destroy, and invoke consumer's `classify_failure`. Carries `cause: PreemptCause` and optional `detail: str`. |
 | `PreemptCause` | StrEnum; the reason the worker died. Currently `WORKER_DIED`; reserved for `BOOT_TIMEOUT_RETRY_EXHAUSTED`, `SSH_LOST`, `GPU_OOM`. |
-| `ProgressSnapshot` | Frozen dataclass normalising the runner's `check_progress` response before classification. Missing or malformed fields default to the conservative read. |
+| `ProgressSnapshot` | Frozen dataclass normalising the runner's `check_progress` response before classification. Missing or malformed fields default to the conservative read. Contradictory fields clear both flags. |
 | `decide_next_action` | The single public function in `unit_lifecycle.py`. Performs a localised observation sequence (R2 → SSH → R2-on-worker_dead), returns the action. |
-| `DestroyResult` | Frozen dataclass; the outcome of a belt-and-suspenders destroy attempt. Carries `verdict: DestroyVerdict`, `attempts`, `stop_error`, `last_status_code`. |
-| `DestroyVerdict` | StrEnum; `DESTROYED`, `LEAKED`, or `UNKNOWN`. Never collapses into a bool. |
-| `DestroyPolicy` | Frozen dataclass; provider-specific retry/timing policy (`verify_delay_s`, `retry_delay_s`, `max_delete_attempts`, `verify_after_resurrection`). |
-| `belt_and_suspenders` | The single public function in `providers/destroy.py`. Four-step destroy loop with second verification after resurrection cleanup. Returns `DestroyResult`. |
-| `StopFn` / `DeleteFn` / `VerifyFn` | The callback protocols for the destroy loop. `verify_fn` returns `DestroyVerdict` (not bool). |
-| `destroy_vastai_instance` | The Vast.ai adapter for the belt-and-suspenders protocol. Lives in `providers/destroy_adapters/vastai.py`. |
+| `VerifyVerdict` | StrEnum; the verifier's observation at one instant. `GONE | PRESENT | UNKNOWN`. |
+| `VerifyResult` | Frozen dataclass; the verifier's output. Carries `verdict: VerifyVerdict`, `status_code: int | None`, `error: str | None`. |
+| `DestroyVerdict` | StrEnum; the protocol's outcome. `DESTROYED | LEAKED | UNKNOWN`. |
+| `DestroyRefusal` | StrEnum; pre-protocol refusals. `OWNERSHIP | NO_CREDENTIALS`. |
+| `DestroyResult` | Frozen dataclass; the protocol's output. Exactly one of `verdict: DestroyVerdict | None` and `refusal: DestroyRefusal | None` is set. Carries `attempts`, `stop_error`, `last_status_code`. |
+| `DestroyPolicy` | Frozen dataclass; provider-specific retry/timing policy with `__post_init__` invariants. |
+| `belt_and_suspenders` | The single public function in `providers/destroy.py`. Four-step destroy loop with second verification after resurrection cleanup. Returns `DestroyResult` with `verdict` set. |
+| `StopFn` / `DeleteFn` / `VerifyFn` | The callback protocols for the destroy loop. `VerifyFn` returns `VerifyResult` (not enum). |
+| `destroy_vastai_instance` | The Vast.ai adapter. Wraps the protocol with pre-protocol refusals (ownership, no credentials). |
 | `read_vastai_api_key` | The Vast.ai credential loader with env-first precedence and fail-closed semantics. |
+| `VASTAI_POLICY` | The `DestroyPolicy` constant for Vast.ai (5s verify delay, 3s retry sleep, 3 max delete attempts). |
+| `allowed_images` | New `BatchOrchestrator` constructor parameter. The image allowlist for the destroy-safety boundary; the label prefix remains the orphan-detection boundary. |
 
 ## Resolved design decisions
 
@@ -815,12 +1118,12 @@ A present-empty env var is not the same as an absent one. A stale `~/.cloud-cred
 
 Multi-provider credential unification is deferred until `RunPodRunner` lands.
 
-### Destroy callback return values
+### Destroy callback return types
 
-`verify_fn` returns `DestroyVerdict` (an enum), not a bool. The protocol interprets:
-- `DESTROYED` → confirmed gone, return `DestroyResult(verdict=DESTROYED)`.
-- `PRESENT` → resurrection detected, run stop + delete + re-verify.
-- `UNKNOWN` → cannot determine (auth error, transient outage, JSON parse failure). Return `DestroyResult(verdict=UNKNOWN)` with `last_status_code` if available.
+`verify_fn` returns `VerifyResult` (carrying `verdict: VerifyVerdict`, `status_code: int | None`, `error: str | None`). The protocol interprets:
+- `verdict == GONE` → first verified gone, return `DestroyResult(verdict=DESTROYED)`.
+- `verdict == PRESENT` → resurrection detected, run stop + delete + re-verify.
+- `verdict == UNKNOWN` → cannot determine. Return `DestroyResult(verdict=UNKNOWN)` with `last_status_code` and `error` preserved.
 
 `delete_fn` returns `bool` (success or no — idempotent on 404). `stop_fn` returns `None` and must not raise (the protocol wraps it in try/except).
 
@@ -832,70 +1135,113 @@ Multi-provider credential unification is deferred until `RunPodRunner` lands.
 
 No `CONTEXT.md` is created. The glossary stays in `architecture-v3.md`. Future docs that need the terms link here. If the project later wants a single glossary file, this section is the seed.
 
+### Ownership boundary
+
+The image allowlist (`allowed_images`) is the destruction-safety boundary. The batch-label prefix is the orphan-detection boundary. They are independent and complementary:
+
+- The label prefix identifies *which* instances are orphan candidates (instances we created but lost track of).
+- The image allowlist determines *whether* each candidate may be destroyed.
+
+The zombie sweep passes both to the adapter. The adapter's `OWNERSHIP` refusal fires when the image allowlist rejects the instance. The CLI fallback is only permitted for `NO_CREDENTIALS`; ownership refusals are never bypassed.
+
+The `allowed_images` parameter is added to `BatchOrchestrator.__init__` with a default of `None` to preserve existing behaviour for callers that did not set it.
+
+### CLI fallback honesty
+
+The CLI `vastai destroy instance <id>` command returns 0 even if the instance becomes a zombie. The CLI fallback is therefore opportunistic: it runs only for `DestroyResult.refusal == NO_CREDENTIALS`, and its attempts are recorded in a separate counter (`cli_attempted`), not the `killed` counter. The `killed` counter increments only on `DestroyResult.verdict == DESTROYED` (confirmed by the belt-and-suspenders protocol).
+
 ## Critical test cases
 
 The following test cases must be enumerated in the implementation PR. The design doc lists them so the implementation reviewer can verify the test surface is complete.
 
 ### `unit_lifecycle` tests
 
-- **Malformed progress response.** `check_progress` returns `{}`, `{"running": False}`, `{"complete": "true"}` (string, not bool), `{"complete": True, "worker_dead": True}` (contradictory), or a non-dict (None, list). Each coerces to `Continue` (conservative). The contradictory case logs a warning and downgrades to `running` (not preempted).
-- **Initial R2 raises.** `is_done_in_r2` raises on the first call. The logs the exception and continues to SSH. SSH verdict is honoured.
+- **Malformed progress response.** `check_progress` returns `{}`, `{"running": False}`, `{"complete": "true"}` (string, not bool), `{"worker_dead": 1}` (int, not bool), or a non-dict (None, list). Each coerces to `Continue` (conservative).
+- **Contradictory progress response.** `{"complete": True, "worker_dead": True}`. Both flags clear; returns `Continue`. The test asserts `not complete and not worker_dead` on the resulting snapshot.
+- **Initial R2 raises.** `is_done_in_r2` raises on the first call. Logs the exception and continues to SSH. SSH verdict is honoured.
 - **Worker_dead R2 re-check raises.** `is_done_in_r2` raises on the second call (after `worker_dead`). Returns `Continue` (not `Preempt`) — destroying on unknown final-upload status risks losing recoverable results.
 - **`check_progress` raises.** Returns `Continue` (transient SSH flakiness).
-- **Happy path: R2 done.** `is_done_in_r2` returns True on the first call. Returns `Complete`. (SSH not consulted.)
+- **Happy path: R2 done.** `is_done_in_r2` returns True on the first call. Returns `Complete`. SSH not consulted.
 - **Happy path: SSH complete.** R2 not done, `check_progress` returns `{"complete": True}`. Returns `Complete`.
 - **Happy path: worker dead, R2 re-check done.** Returns `Complete`.
 - **Happy path: worker dead, R2 re-check not done.** Returns `Preempt(cause=WORKER_DIED, detail=log_tail)`.
 
 ### `providers/destroy` tests
 
-- **Happy delete.** `stop_fn` succeeds, `delete_fn` returns True on first attempt, `verify_fn` returns `DESTROYED`. Result: `DestroyResult(verdict=DESTROYED, attempts=1)`.
-- **Delete retry.** `delete_fn` returns False twice, True on the third. `verify_fn` returns `DESTROYED`. Result: `DestroyResult(verdict=DESTROYED, attempts=3)`.
-- **Resurrection cleanup succeeds.** First verify returns `PRESENT`. Run stop + delete + re-verify. Second verify returns `DESTROYED`. Result: `DestroyResult(verdict=DESTROYED, attempts=2)`.
-- **Resurrection cleanup fails.** First verify returns `PRESENT`. Re-verify still returns `PRESENT`. Result: `DestroyResult(verdict=LEAKED, attempts=2)`.
-- **Unknown verification.** `verify_fn` returns `UNKNOWN` on first call. Result: `DestroyResult(verdict=UNKNOWN)`. No resurrection cleanup.
+- **Happy delete.** `stop_fn` succeeds, `delete_fn` returns True on first attempt, `verify_fn` returns `VerifyResult(verdict=GONE)`. Result: `DestroyResult(verdict=DESTROYED, attempts=1)`.
+- **Delete retry.** `delete_fn` returns False twice, True on the third. `verify_fn` returns `VerifyResult(verdict=GONE)`. Result: `DestroyResult(verdict=DESTROYED, attempts=3)`.
+- **Resurrection cleanup succeeds.** First verify returns `VerifyResult(verdict=PRESENT)`. Run stop + delete + re-verify. Second verify returns `VerifyResult(verdict=GONE)`. Result: `DestroyResult(verdict=DESTROYED, attempts=2)`.
+- **Resurrection cleanup fails.** First verify returns `VERIFY(PRESENT)`. Re-verify still returns `VERIFY(PRESENT)`. Result: `DestroyResult(verdict=LEAKED, attempts=2)`.
+- **Unknown verification.** `verify_fn` returns `VerifyResult(verdict=UNKNOWN)` on first call. Result: `DestroyResult(verdict=UNKNOWN)`. No resurrection cleanup.
 - **Stop failure.** `stop_fn` raises. The error is recorded in `stop_error`; the DELETE still runs. Result: `DestroyResult(verdict=DESTROYED, stop_error="...")`.
+- **Resurrection stop failure.** First verify returns `PRESENT`. The second stop raises. The second delete still runs. Result: `DestroyResult(verdict=DESTROYED, attempts=2, stop_error="resurrection: ...")` (or `LEAKED` if the second verify still returns `PRESENT`).
 - **Unknown after resurrection.** First verify returns `PRESENT`. Resurrection cleanup completes. Second verify returns `UNKNOWN`. Result: `DestroyResult(verdict=UNKNOWN)`.
+- **DestroyPolicy invariants.** `DestroyPolicy(verify_delay_s=-1)` raises `ValueError`. `DestroyPolicy(retry_delay_s=-1)` raises `ValueError`. `DestroyPolicy(max_delete_attempts=0)` raises `ValueError`.
+- **DestroyResult invariants.** `DestroyResult()` (neither field) raises `ValueError`. `DestroyResult(verdict=DESTROYED, refusal=NO_CREDENTIALS)` (both fields) raises `ValueError`.
 
 ### Adapter tests
 
-- **Empty allowlist.** `allowed_images=set()` (empty, not None). Instance image is any value. Returns `DestroyResult(verdict=UNKNOWN)` with refusal logged. **This is the safety-critical test for the blocker fix.**
+- **Empty allowlist.** `allowed_images=set()` (empty, not None). Instance image is any value. Returns `DestroyResult(refusal=OWNERSHIP)` with refusal logged. **This is the safety-critical test for the blocker fix.**
 - **None allowlist.** `allowed_images=None`. No guard applied. Proceeds to API call.
 - **Matching allowlist.** Instance image is in the set. Proceeds.
-- **Non-matching allowlist.** Instance image is not in the set. Returns `DestroyResult(verdict=UNKNOWN)` with refusal logged.
+- **Non-matching allowlist.** Instance image is not in the set. Returns `DestroyResult(refusal=OWNERSHIP)` with refusal logged.
 - **`VASTAI_API_KEY` env empty.** `read_vastai_api_key()` returns empty string and does not fall through to file credentials. Fail-closed.
 - **`VASTAI_API_KEY` env set.** `read_vastai_api_key()` returns the env value.
-- **Vast.ai verify 404.** Returns `DestroyVerdict.DESTROYED`.
-- **Vast.ai verify 200 with `actual_status == "destroyed"`.** Returns `DestroyVerdict.DESTROYED`.
-- **Vast.ai verify 200 with `actual_status == "running"`.** Returns `DestroyVerdict.PRESENT`.
-- **Vast.ai verify 401 / 403 / 429 / 500.** Returns `DestroyVerdict.UNKNOWN`.
-- **Vast.ai verify JSON parse failure.** Returns `DestroyVerdict.UNKNOWN`.
+- **Vast.ai verify 404.** Returns `VerifyResult(verdict=GONE, status_code=404)`.
+- **Vast.ai verify 200 with `actual_status == "destroyed"`.** Returns `VerifyResult(verdict=GONE, status_code=200)`.
+- **Vast.ai verify 200 with empty `actual_status`.** Returns `VerifyResult(verdict=PRESENT, status_code=200)`. **This is the safety-critical test for the empty-status fix.**
+- **Vast.ai verify 200 with missing `actual_status` key.** Returns `VerifyResult(verdict=PRESENT, status_code=200)`.
+- **Vast.ai verify 200 with non-string `actual_status` (e.g. None).** Returns `VerifyResult(verdict=PRESENT, status_code=200)`.
+- **Vast.ai verify 200 with `actual_status == "running"`.** Returns `VerifyResult(verdict=PRESENT, status_code=200)`.
+- **Vast.ai verify 401 / 403 / 429 / 500.** Returns `VerifyResult(verdict=UNKNOWN, status_code=X, error="http X")`.
+- **Vast.ai verify JSON parse failure.** Returns `VerifyResult(verdict=UNKNOWN, status_code=200, error=...)`.
+- **Vast.ai verify network error.** Returns `VerifyResult(verdict=UNKNOWN, error=...)`.
+
+### Runner integration tests
+
+- **`VastaiRunner.destroy_instance` with `DestroyResult(verdict=DESTROYED)`.** Returns `True`. `InstanceStatus.DESTROYED` is set.
+- **`VastaiRunner.destroy_instance` with `DestroyResult(verdict=LEAKED)`.** Returns `False`. `InstanceStatus` is unchanged. Error logged.
+- **`VastaiRunner.destroy_instance` with `DestroyResult(verdict=UNKNOWN)`.** Returns `False`. Warning logged.
+- **`VastaiRunner.destroy_instance` with `DestroyResult(refusal=OWNERSHIP)`.** Returns `False`. Error logged.
+- **`VastaiRunner.destroy_instance` with `DestroyResult(refusal=NO_CREDENTIALS)`.** Returns `False`. Error logged. (No CLI fallback in the runner path.)
+
+### Zombie sweep integration tests
+
+- **Sweep with `allowed_images=set()` and orphan candidate.** `destroy_vastai_instance` returns `OWNERSHIP`. The sweep skips the instance. CLI fallback does NOT fire. `killed` does not increment.
+- **Sweep with `allowed_images=None` and orphan candidate.** Protocol runs. `DESTROYED` increments `killed`. `LEAKED` and `UNKNOWN` are logged.
+- **Sweep with `NO_CREDENTIALS` and orphan candidate.** CLI fallback fires. `cli_attempted` increments. `killed` does not increment.
+- **Sweep with `OWNERSHIP` and `NO_CREDENTIALS` simultaneously (impossible in practice but documents the precedence).** `OWNERSHIP` takes precedence. CLI fallback does NOT fire.
 
 ## Migration checklist
 
 For the implementer (one PR, one PR-number):
 
 1. Delete `orchestrator.py:poll_instance_progress` and `orchestrator.py:ensure_detached`. Update `CHANGELOG.md`, `docs/api.md`, `docs/architecture.md` to reflect the deletion.
-2. Delete `orchestrator.py:load_vastai_api_key`. Add `read_vastai_api_key()` to `providers/destroy_adapters/vastai.py` with env-first precedence and fail-closed semantics. Remove the old `_read_vastai_api_key` from `providers/vastai.py` (the new module owns it).
-3. New file `src/vastai_gpu_runner/providers/destroy.py` (the protocol module: `DestroyResult`, `DestroyVerdict`, `DestroyPolicy`, `belt_and_suspenders`).
-4. New file `src/vastai_gpu_runner/providers/destroy_adapters/vastai.py` (the Vast.ai adapter: `vastai_stop`, `vastai_delete`, `vastai_verify`, `destroy_vastai_instance`, `read_vastai_api_key`, `VASTAI_POLICY`).
-5. Update `VastaiRunner._rest_destroy` to delegate to `destroy_vastai_instance`. Delete the standalone helpers `_rest_stop`, `_rest_delete_with_retries`, `_rest_verify_and_redestroy` from `providers/vastai.py`.
-6. Update `orchestrator.py:_sweep_zombies` to route through `destroy_vastai_instance` with CLI fallback when no API key is configured. Increment `killed` on confirmed destroy only. Delete `orchestrator.py:_destroy_via_rest`.
-7. New file `src/vastai_gpu_runner/unit_lifecycle.py` (the decision module: `Action`, `PreemptCause`, `ProgressSnapshot`, `Continue` / `Complete` / `Preempt`, `decide_next_action`).
-8. Update `BatchOrchestrator._poll_cycle_once` and `_check_unit` to use `_dispatch_unit` (single dispatch helper). Delete `_classify_live_unit`. Mark `_check_unit` deprecated.
-9. New tests `tests/test_unit_lifecycle.py`, `tests/test_destroy.py`, `tests/test_destroy_adapters_vastai.py`. Update `tests/test_batch.py` and `tests/test_batch_orchestrator.py`.
-10. Update `CHANGELOG.md` with the v3 changes.
+2. Delete `orchestrator.py:load_vastai_api_key`. Add `read_vastai_api_key()` to `providers/destroy_adapters/vastai.py` with env-first precedence and fail-closed semantics. Remove the old `_read_vastai_api_key` from `providers/vastai.py`.
+3. Add `allowed_images: set[str] | None = None` to `BatchOrchestrator.__init__`. Pass it to `sweep_zombie_instances` via the existing `*` keyword-args signature.
+4. New file `src/vastai_gpu_runner/providers/destroy.py` (the protocol module: `VerifyVerdict`, `DestroyVerdict`, `DestroyRefusal`, `VerifyResult`, `DestroyResult`, `DestroyPolicy`, `belt_and_suspenders`).
+5. New file `src/vastai_gpu_runner/providers/destroy_adapters/vastai.py` (the Vast.ai adapter: `vastai_stop`, `vastai_delete`, `vastai_verify`, `destroy_vastai_instance`, `read_vastai_api_key`, `VASTAI_POLICY`).
+6. Update `VastaiRunner._rest_destroy` (and the public `destroy_instance`) to delegate to `destroy_vastai_instance`. The public `destroy_instance` returns `True` only on `verdict=DESTROYED`. Delete the standalone helpers `_rest_stop`, `_rest_delete_with_retries`, `_rest_verify_and_redestroy` from `providers/vastai.py`.
+7. Update `orchestrator.py:_sweep_zombies` to route through `destroy_vastai_instance` with branches on `verdict` vs `refusal`. CLI fallback only for `NO_CREDENTIALS`. Track `cli_attempted` separately from `killed`. Delete `orchestrator.py:_destroy_via_rest`.
+8. New file `src/vastai_gpu_runner/unit_lifecycle.py` (the decision module: `Action`, `PreemptCause`, `ProgressSnapshot`, `Continue` / `Complete` / `Preempt`, `decide_next_action`).
+9. Update `BatchOrchestrator._poll_cycle_once` to use the two-stage shape (classify-all → preemptions → parallel finalise). Add `_handle_preempt`. Update `BatchOrchestrator._check_unit` to use the same primitive. Delete `_classify_live_unit`. Mark `_check_unit` deprecated.
+10. New tests `tests/test_unit_lifecycle.py`, `tests/test_destroy.py`, `tests/test_destroy_adapters_vastai.py`, `tests/test_zombie_sweep.py`. Update `tests/test_batch.py` and `tests/test_batch_orchestrator.py`.
+11. Update `CHANGELOG.md` with the v3 changes.
 
 ## Review process
 
 This design is published as a PR for review before implementation begins. Reviewers (code owner + ChatGPT-with-GitHub-plugin) should focus on:
 
-- **Seam placement.** Is the `unit_lifecycle` ↔ `BatchOrchestrator` seam at the right boundary? Is the `providers/destroy` ↔ `providers/destroy_adapters/vastai.py` split clean?
-- **Typed destroy result.** Does `DestroyResult` + `DestroyVerdict` cover every case the reviewer named (gone / already-gone / present / unknown)?
-- **Safety behaviour.** Does the empty-allowlist test (`allowed_images=set()` rejects all images) catch the regression that the previous draft introduced?
+- **VerifyVerdict vs DestroyVerdict split.** Does the two-enum split correctly separate the verifier's observation from the protocol's outcome? Are the names right?
+- **DestroyRefusal.** Does the `OWNERSHIP` / `NO_CREDENTIALS` split correctly distinguish the two failure modes for the CLI fallback decision?
+- **Safety behaviour.** Does the empty-allowlist test (`allowed_images=set()` rejects all images) catch the regression that the original draft introduced?
+- **Empty-status classification.** Does the `vastai_verify` 200 + empty/missing/non-string `actual_status` correctly return `PRESENT`, not `GONE`?
 - **R2 exception policy.** Are the three exception paths (initial R2, check_progress, worker_dead re-check) all handled the way the reviewer asked for?
 - **`Preempt` shape.** Is `Preempt(cause: PreemptCause, detail: str | None)` the right shape, or should `cause` carry more structure?
 - **Thin-wrapper retention.** Is removing `_classify_live_unit` and keeping `_check_unit` for one deprecation cycle the right balance, or should both be removed in the same PR?
+- **Two-stage poll loop.** Does the new `_poll_cycle_once` preserve the parallel-finalisation behaviour of the previous design?
+- **VastaiRunner destroy mapping.** Does the `DestroyResult` → boolean return mapping correctly distinguish DESTROYED from LEAKED / UNKNOWN / OWNERSHIP / NO_CREDENTIALS?
+- **CLI fallback honesty.** Is the `cli_attempted` counter separate from `killed` the right way to encode the opportunistic nature of the CLI fallback?
 - **Credential precedence.** Does the env-first + fail-closed semantics match the project's intent for Vast.ai credentials?
 - **Biolab-runners precedent.** The biolab-runners v15 PR ([#88](https://github.com/Lambda-Biolab/biolab-runners/pull/88)) and v14 PR ([#82](https://github.com/Lambda-Biolab/biolab-runners/pull/82)) are the precedent. Does this design match v15's discipline (single localised observation sequence, frozen dataclass plans, ClassVar action enum) and v14's discipline (one protocol module, one adapter per provider, callbacks + policy over class hierarchy)?
 
