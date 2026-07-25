@@ -1651,7 +1651,7 @@ Multi-provider credential unification is deferred until `RunPodRunner` lands.
 - `verdict == PRESENT` → resurrection detected, run stop + delete + re-verify.
 - `verdict == UNKNOWN` → cannot determine. Return `DestroyResult(verdict=UNKNOWN)` with `last_status_code` and `error` preserved.
 
-`delete_fn` returns `bool` (success or no — idempotent on 404). `stop_fn` returns `None` and must not raise (the protocol wraps it in try/except).
+`delete_fn` returns `bool` (success or no — idempotent on 404). `stop_fn` returns `None` and may raise; the protocol records the exception in `stop_error` and continues to DELETE. (The previous wording "must not raise" was incorrect: the protocol's `try/except` in phase 1 explicitly handles stop failures by recording them and proceeding. A silent return on a 401/429/500 would let DELETE proceed without a recorded error. The `vastai_stop` adapter now inspects the response status and raises `RuntimeError` on non-2xx so the protocol sees the failure.)
 
 ### `Preempt` reason
 
