@@ -9,14 +9,14 @@ motivated this doc see the [HTML report][review].
 
 ## What changes vs v2
 
-In one paragraph: the unit-lifecycle decision tree (R2 → SSH → worker_dead re-check → action) moves out of `BatchOrchestrator` into a new `unit_lifecycle` deep module exposing one function `decide_next_action(unit, runner, instance, is_done_in_r2) -> UnitAction`, where `UnitAction` is a tagged union of three frozen dataclasses (`Continue | Complete | Preempt`). The four-step belt-and-suspenders destroy protocol moves out of `VastaiRunner._rest_destroy` and the standalone helpers in `providers/vastai.py` into a new `providers/destroy` deep module exposing `belt_and_suspenders`. The destroy protocol has two distinct enums: `VerifyVerdict` (the verifier's observation: `GONE | PRESENT | UNKNOWN`) and `DestroyVerdict` (the protocol's outcome: `DESTROYED | LEAKED | UNKNOWN`). The `VerifyFn` callback returns a `VerifyResult` carrying `verdict` + `status_code` + `error`. The protocol returns a `DestroyResult` carrying `verdict` (protocol outcome) or `refusal` (pre-protocol outcome: `OWNERSHIP | NO_CREDENTIALS`), but never both. This split makes the CLI fallback in the zombie sweep safe: a refusal for `OWNERSHIP` cannot be bypassed by falling back to the CLI. The destroy module owns the loop shape; provider-specific timing policy lives in a `DestroyPolicy` dataclass supplied by the adapter. Two latent bugs are corrected: the orchestrator's `_destroy_via_rest` silently treats HTTP errors as "instance gone," and the current `VastaiRunner.destroy_instance` ignores the destroy result and unconditionally returns `True`.
+In one paragraph: the unit-lifecycle decision tree (R2 → SSH → worker_dead re-check → action) moves out of `BatchOrchestrator` into a new `unit_lifecycle` deep module exposing one function `decide_next_action(unit, runner, instance, is_done_in_r2) -> UnitAction`, where `UnitAction` is a tagged union of three frozen dataclasses (`Continue | Complete | Preempt`). The four-step belt-and-suspenders destroy protocol moves out of `VastaiRunner._rest_destroy` and the standalone helpers in `providers/vastai.py` into a new `providers/destroy` deep module exposing `belt_and_suspenders`. The destroy protocol has two distinct enums: `VerifyVerdict` (the verifier's observation: `GONE | PRESENT | UNKNOWN`) and `DestroyVerdict` (the protocol's outcome: `DESTROYED | LEAKED | UNKNOWN`). The `VerifyFn` callback returns a `VerifyResult` carrying `verdict` + `status_code` + `error`. The protocol returns a `DestroyResult` carrying `verdict` (protocol outcome) or `refusal` (pre-protocol outcome: `OWNERSHIP | NO_CREDENTIALS | CREDENTIALS_DISABLED`), but never both, plus `verify_error` to preserve the most recent verifier error context. This split makes the CLI fallback in the zombie sweep safe: a refusal for `OWNERSHIP` cannot be bypassed by falling back to the CLI, and a refusal for `CREDENTIALS_DISABLED` (operator set `VASTAI_API_KEY=""`) cannot be bypassed by the CLI re-enabling file credentials. The destroy module owns the loop shape; provider-specific timing policy lives in a `DestroyPolicy` dataclass supplied by the adapter. Three latent bugs are corrected: the orchestrator's `_destroy_via_rest` silently treats HTTP errors as "instance gone," the current `VastaiRunner.destroy_instance` ignores the destroy result and unconditionally returns `True`, and the fail-closed credential semantics were bypassed by the CLI fallback in the zombie sweep.
 
 Diff vs v2:
 
 - **+** `src/vastai_gpu_runner/unit_lifecycle.py` — `decide_next_action`, `Action` enum, `Continue | Complete | Preempt` plan types, `PreemptCause` enum, `ProgressSnapshot` dataclass
-- **+** `src/vastai_gpu_runner/providers/destroy.py` — `VerifyVerdict` + `DestroyVerdict` + `DestroyRefusal` enums, `VerifyResult` + `DestroyResult` + `DestroyPolicy` dataclasses, `belt_and_suspenders()` function
-- **+** `src/vastai_gpu_runner/providers/destroy_adapters/vastai.py` — Vast.ai REST callbacks (`stop_fn`, `delete_fn`, `verify_fn`), `destroy_vastai_instance`, `read_vastai_api_key` (env-first precedence, fail-closed), `VASTAI_POLICY`
-- **~** `BatchOrchestrator.__init__` adds `allowed_images: set[str] | None = None` so the zombie sweep can apply the same image allowlist as the runner
+- **+** `src/vastai_gpu_runner/providers/destroy.py` — `VerifyVerdict` + `DestroyVerdict` + `DestroyRefusal` (incl. `CREDENTIALS_DISABLED`) enums, `VerifyResult` + `DestroyResult` (with `verify_error` field + refusal invariants) + `DestroyPolicy` dataclasses, `belt_and_suspenders()` function
+- **+** `src/vastai_gpu_runner/providers/destroy_adapters/vastai.py` — `CredentialState` + `CredentialResolution` types, `read_vastai_api_key` (three-state env-first precedence), `verify_instance_ownership_rest` (REST-based ownership using same headers as destroy), Vast.ai REST callbacks (`stop_fn`, `delete_fn`, `verify_fn`), `destroy_vastai_instance`, `VASTAI_POLICY`
+- **~** `BatchOrchestrator.__init__` adds `allowed_images: AbstractSet[str] | None = None` (normalised to `frozenset` internally; matches the existing `VastaiRunner.allowed_images: frozenset[str] | None` contract) so the zombie sweep can apply the same image allowlist as the runner
 - **~** `BatchOrchestrator._poll_cycle_once` keeps its two-stage shape (classify-all → preemptions → parallel finalise) using the shared `decide_next_action` primitive
 - **~** `BatchOrchestrator._check_unit` becomes a thin wrapper (one deprecation cycle only — the API reference documents it as inherited lifecycle surface) that delegates to `decide_next_action`. `_classify_live_unit` is **deleted**, not wrapped.
 - **~** `BatchOrchestrator._sweep_zombies` routes through `destroy_vastai_instance` and branches on `DestroyResult.verdict` vs `DestroyResult.refusal`; CLI fallback only fires for `NO_CREDENTIALS`, never for `OWNERSHIP`
@@ -52,7 +52,7 @@ Does **not** own: REST URLs, API key paths, image-ownership guard, timing consta
 
 ### New: `providers/destroy_adapters/vastai.py` — Vast.ai REST callbacks
 
-Owns: the three Vast.ai REST endpoints (`PUT state=stopped`, `DELETE`, `GET for verify`), the `read_vastai_api_key` call with env-first precedence and fail-closed semantics, the `allowed_images` ownership guard with `is not None` semantics, the `DestroyPolicy` constants (the Vast.ai-discovered 5s verify delay, 3s retry sleep, 3 max delete attempts), the `destroy_vastai_instance` function that wraps the protocol with pre-protocol refusals.
+Owns: the three Vast.ai REST endpoints (`PUT state=stopped`, `DELETE`, `GET for verify`), the `CredentialState` and `CredentialResolution` types, the `read_vastai_api_key` call (three-state: `AVAILABLE` / `ABSENT` / `EXPLICITLY_DISABLED`), the `verify_instance_ownership_rest` function (REST-based ownership using the same auth headers as destroy), the `allowed_images` ownership guard with `is not None` semantics, the `DestroyPolicy` constants (the Vast.ai-discovered 5s verify delay, 3s retry sleep, 3 max delete attempts), the `destroy_vastai_instance` function that wraps the protocol with pre-protocol refusals (`OWNERSHIP` / `NO_CREDENTIALS` / `CREDENTIALS_DISABLED`).
 
 The RunPod adapter lands separately when `RunPodRunner` ships (roadmap item 2). It will register its own `stop_fn` / `delete_fn` / `verify_fn` callbacks and its own `DestroyPolicy` (different retry timing may be appropriate for RunPod's API).
 
@@ -333,12 +333,21 @@ class DestroyRefusal(StrEnum):
     """Pre-protocol refusals — the belt-and-suspenders loop did not run.
 
     The zombie sweep uses these to decide whether to fall back to
-    the CLI: ``NO_CREDENTIALS`` allows the fallback; ``OWNERSHIP``
-    forbids it (the image allowlist is the destruction-safety
-    boundary regardless of credentials).
+    the CLI:
+
+    * ``OWNERSHIP`` forbids the CLI fallback (the image allowlist
+      is the destruction-safety boundary regardless of credentials).
+    * ``NO_CREDENTIALS`` permits the CLI fallback (the CLI may
+      have its own auth independent of the Python loader).
+    * ``CREDENTIALS_DISABLED`` forbids the CLI fallback: the
+      operator has explicitly set ``VASTAI_API_KEY=""`` to disable
+      credentials, and the CLI fallback would silently re-enable
+      them via ``~/.cloud-credentials``. The instance is left
+      for explicit operator action.
     """
-    OWNERSHIP = "ownership"           # image allowlist rejected the instance
-    NO_CREDENTIALS = "no_credentials" # no API key configured to run the protocol
+    OWNERSHIP = "ownership"
+    NO_CREDENTIALS = "no_credentials"
+    CREDENTIALS_DISABLED = "credentials_disabled"
 
 
 @dataclass(frozen=True)
@@ -388,22 +397,28 @@ class DestroyPolicy:
 class DestroyResult:
     """Outcome of a belt-and-suspenders destroy attempt.
 
-    Exactly one of ``verdict`` and ``refusal`` is set. The
-    invariant is enforced in ``__post_init__``.
+    Exactly one of ``verdict`` and ``refusal`` is set. When
+    ``refusal`` is set, the protocol never ran and the
+    ``attempts`` / ``stop_error`` / ``last_status_code`` /
+    ``verify_error`` fields are all None or 0. The invariant
+    is enforced in ``__post_init__``.
 
     * ``verdict`` set → the protocol ran; result is one of
       DESTROYED / LEAKED / UNKNOWN.
     * ``refusal`` set → the protocol did not run; one of
-      OWNERSHIP / NO_CREDENTIALS applies.
+      OWNERSHIP / NO_CREDENTIALS / CREDENTIALS_DISABLED applies.
 
     The zombie sweep branches on which field is set. CLI fallback
     is only permitted for ``refusal == NO_CREDENTIALS``.
+    ``CREDENTIALS_DISABLED`` forbids the CLI fallback because the
+    operator has explicitly disabled credentials.
     """
     verdict: DestroyVerdict | None = None
     refusal: DestroyRefusal | None = None
     attempts: int = 0
     stop_error: str | None = None
     last_status_code: int | None = None
+    verify_error: str | None = None
 
     def __post_init__(self) -> None:
         if (self.verdict is None) == (self.refusal is None):
@@ -411,6 +426,28 @@ class DestroyResult:
                 "DestroyResult: exactly one of verdict or refusal must be set, "
                 f"got verdict={self.verdict} refusal={self.refusal}"
             )
+        if self.refusal is not None:
+            # Protocol never ran — no execution context to carry.
+            if self.attempts != 0:
+                raise ValueError(
+                    f"DestroyResult.refusal={self.refusal} but attempts={self.attempts} "
+                    "(protocol never ran; attempts must be 0)"
+                )
+            if self.stop_error is not None:
+                raise ValueError(
+                    f"DestroyResult.refusal={self.refusal} but stop_error is set "
+                    "(protocol never ran; stop_error must be None)"
+                )
+            if self.last_status_code is not None:
+                raise ValueError(
+                    f"DestroyResult.refusal={self.refusal} but last_status_code is set "
+                    "(protocol never ran; last_status_code must be None)"
+                )
+            if self.verify_error is not None:
+                raise ValueError(
+                    f"DestroyResult.refusal={self.refusal} but verify_error is set "
+                    "(protocol never ran; verify_error must be None)"
+                )
 
 
 class StopFn(Protocol):
@@ -461,6 +498,7 @@ def belt_and_suspenders(
     attempts = 0
     stop_error: str | None = None
     last_status_code: int | None = None
+    verify_error: str | None = None
 
     # Phase 1: best-effort stop. Must not block DELETE.
     try:
@@ -488,13 +526,16 @@ def belt_and_suspenders(
     try:
         first_verify = verify_fn()
     except Exception as exc:
-        logger.warning("belt_and_suspenders: verify_fn raised %s — UNKNOWN", exc)
+        verify_error = f"{type(exc).__name__}: {exc}"
+        logger.warning("belt_and_suspenders: verify_fn raised %s — UNKNOWN", verify_error)
         return DestroyResult(
             verdict=DestroyVerdict.UNKNOWN,
             attempts=attempts,
             stop_error=stop_error,
+            verify_error=verify_error,
         )
     last_status_code = first_verify.status_code
+    verify_error = first_verify.error
 
     if first_verify.verdict == VerifyVerdict.GONE:
         return DestroyResult(
@@ -502,6 +543,7 @@ def belt_and_suspenders(
             attempts=attempts,
             stop_error=stop_error,
             last_status_code=last_status_code,
+            verify_error=verify_error,
         )
     if first_verify.verdict == VerifyVerdict.UNKNOWN:
         return DestroyResult(
@@ -509,6 +551,7 @@ def belt_and_suspenders(
             attempts=attempts,
             stop_error=stop_error,
             last_status_code=last_status_code,
+            verify_error=verify_error,
         )
 
     # Phase 4: resurrection cleanup. Stop is best-effort; delete
@@ -520,6 +563,7 @@ def belt_and_suspenders(
             attempts=attempts,
             stop_error=stop_error,
             last_status_code=last_status_code,
+            verify_error=verify_error,
         )
     try:
         stop_fn()
@@ -541,6 +585,7 @@ def belt_and_suspenders(
             attempts=attempts,
             stop_error=stop_error,
             last_status_code=last_status_code,
+            verify_error=verify_error,
         )
 
     # Phase 5: second verification.
@@ -548,14 +593,17 @@ def belt_and_suspenders(
     try:
         second_verify = verify_fn()
     except Exception as exc:
-        logger.warning("belt_and_suspenders: second verify_fn raised %s — UNKNOWN", exc)
+        verify_error = f"{type(exc).__name__}: {exc}"
+        logger.warning("belt_and_suspenders: second verify_fn raised %s — UNKNOWN", verify_error)
         return DestroyResult(
             verdict=DestroyVerdict.UNKNOWN,
             attempts=attempts,
             stop_error=stop_error,
             last_status_code=last_status_code,
+            verify_error=verify_error,
         )
     last_status_code = second_verify.status_code
+    verify_error = second_verify.error
 
     if second_verify.verdict == VerifyVerdict.GONE:
         return DestroyResult(
@@ -563,6 +611,7 @@ def belt_and_suspenders(
             attempts=attempts,
             stop_error=stop_error,
             last_status_code=last_status_code,
+            verify_error=verify_error,
         )
     if second_verify.verdict == VerifyVerdict.PRESENT:
         return DestroyResult(
@@ -570,12 +619,14 @@ def belt_and_suspenders(
             attempts=attempts,
             stop_error=stop_error,
             last_status_code=last_status_code,
+            verify_error=verify_error,
         )
     return DestroyResult(
         verdict=DestroyVerdict.UNKNOWN,
         attempts=attempts,
         stop_error=stop_error,
         last_status_code=last_status_code,
+        verify_error=verify_error,
     )
 ```
 
@@ -601,6 +652,9 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import AbstractSet
+from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 
 import requests
@@ -614,7 +668,6 @@ from vastai_gpu_runner.providers.destroy import (
     VerifyVerdict,
     belt_and_suspenders,
 )
-from vastai_gpu_runner.providers.vastai import verify_instance_ownership
 
 logger = logging.getLogger(__name__)
 
@@ -630,36 +683,133 @@ VASTAI_POLICY = DestroyPolicy(
 )
 
 
-def read_vastai_api_key() -> str:
+class CredentialState(StrEnum):
+    """Result of resolving Vast.ai credentials.
+
+    The three states are distinct because they imply different
+    behaviours downstream:
+
+    * ``AVAILABLE``: a key was found. Use it for REST.
+    * ``ABSENT``: no credentials configured anywhere. The CLI
+      may have its own auth; the Python loader has none.
+    * ``EXPLICITLY_DISABLED``: ``VASTAI_API_KEY`` is set but
+      empty. The operator has explicitly chosen not to use any
+      credentials. The CLI fallback is forbidden because the
+      CLI would silently re-enable file credentials that this
+      env var was meant to disable.
+    """
+    AVAILABLE = "available"
+    ABSENT = "absent"
+    EXPLICITLY_DISABLED = "explicitly_disabled"
+
+
+@dataclass(frozen=True)
+class CredentialResolution:
+    """The outcome of credential lookup.
+
+    ``key`` is set only when ``state == AVAILABLE``. For
+    ``ABSENT`` and ``EXPLICITLY_DISABLED`` the ``key`` field is
+    empty by convention; callers must branch on ``state``
+    rather than on ``key``.
+    """
+    state: CredentialState
+    key: str = ""
+
+
+def read_vastai_api_key() -> CredentialResolution:
     """Resolve the Vast.ai API key with env-first precedence.
 
     Order:
       1. ``VASTAI_API_KEY`` environment variable. A present-but-empty
-         value fails closed (returns empty string, refusing to fall
-         through to the file — a stale ``~/.cloud-credentials`` would
-         silently select the wrong key).
+         value is ``EXPLICITLY_DISABLED``: the operator has turned
+         off credentials and the CLI fallback must not re-enable
+         them via ``~/.cloud-credentials``.
       2. ``~/.config/vastai/vast_api_key`` file.
       3. ``~/.vast_api_key`` file.
 
     Returns:
-        Non-empty API key, or empty string if no source is configured.
+        ``CredentialResolution`` with state and (when available)
+        the resolved key. Callers must branch on ``state`` rather
+        than on the key's truthiness — ``EXPLICITLY_DISABLED``
+        and ``ABSENT`` both have an empty key but different
+        semantics.
     """
     env_key = os.environ.get("VASTAI_API_KEY")
     if env_key is not None:
         if env_key.strip() == "":
             logger.warning(
-                "VASTAI_API_KEY is set but empty — ignoring and NOT "
-                "falling through to file credentials (fail-closed)."
+                "VASTAI_API_KEY is set but empty — EXPLICITLY_DISABLED. "
+                "Credentials disabled; CLI fallback forbidden."
             )
-            return ""
-        return env_key.strip()
+            return CredentialResolution(state=CredentialState.EXPLICITLY_DISABLED)
+        return CredentialResolution(
+            state=CredentialState.AVAILABLE, key=env_key.strip(),
+        )
     for path in (
         Path("~/.config/vastai/vast_api_key").expanduser(),
         Path("~/.vast_api_key").expanduser(),
     ):
         if path.exists():
-            return path.read_text().strip()
-    return ""
+            return CredentialResolution(
+                state=CredentialState.AVAILABLE, key=path.read_text().strip(),
+            )
+    return CredentialResolution(state=CredentialState.ABSENT)
+
+
+def _image_is_allowed(image: str, allowed_images: AbstractSet[str]) -> bool:
+    """Check whether the instance's image matches the allowlist.
+
+    The matching rules match the existing
+    ``verify_instance_ownership`` semantics: exact match first,
+    then prefix match (where the prefix is the part before the
+    first ``:`` in the allowlist entry, supporting image tags).
+    """
+    if not image:
+        return False
+    if image in allowed_images:
+        return True
+    for entry in allowed_images:
+        prefix = entry.split(":", 1)[0]
+        if prefix and image.startswith(prefix):
+            return True
+    return False
+
+
+def verify_instance_ownership_rest(
+    instance_id: str,
+    allowed_images: AbstractSet[str],
+    hdrs: dict[str, str],
+) -> bool:
+    """Ownership check via REST, using the same headers as destroy.
+
+    This is the ownership check used by the REST path. The CLI
+    fallback uses the existing CLI-based ``verify_instance_ownership``
+    in ``providers/vastai.py`` (separate auth context).
+
+    Returns ``True`` when the instance's image is in the allowlist
+    or when the lookup fails open (the instance does not exist,
+    or the API call fails). Returns ``False`` only when the
+    instance genuinely exists and its image is not allowed.
+    """
+    try:
+        resp = requests.get(f"{BASE_URL}/{instance_id}/", headers=hdrs, timeout=10)
+    except Exception as exc:
+        logger.warning("verify_instance_ownership_rest: GET raised %s", exc)
+        return False  # fail-closed on network failure
+    if resp.status_code == 404:
+        return True  # instance is gone; ownership is moot
+    if resp.status_code != 200:
+        logger.warning(
+            "verify_instance_ownership_rest: GET %s returned %d",
+            instance_id, resp.status_code,
+        )
+        return False
+    try:
+        image = resp.json().get("image", "")
+    except Exception as exc:
+        logger.warning("verify_instance_ownership_rest: JSON parse raised %s", exc)
+        return False
+    return _image_is_allowed(image, allowed_images)
 
 
 def vastai_stop(instance_id: str, hdrs: dict[str, str]) -> None:
@@ -740,37 +890,56 @@ def vastai_verify(instance_id: str, hdrs: dict[str, str]) -> VerifyResult:
 def destroy_vastai_instance(
     instance_id: str,
     *,
-    allowed_images: set[str] | None = None,
+    allowed_images: AbstractSet[str] | None = None,
 ) -> DestroyResult:
     """Belt-and-suspenders destroy with the ownership guard.
 
-    The ownership guard is applied first: if ``allowed_images`` is
-    not None (note: an empty set *rejects every image*, not skips
-    the guard) and the instance's image is not in the set, return
-    ``DestroyResult(refusal=OWNERSHIP)`` with a logged refusal —
-    no API call is made. This protects against cross-project
-    accidents on shared Vast.ai accounts.
+    The ownership guard is applied first via REST (using the same
+    headers as the destroy). If the image is not in the allowlist,
+    return ``DestroyResult(refusal=OWNERSHIP)``. No API call to
+    delete is made.
 
-    If no API key is configured, return
-    ``DestroyResult(refusal=NO_CREDENTIALS)``. The zombie sweep
-    uses this refusal to decide whether the CLI fallback is
-    permitted; the runner's ``destroy_instance`` path should
-    treat NO_CREDENTIALS as a hard failure (return False) since
-    the runner manages the unit-tracked lifecycle and cannot
-    rely on the opportunistic CLI fallback.
+    Credential resolution distinguishes three states:
+
+    * ``AVAILABLE``: a key was found. Build the REST headers and
+      run the protocol.
+    * ``ABSENT``: no credentials configured. Return ``refusal=
+      NO_CREDENTIALS``. The zombie sweep may try the CLI fallback
+      (the CLI may have its own auth).
+    * ``EXPLICITLY_DISABLED``: the operator has set
+      ``VASTAI_API_KEY=""`` to disable credentials. Return
+      ``refusal=CREDENTIALS_DISABLED``. The CLI fallback is
+      forbidden because the CLI would silently re-enable file
+      credentials that this env var was meant to disable.
+
+    The runner's ``destroy_instance`` path treats every refusal
+    as a hard failure (returns False), including
+    ``CREDENTIALS_DISABLED`` and ``NO_CREDENTIALS``. The CLI
+    fallback is *only* available in the zombie sweep.
     """
-    if allowed_images is not None and not verify_instance_ownership(
-        instance_id, allowed_images=allowed_images
+    resolution = read_vastai_api_key()
+    if resolution.state == CredentialState.EXPLICITLY_DISABLED:
+        logger.error(
+            "destroy_vastai_instance: %s — credentials disabled "
+            "via VASTAI_API_KEY=''. Refusing.",
+            instance_id,
+        )
+        return DestroyResult(refusal=DestroyRefusal.CREDENTIALS_DISABLED)
+    if resolution.state == CredentialState.ABSENT:
+        logger.error(
+            "destroy_vastai_instance: %s — no credentials configured",
+            instance_id,
+        )
+        return DestroyResult(refusal=DestroyRefusal.NO_CREDENTIALS)
+    hdrs = {"Authorization": f"Bearer {resolution.key}"}
+    if allowed_images is not None and not verify_instance_ownership_rest(
+        instance_id, allowed_images, hdrs,
     ):
         logger.error(
             "REFUSED to destroy instance %s — ownership check failed.",
             instance_id,
         )
         return DestroyResult(refusal=DestroyRefusal.OWNERSHIP)
-    api_key = read_vastai_api_key()
-    if not api_key:
-        return DestroyResult(refusal=DestroyRefusal.NO_CREDENTIALS)
-    hdrs = {"Authorization": f"Bearer {api_key}"}
     return belt_and_suspenders(
         stop_fn=lambda: vastai_stop(instance_id, hdrs),
         delete_fn=lambda: vastai_delete(instance_id, hdrs),
@@ -779,7 +948,11 @@ def destroy_vastai_instance(
     )
 ```
 
-The `is not None` guard (not `if allowed_images and ...`) is the safety-critical fix. An empty `set()` passed as `allowed_images` rejects every image, which is the correct conservative behaviour; the previous `if allowed_images and ...` shape would silently skip the guard on an empty set and allow cross-project deletion.
+The `is not None` guard (not `if allowed_images and ...`) is the safety-critical fix. An empty `set()` passed as `allowed_images` rejects every image, which is the correct conservative behaviour.
+
+The three-state credential model is the second safety-critical fix. The previous design's `read_vastai_api_key()` returned `""` for both ABSENT and EXPLICITLY_DISABLED; the adapter flattened both to `NO_CREDENTIALS`; the CLI fallback then used file credentials that the explicit empty env var was meant to disable. The new design makes the operator's intent explicit: setting `VASTAI_API_KEY=""` is a hard stop, not a "try the CLI fallback."
+
+The ownership check now uses REST (when REST is available) so that the same auth identity applies to the ownership check and the destroy. The CLI-based `verify_instance_ownership` in `providers/vastai.py` is retained for the CLI fallback path (which uses the CLI's auth, not the REST key).
 
 ## `VastaiRunner.destroy_instance` integration
 
@@ -792,20 +965,18 @@ def destroy_instance(self, instance: CloudInstance) -> bool:
     """Destroy a Vast.ai instance (with ownership safety guard).
 
     Returns True only when the belt-and-suspenders protocol confirmed
-    destruction. Returns False on refusal (ownership), leakage
-    (resurrected after cleanup), or unknown verification — each
-    with an explanatory log message. ``InstanceStatus.DESTROYED``
-    is set only on confirmed destruction.
+    destruction. Returns False on refusal (ownership, missing
+    credentials, credentials disabled), leakage (resurrected after
+    cleanup), or unknown verification — each with an explanatory
+    log message. ``InstanceStatus.DESTROYED`` is set only on
+    confirmed destruction.
+
+    The adapter is called once; the result drives the boolean
+    return. The runner does not pre-resolve the API key (the
+    adapter owns credential resolution and the refusal contract).
     """
-    api_key = read_vastai_api_key()
-    if not api_key:
-        logger.error(
-            "VastaiRunner.destroy_instance: no API key for %s — refusing",
-            instance.instance_id,
-        )
-        return False  # runner path is unit-tracked; no CLI fallback
     result = destroy_vastai_instance(
-        instance.instance_id, allowed_images=self.allowed_images
+        instance.instance_id, allowed_images=self.allowed_images,
     )
     if result.refusal == DestroyRefusal.OWNERSHIP:
         logger.error(
@@ -819,6 +990,13 @@ def destroy_instance(self, instance: CloudInstance) -> bool:
             instance.instance_id,
         )
         return False
+    if result.refusal == DestroyRefusal.CREDENTIALS_DISABLED:
+        logger.error(
+            "VastaiRunner.destroy_instance: %s — credentials disabled "
+            "via VASTAI_API_KEY=''",
+            instance.instance_id,
+        )
+        return False
     if result.verdict == DestroyVerdict.DESTROYED:
         instance.status = InstanceStatus.DESTROYED
         logger.info("Destroyed instance %s", instance.instance_id)
@@ -827,55 +1005,51 @@ def destroy_instance(self, instance: CloudInstance) -> bool:
         logger.error(
             "VastaiRunner.destroy_instance: %s LEAKED after resurrection "
             "cleanup — operator intervention required "
-            "(attempts=%d, last_status=%s, stop_error=%s)",
+            "(attempts=%d, last_status=%s, last_error=%s, stop_error=%s)",
             instance.instance_id,
-            result.attempts, result.last_status_code, result.stop_error,
+            result.attempts, result.last_status_code,
+            result.verify_error, result.stop_error,
         )
         return False
     logger.warning(
         "VastaiRunner.destroy_instance: %s destroy result UNKNOWN "
-        "(attempts=%d, last_status=%s, stop_error=%s)",
+        "(attempts=%d, last_status=%s, last_error=%s, stop_error=%s)",
         instance.instance_id,
-        result.attempts, result.last_status_code, result.stop_error,
+        result.attempts, result.last_status_code,
+        result.verify_error, result.stop_error,
     )
     return False
 ```
 
-The current code's "CLI destroy + REST + always return True" pattern is replaced. The CLI fallback is *only* available in the zombie sweep (the orphan path), and only for `NO_CREDENTIALS`. The runner's `destroy_instance` is the unit-tracked path and treats missing credentials as a hard failure.
+The current code's "CLI destroy + REST + always return True" pattern is replaced. The CLI fallback is *only* available in the zombie sweep (the orphan path), and only for `NO_CREDENTIALS`. The runner's `destroy_instance` is the unit-tracked path and treats every refusal as a hard failure. Adapter is called once; the result drives the boolean return.
 
 ## Zombie sweep integration
 
-The orchestrator's `_sweep_zombies` routes through `destroy_vastai_instance` and branches on the `DestroyResult.verdict` vs `DestroyResult.refusal` distinction. The CLI fallback only fires for `NO_CREDENTIALS`; ownership refusals are never bypassed.
+The zombie sweep lives in `orchestrator.py:sweep_zombie_instances` as today. The function gains an `allowed_images: AbstractSet[str] | None` keyword argument and routes through `destroy_vastai_instance`. It branches on the `DestroyResult.verdict` vs `DestroyResult.refusal` distinction.
+
+* `DestroyResult.verdict == DESTROYED` → `killed` increments.
+* `DestroyResult.verdict == LEAKED` / `UNKNOWN` → logged with full error context.
+* `DestroyResult.refusal == OWNERSHIP` → skipped (no CLI fallback, ever).
+* `DestroyResult.refusal == CREDENTIALS_DISABLED` → skipped (CLI fallback forbidden — it would silently re-enable file credentials).
+* `DestroyResult.refusal == NO_CREDENTIALS` → CLI fallback is opportunistic; tracked in `cli_attempted` (separate from `killed`).
+
+`BatchOrchestrator._sweep_zombies` is a thin delegate that calls `sweep_zombie_instances` with `allowed_images=self._allowed_images`. This keeps the public zombie-cleanup surface in `orchestrator.py` (where the function lives today) and the orchestrator's role minimal.
 
 ```python
-# In BatchOrchestrator, after the refactor:
+# In orchestrator.py — sweep_zombie_instances, after the refactor:
 
-def __init__(
-    self,
+def sweep_zombie_instances(
+    live_runners: dict[int, tuple[CloudRunner, CloudInstance]],
     *,
-    runner_factory: RunnerFactory,
     label_prefix: str,
-    allowed_images: set[str] | None = None,
-    workspace_dir: str = "/workspace",
+    allowed_images: AbstractSet[str] | None = None,
     r2_sink: R2Sink | None = None,
     r2_batch_id: str = "",
-    budget_usd: float = 0.0,
-    max_retries: int = 2,
-    max_parallel_deploys: int = 16,
-    max_parallel_collects: int = 1,
-    poll_interval_seconds: int = 30,
-    zombie_sweep_every_n_cycles: int = 5,
-    poll_timeout_seconds: float = 0.0,
-) -> None:
-    # ... existing assignments ...
-    self._allowed_images = allowed_images
-    # ... rest unchanged ...
-
-def _sweep_zombies(self) -> int:
+) -> int:
     """Destroy Vast.ai instances not tracked by live_runners.
 
     Each candidate instance is destroyed via the belt-and-suspenders
-    adapter. The image allowlist (``self._allowed_images``) is the
+    adapter. The image allowlist (``allowed_images``) is the
     destruction-safety boundary; the batch-label prefix is the
     orphan-detection boundary. The two boundaries are independent:
     the label prefix determines *which* instances are candidates;
@@ -884,17 +1058,17 @@ def _sweep_zombies(self) -> int:
 
     The CLI fallback is opportunistic: it runs only for
     ``DestroyResult.refusal == NO_CREDENTIALS`` and is recorded
-    in a separate counter (``cli_attempted``). Ownership refusals
-    are never bypassed by the CLI. The ``killed`` counter is
-    incremented only on confirmed destroy (``verdict == DESTROYED``).
+    in a separate counter (``cli_attempted``). Ownership and
+    credentials-disabled refusals are never bypassed by the CLI.
+    The ``killed`` counter is incremented only on confirmed
+    destroy (``verdict == DESTROYED``).
     """
-    # ... enumerate candidates via vastai_cmd (existing logic) ...
+    # ... existing enumeration via vastai_cmd (unchanged) ...
     killed = 0
     cli_attempted = 0
     for iid in zombie_candidates:
         result = destroy_vastai_instance(
-            iid,
-            allowed_images=self._allowed_images,
+            iid, allowed_images=allowed_images,
         )
         if result.verdict == DestroyVerdict.DESTROYED:
             killed += 1
@@ -902,14 +1076,16 @@ def _sweep_zombies(self) -> int:
             logger.error(
                 "Zombie sweep: instance %s LEAKED after resurrection cleanup "
                 "— operator intervention required (attempts=%d, "
-                "last_status=%s, stop_error=%s)",
-                iid, result.attempts, result.last_status_code, result.stop_error,
+                "last_status=%s, last_error=%s, stop_error=%s)",
+                iid, result.attempts, result.last_status_code,
+                result.verify_error, result.stop_error,
             )
         elif result.verdict == DestroyVerdict.UNKNOWN:
             logger.warning(
                 "Zombie sweep: instance %s destroy result UNKNOWN "
-                "(attempts=%d, last_status=%s, stop_error=%s)",
-                iid, result.attempts, result.last_status_code, result.stop_error,
+                "(attempts=%d, last_status=%s, last_error=%s, stop_error=%s)",
+                iid, result.attempts, result.last_status_code,
+                result.verify_error, result.stop_error,
             )
         elif result.refusal == DestroyRefusal.OWNERSHIP:
             logger.info(
@@ -918,10 +1094,22 @@ def _sweep_zombies(self) -> int:
                 "disagree — reconcile before next sweep.",
                 iid,
             )
+        elif result.refusal == DestroyRefusal.CREDENTIALS_DISABLED:
+            # CLI fallback is forbidden. The operator explicitly
+            # disabled credentials via VASTAI_API_KEY=''; the CLI
+            # would silently re-enable file credentials that the
+            # env var was meant to disable. Operator must act.
+            logger.warning(
+                "Zombie sweep: skipped %s (credentials disabled via "
+                "VASTAI_API_KEY=''). CLI fallback forbidden — "
+                "operator action required.",
+                iid,
+            )
         elif result.refusal == DestroyRefusal.NO_CREDENTIALS:
-            # CLI fallback permitted. The CLI command is opportunistic;
-            # the killed counter does not increment because we cannot
-            # verify the result through the CLI without significant work.
+            # CLI fallback permitted. The CLI may have its own auth
+            # independent of the Python loader. The killed counter
+            # does not increment because we cannot verify the result
+            # through the CLI without significant work.
             try:
                 vastai_cmd(["destroy", "instance", iid], timeout=15)
                 cli_attempted += 1
@@ -945,7 +1133,62 @@ def _sweep_zombies(self) -> int:
     return killed
 ```
 
+```python
+# In BatchOrchestrator, after the refactor:
+
+def __init__(
+    self,
+    *,
+    runner_factory: RunnerFactory,
+    label_prefix: str,
+    allowed_images: AbstractSet[str] | None = None,
+    workspace_dir: str = "/workspace",
+    r2_sink: R2Sink | None = None,
+    r2_batch_id: str = "",
+    budget_usd: float = 0.0,
+    max_retries: int = 2,
+    max_parallel_deploys: int = 16,
+    max_parallel_collects: int = 1,
+    poll_interval_seconds: int = 30,
+    zombie_sweep_every_n_cycles: int = 5,
+    poll_timeout_seconds: float = 0.0,
+) -> None:
+    # ... existing assignments ...
+    self._allowed_images = (
+        frozenset(allowed_images) if allowed_images is not None else None
+    )
+    # ... rest unchanged ...
+
+def _sweep_zombies(self) -> int:
+    """Thin delegate to ``sweep_zombie_instances``.
+
+    Carries the orchestrator's ``allowed_images`` config into the
+    shared sweep function. The actual cleanup logic lives in
+    ``orchestrator.py:sweep_zombie_instances``; the orchestrator
+    just adapts the signature.
+    """
+    with self._state_lock:
+        live_map: dict[int, tuple[CloudRunner, CloudInstance]] = {
+            i: (entry[0], entry[1]) for i, entry in enumerate(self._live_runners.values())
+        }
+    try:
+        return sweep_zombie_instances(
+            live_map,
+            label_prefix=self._label_prefix,
+            allowed_images=self._allowed_images,
+            r2_sink=self._r2_sink,
+            r2_batch_id=self._r2_batch_id,
+        )
+    except Exception as exc:
+        logger.warning("Zombie sweep failed: %s", exc)
+        return 0
+```
+
 The `allowed_images` field is intentionally distinct from the label-prefix boundary. The label prefix identifies orphans (instances we created but lost track of); the image allowlist is the safety guard against cross-project deletion. Both must agree for the CLI fallback to be safe — if they disagree, the operator has misconfigured something and the instance is logged but not destroyed.
+
+The fresh `allowed_images` is normalised to `frozenset` at construction so downstream calls (which all use `AbstractSet[str]`) work identically whether the caller passed a `set`, `frozenset`, or any other `AbstractSet` implementation. This matches the existing `VastaiRunner.allowed_images` contract, which is `frozenset[str] | None`.
+
+**Known limitation (to be addressed in a follow-up issue).** Adding `allowed_images` directly to the provider-neutral `BatchOrchestrator` weakens its "no provider coupling" principle and creates a second independently configured copy of the runner's ownership policy. The longer-term shape is a `destroy_zombie` callback or a provider cleanup policy on the runner — the orchestrator would invoke the callback per orphan rather than carrying the allowlist. See the tracking issue for the proposal.
 
 ## Two-stage poll loop
 
@@ -1073,7 +1316,7 @@ def _check_unit(
 
 **None.** `CloudRunner` keeps its public interface. The new `unit_lifecycle` module does not subclass the runner; it takes a `runner` parameter via protocol. The new `providers/destroy` module takes callbacks plus a `DestroyPolicy`; `VastaiRunner` still calls `destroy_vastai_instance` from its own `destroy_instance` method.
 
-The new `BatchOrchestrator` constructor parameter `allowed_images: set[str] | None = None` is additive (default `None` preserves existing behaviour for callers that did not set it).
+The new `BatchOrchestrator` constructor parameter `allowed_images: AbstractSet[str] | None = None` is additive (default `None` preserves existing behaviour for callers that did not set it). At construction the value is normalised to `frozenset` for stable hashing and immutability, matching `VastaiRunner.allowed_images`.
 
 The RunPod adapter does not exist yet. When `RunPodRunner` ships (roadmap item 2), it gets a sibling `providers/destroy_adapters/runpod.py` with the same callback shape and its own `DestroyPolicy`. No ABC change.
 
@@ -1092,8 +1335,11 @@ The RunPod adapter does not exist yet. When `RunPodRunner` ships (roadmap item 2
 | `VerifyVerdict` | StrEnum; the verifier's observation at one instant. `GONE | PRESENT | UNKNOWN`. |
 | `VerifyResult` | Frozen dataclass; the verifier's output. Carries `verdict: VerifyVerdict`, `status_code: int | None`, `error: str | None`. |
 | `DestroyVerdict` | StrEnum; the protocol's outcome. `DESTROYED | LEAKED | UNKNOWN`. |
-| `DestroyRefusal` | StrEnum; pre-protocol refusals. `OWNERSHIP | NO_CREDENTIALS`. |
-| `DestroyResult` | Frozen dataclass; the protocol's output. Exactly one of `verdict: DestroyVerdict | None` and `refusal: DestroyRefusal | None` is set. Carries `attempts`, `stop_error`, `last_status_code`. |
+| `DestroyRefusal` | StrEnum; pre-protocol refusals. `OWNERSHIP | NO_CREDENTIALS | CREDENTIALS_DISABLED`. |
+| `DestroyResult` | Frozen dataclass; the protocol's output. Exactly one of `verdict: DestroyVerdict | None` and `refusal: DestroyRefusal | None` is set. Carries `attempts`, `stop_error`, `last_status_code`, `verify_error`. When `refusal` is set, `attempts == 0` and the other fields are `None`. |
+| `CredentialState` | StrEnum; the result of Vast.ai credential lookup. `AVAILABLE | ABSENT | EXPLICITLY_DISABLED`. Used to distinguish a missing key from an operator-disabled key. |
+| `CredentialResolution` | Frozen dataclass; carries `state: CredentialState` and `key: str` (set only when `state == AVAILABLE`). |
+| `verify_error` | Field on `DestroyResult`; the most recent `verify_fn` error message (or `None`). Distinct from `stop_error` (best-effort stop failures). |
 | `DestroyPolicy` | Frozen dataclass; provider-specific retry/timing policy with `__post_init__` invariants. |
 | `belt_and_suspenders` | The single public function in `providers/destroy.py`. Four-step destroy loop with second verification after resurrection cleanup. Returns `DestroyResult` with `verdict` set. |
 | `StopFn` / `DeleteFn` / `VerifyFn` | The callback protocols for the destroy loop. `VerifyFn` returns `VerifyResult` (not enum). |
@@ -1108,13 +1354,19 @@ These were open questions in the v3 draft; they are resolved in this revision.
 
 ### Credential precedence (Vast.ai)
 
-`read_vastai_api_key()` resolves in this order:
+`read_vastai_api_key()` returns a `CredentialResolution` with three distinct states:
 
-1. `VASTAI_API_KEY` environment variable. A present-but-empty value fails closed (returns empty string, refuses to fall through to file credentials).
-2. `~/.config/vastai/vast_api_key` file.
-3. `~/.vast_api_key` file.
+* `CredentialState.AVAILABLE`: a key was found (env-first, then `~/.config/vastai/vast_api_key`, then `~/.vast_api_key`).
+* `CredentialState.ABSENT`: no credentials configured anywhere.
+* `CredentialState.EXPLICITLY_DISABLED`: `VASTAI_API_KEY` is set but empty. The operator has explicitly turned off credentials.
 
-A present-empty env var is not the same as an absent one. A stale `~/.cloud-credentials` file would silently select the wrong key; the fail-closed semantics prevent this.
+The adapter translates the state into a `DestroyResult.refusal`:
+
+* `AVAILABLE` → run the belt-and-suspenders protocol.
+* `ABSENT` → `DestroyResult(refusal=NO_CREDENTIALS)`. CLI fallback is permitted (the CLI may have its own auth).
+* `EXPLICITLY_DISABLED` → `DestroyResult(refusal=CREDENTIALS_DISABLED)`. CLI fallback is forbidden — the CLI would silently re-enable file credentials that the env var was meant to disable.
+
+The previous design's `read_vastai_api_key()` returned `""` for both `ABSENT` and `EXPLICITLY_DISABLED`; the adapter flattened both to `NO_CREDENTIALS`; the CLI fallback then used file credentials that the explicit empty env var was meant to disable. The new design closes that loop: the operator's intent is now an explicit state the CLI fallback can read.
 
 Multi-provider credential unification is deferred until `RunPodRunner` lands.
 
@@ -1173,20 +1425,33 @@ The following test cases must be enumerated in the implementation PR. The design
 - **Resurrection cleanup succeeds.** First verify returns `VerifyResult(verdict=PRESENT)`. Run stop + delete + re-verify. Second verify returns `VerifyResult(verdict=GONE)`. Result: `DestroyResult(verdict=DESTROYED, attempts=2)`.
 - **Resurrection cleanup fails.** First verify returns `VERIFY(PRESENT)`. Re-verify still returns `VERIFY(PRESENT)`. Result: `DestroyResult(verdict=LEAKED, attempts=2)`.
 - **Unknown verification.** `verify_fn` returns `VerifyResult(verdict=UNKNOWN)` on first call. Result: `DestroyResult(verdict=UNKNOWN)`. No resurrection cleanup.
+- **`verify_error` preserved from verify_fn.** `verify_fn` returns `VerifyResult(verdict=UNKNOWN, error="http 500")`. Result: `DestroyResult(verdict=UNKNOWN, verify_error="http 500", last_status_code=500)`. The error context is propagated to the caller.
+- **Verify_fn raises.** `verify_fn()` raises an exception. Result: `DestroyResult(verdict=UNKNOWN, verify_error="<ExceptionClass>: <message>")`. The exception is caught and converted to a structured error.
 - **Stop failure.** `stop_fn` raises. The error is recorded in `stop_error`; the DELETE still runs. Result: `DestroyResult(verdict=DESTROYED, stop_error="...")`.
 - **Resurrection stop failure.** First verify returns `PRESENT`. The second stop raises. The second delete still runs. Result: `DestroyResult(verdict=DESTROYED, attempts=2, stop_error="resurrection: ...")` (or `LEAKED` if the second verify still returns `PRESENT`).
 - **Unknown after resurrection.** First verify returns `PRESENT`. Resurrection cleanup completes. Second verify returns `UNKNOWN`. Result: `DestroyResult(verdict=UNKNOWN)`.
 - **DestroyPolicy invariants.** `DestroyPolicy(verify_delay_s=-1)` raises `ValueError`. `DestroyPolicy(retry_delay_s=-1)` raises `ValueError`. `DestroyPolicy(max_delete_attempts=0)` raises `ValueError`.
-- **DestroyResult invariants.** `DestroyResult()` (neither field) raises `ValueError`. `DestroyResult(verdict=DESTROYED, refusal=NO_CREDENTIALS)` (both fields) raises `ValueError`.
+- **DestroyResult invariants.**
+  - `DestroyResult()` (neither field) raises `ValueError`.
+  - `DestroyResult(verdict=DESTROYED, refusal=NO_CREDENTIALS)` (both fields) raises `ValueError`.
+  - `DestroyResult(verdict=DESTROYED, attempts=0)` (verdict set, non-zero attempts) is fine — `attempts` is per-protocol-attempt.
+  - `DestroyResult(refusal=NO_CREDENTIALS, attempts=1)` raises `ValueError` (refusal set, attempts must be 0).
+  - `DestroyResult(refusal=NO_CREDENTIALS, last_status_code=500)` raises `ValueError` (refusal set, last_status_code must be None).
+  - `DestroyResult(refusal=NO_CREDENTIALS, verify_error="...")` raises `ValueError` (refusal set, verify_error must be None).
+  - `DestroyResult(refusal=NO_CREDENTIALS, stop_error="...")` raises `ValueError` (refusal set, stop_error must be None).
 
 ### Adapter tests
 
-- **Empty allowlist.** `allowed_images=set()` (empty, not None). Instance image is any value. Returns `DestroyResult(refusal=OWNERSHIP)` with refusal logged. **This is the safety-critical test for the blocker fix.**
+- **Empty allowlist.** `allowed_images=set()` (empty, not None). Instance image is any value. Returns `DestroyResult(refusal=OWNERSHIP)` with refusal logged. **This is the safety-critical test for the empty-allowlist fix.**
 - **None allowlist.** `allowed_images=None`. No guard applied. Proceeds to API call.
+- **`frozenset` allowlist.** `allowed_images=frozenset({"image-1"})`. Works identically to a `set`. The orchestrator's `BatchOrchestrator` normalises to `frozenset`; the adapter's public type is `AbstractSet[str]`.
 - **Matching allowlist.** Instance image is in the set. Proceeds.
 - **Non-matching allowlist.** Instance image is not in the set. Returns `DestroyResult(refusal=OWNERSHIP)` with refusal logged.
-- **`VASTAI_API_KEY` env empty.** `read_vastai_api_key()` returns empty string and does not fall through to file credentials. Fail-closed.
-- **`VASTAI_API_KEY` env set.** `read_vastai_api_key()` returns the env value.
+- **REST ownership check uses same headers as destroy.** When a REST key is available, `verify_instance_ownership_rest` is called with the same `hdrs` used for `vastai_stop`/`vastai_delete`/`vastai_verify`. The CLI-based `verify_instance_ownership` is only called in the CLI fallback path. (Test: spy on the requests call to assert the auth header is shared.)
+- **`VASTAI_API_KEY` env unset, no file.** `read_vastai_api_key()` returns `CredentialResolution(state=CredentialState.ABSENT, key="")`. The adapter returns `DestroyResult(refusal=NO_CREDENTIALS)`.
+- **`VASTAI_API_KEY` env empty.** `read_vastai_api_key()` returns `CredentialResolution(state=CredentialState.EXPLICITLY_DISABLED, key="")`. The adapter returns `DestroyResult(refusal=CREDENTIALS_DISABLED)`. **This is the safety-critical test for the credential-state blocker fix.** The file credentials are NEVER consulted.
+- **`VASTAI_API_KEY` env unset, file present.** `read_vastai_api_key()` returns `CredentialResolution(state=CredentialState.AVAILABLE, key="<file content>")`. Protocol runs.
+- **`VASTAI_API_KEY` env set.** `read_vastai_api_key()` returns `CredentialResolution(state=CredentialState.AVAILABLE, key="<env value>")`. Protocol runs.
 - **Vast.ai verify 404.** Returns `VerifyResult(verdict=GONE, status_code=404)`.
 - **Vast.ai verify 200 with `actual_status == "destroyed"`.** Returns `VerifyResult(verdict=GONE, status_code=200)`.
 - **Vast.ai verify 200 with empty `actual_status`.** Returns `VerifyResult(verdict=PRESENT, status_code=200)`. **This is the safety-critical test for the empty-status fix.**
@@ -1200,49 +1465,58 @@ The following test cases must be enumerated in the implementation PR. The design
 ### Runner integration tests
 
 - **`VastaiRunner.destroy_instance` with `DestroyResult(verdict=DESTROYED)`.** Returns `True`. `InstanceStatus.DESTROYED` is set.
-- **`VastaiRunner.destroy_instance` with `DestroyResult(verdict=LEAKED)`.** Returns `False`. `InstanceStatus` is unchanged. Error logged.
-- **`VastaiRunner.destroy_instance` with `DestroyResult(verdict=UNKNOWN)`.** Returns `False`. Warning logged.
+- **`VastaiRunner.destroy_instance` with `DestroyResult(verdict=LEAKED)`.** Returns `False`. `InstanceStatus` is unchanged. Error logged. The `verify_error` from the protocol is included in the log.
+- **`VastaiRunner.destroy_instance` with `DestroyResult(verdict=UNKNOWN)`.** Returns `False`. Warning logged. The `verify_error` and `last_status_code` are included in the log.
 - **`VastaiRunner.destroy_instance` with `DestroyResult(refusal=OWNERSHIP)`.** Returns `False`. Error logged.
 - **`VastaiRunner.destroy_instance` with `DestroyResult(refusal=NO_CREDENTIALS)`.** Returns `False`. Error logged. (No CLI fallback in the runner path.)
+- **`VastaiRunner.destroy_instance` with `DestroyResult(refusal=CREDENTIALS_DISABLED)`.** Returns `False`. Error logged. (No CLI fallback.)
+- **`VastaiRunner.destroy_instance` is called once.** The runner does not pre-resolve the API key (the adapter owns credential resolution). Test: spy on `read_vastai_api_key` to assert it's called exactly once per `destroy_instance` call.
 
 ### Zombie sweep integration tests
 
 - **Sweep with `allowed_images=set()` and orphan candidate.** `destroy_vastai_instance` returns `OWNERSHIP`. The sweep skips the instance. CLI fallback does NOT fire. `killed` does not increment.
 - **Sweep with `allowed_images=None` and orphan candidate.** Protocol runs. `DESTROYED` increments `killed`. `LEAKED` and `UNKNOWN` are logged.
+- **Sweep with `CREDENTIALS_DISABLED` and orphan candidate.** The sweep logs the skip and does NOT invoke the CLI. `killed` does not increment; `cli_attempted` does not increment. **This is the safety-critical test for the credential-state blocker fix.**
 - **Sweep with `NO_CREDENTIALS` and orphan candidate.** CLI fallback fires. `cli_attempted` increments. `killed` does not increment.
 - **Sweep with `OWNERSHIP` and `NO_CREDENTIALS` simultaneously (impossible in practice but documents the precedence).** `OWNERSHIP` takes precedence. CLI fallback does NOT fire.
+- **Sweep with `CREDENTIALS_DISABLED` and `NO_CREDENTIALS` simultaneously (impossible in practice but documents the precedence).** `CREDENTIALS_DISABLED` takes precedence. CLI fallback does NOT fire.
 
 ## Migration checklist
 
 For the implementer (one PR, one PR-number):
 
 1. Delete `orchestrator.py:poll_instance_progress` and `orchestrator.py:ensure_detached`. Update `CHANGELOG.md`, `docs/api.md`, `docs/architecture.md` to reflect the deletion.
-2. Delete `orchestrator.py:load_vastai_api_key`. Add `read_vastai_api_key()` to `providers/destroy_adapters/vastai.py` with env-first precedence and fail-closed semantics. Remove the old `_read_vastai_api_key` from `providers/vastai.py`.
-3. Add `allowed_images: set[str] | None = None` to `BatchOrchestrator.__init__`. Pass it to `sweep_zombie_instances` via the existing `*` keyword-args signature.
+2. Delete `orchestrator.py:load_vastai_api_key`. Add `CredentialState` and `CredentialResolution` to `providers/destroy_adapters/vastai.py`. Rewrite `read_vastai_api_key()` to return `CredentialResolution` with three states. Remove the old `_read_vastai_api_key` from `providers/vastai.py`.
+3. Add `allowed_images: AbstractSet[str] | None = None` to `BatchOrchestrator.__init__` (normalised to `frozenset` internally). Pass it to `sweep_zombie_instances` as `allowed_images=allowed_images` (no `*`-args forward).
 4. New file `src/vastai_gpu_runner/providers/destroy.py` (the protocol module: `VerifyVerdict`, `DestroyVerdict`, `DestroyRefusal`, `VerifyResult`, `DestroyResult`, `DestroyPolicy`, `belt_and_suspenders`).
-5. New file `src/vastai_gpu_runner/providers/destroy_adapters/vastai.py` (the Vast.ai adapter: `vastai_stop`, `vastai_delete`, `vastai_verify`, `destroy_vastai_instance`, `read_vastai_api_key`, `VASTAI_POLICY`).
-6. Update `VastaiRunner._rest_destroy` (and the public `destroy_instance`) to delegate to `destroy_vastai_instance`. The public `destroy_instance` returns `True` only on `verdict=DESTROYED`. Delete the standalone helpers `_rest_stop`, `_rest_delete_with_retries`, `_rest_verify_and_redestroy` from `providers/vastai.py`.
-7. Update `orchestrator.py:_sweep_zombies` to route through `destroy_vastai_instance` with branches on `verdict` vs `refusal`. CLI fallback only for `NO_CREDENTIALS`. Track `cli_attempted` separately from `killed`. Delete `orchestrator.py:_destroy_via_rest`.
+5. New file `src/vastai_gpu_runner/providers/destroy_adapters/vastai.py` (the Vast.ai adapter: `CredentialState`, `CredentialResolution`, `read_vastai_api_key`, `_image_is_allowed`, `verify_instance_ownership_rest`, `vastai_stop`, `vastai_delete`, `vastai_verify`, `destroy_vastai_instance`, `VASTAI_POLICY`).
+6. Update `VastaiRunner._rest_destroy` (and the public `destroy_instance`) to delegate to `destroy_vastai_instance`. The public `destroy_instance` returns `True` only on `verdict=DESTROYED`. The runner calls the adapter exactly once; the adapter owns credential resolution. Delete the standalone helpers `_rest_stop`, `_rest_delete_with_retries`, `_rest_verify_and_redestroy` from `providers/vastai.py`. The CLI-based `verify_instance_ownership` is retained for the CLI fallback path (separate auth context).
+7. Update `orchestrator.py:sweep_zombie_instances` to take `allowed_images: AbstractSet[str] | None`, route through `destroy_vastai_instance`, and branch on `verdict` vs `refusal`. CLI fallback only for `NO_CREDENTIALS`; `CREDENTIALS_DISABLED` and `OWNERSHIP` are never bypassed. Track `cli_attempted` separately from `killed`. Delete `orchestrator.py:_destroy_via_rest`. `BatchOrchestrator._sweep_zombies` becomes a thin delegate that passes `self._allowed_images` to `sweep_zombie_instances`.
 8. New file `src/vastai_gpu_runner/unit_lifecycle.py` (the decision module: `Action`, `PreemptCause`, `ProgressSnapshot`, `Continue` / `Complete` / `Preempt`, `decide_next_action`).
 9. Update `BatchOrchestrator._poll_cycle_once` to use the two-stage shape (classify-all → preemptions → parallel finalise). Add `_handle_preempt`. Update `BatchOrchestrator._check_unit` to use the same primitive. Delete `_classify_live_unit`. Mark `_check_unit` deprecated.
-10. New tests `tests/test_unit_lifecycle.py`, `tests/test_destroy.py`, `tests/test_destroy_adapters_vastai.py`, `tests/test_zombie_sweep.py`. Update `tests/test_batch.py` and `tests/test_batch_orchestrator.py`.
+10. New tests `tests/test_unit_lifecycle.py`, `tests/test_destroy.py`, `tests/test_destroy_adapters_vastai.py`, `tests/test_zombie_sweep.py`. Update `tests/test_batch.py` and `tests/test_batch_orchestrator.py`. The critical regression tests for this revision: empty `actual_status` returns `PRESENT`, `VASTAI_API_KEY=""` returns `CREDENTIALS_DISABLED` and the CLI fallback does not fire, `verify_error` is propagated from `verify_fn` to `DestroyResult`, `DestroyResult` invariants reject refusal with non-zero `attempts` / `last_status_code` / `stop_error` / `verify_error`.
 11. Update `CHANGELOG.md` with the v3 changes.
+12. File the tracking issue for the longer-term zombie-destroy callback / provider cleanup policy (the `allowed_images` parameter on `BatchOrchestrator` is the immediate fix; the deeper shape is a callback the orchestrator invokes per orphan).
 
 ## Review process
 
 This design is published as a PR for review before implementation begins. Reviewers (code owner + ChatGPT-with-GitHub-plugin) should focus on:
 
+- **CredentialState vs DestroyRefusal.** Does the three-state credential model (`AVAILABLE` / `ABSENT` / `EXPLICITLY_DISABLED`) correctly distinguish "no credentials" from "operator-disabled credentials," and does the CLI fallback only fire for `ABSENT`?
 - **VerifyVerdict vs DestroyVerdict split.** Does the two-enum split correctly separate the verifier's observation from the protocol's outcome? Are the names right?
-- **DestroyRefusal.** Does the `OWNERSHIP` / `NO_CREDENTIALS` split correctly distinguish the two failure modes for the CLI fallback decision?
-- **Safety behaviour.** Does the empty-allowlist test (`allowed_images=set()` rejects all images) catch the regression that the original draft introduced?
+- **DestroyRefusal.** Does the `OWNERSHIP` / `NO_CREDENTIALS` / `CREDENTIALS_DISABLED` split correctly distinguish the three failure modes for the CLI fallback decision?
+- **Safety behaviour.** Does the empty-allowlist test (`allowed_images=set()` rejects all images) catch the regression that the original draft introduced? Does the `CREDENTIALS_DISABLED` test catch the credential-state regression?
 - **Empty-status classification.** Does the `vastai_verify` 200 + empty/missing/non-string `actual_status` correctly return `PRESENT`, not `GONE`?
 - **R2 exception policy.** Are the three exception paths (initial R2, check_progress, worker_dead re-check) all handled the way the reviewer asked for?
 - **`Preempt` shape.** Is `Preempt(cause: PreemptCause, detail: str | None)` the right shape, or should `cause` carry more structure?
 - **Thin-wrapper retention.** Is removing `_classify_live_unit` and keeping `_check_unit` for one deprecation cycle the right balance, or should both be removed in the same PR?
 - **Two-stage poll loop.** Does the new `_poll_cycle_once` preserve the parallel-finalisation behaviour of the previous design?
-- **VastaiRunner destroy mapping.** Does the `DestroyResult` → boolean return mapping correctly distinguish DESTROYED from LEAKED / UNKNOWN / OWNERSHIP / NO_CREDENTIALS?
+- **VastaiRunner destroy mapping.** Does the `DestroyResult` → boolean return mapping correctly distinguish DESTROYED from LEAKED / UNKNOWN / OWNERSHIP / NO_CREDENTIALS / CREDENTIALS_DISABLED?
 - **CLI fallback honesty.** Is the `cli_attempted` counter separate from `killed` the right way to encode the opportunistic nature of the CLI fallback?
-- **Credential precedence.** Does the env-first + fail-closed semantics match the project's intent for Vast.ai credentials?
-- **Biolab-runners precedent.** The biolab-runners v15 PR ([#88](https://github.com/Lambda-Biolab/biolab-runners/pull/88)) and v14 PR ([#82](https://github.com/Lambda-Biolab/biolab-runners/pull/82)) are the precedent. Does this design match v15's discipline (single localised observation sequence, frozen dataclass plans, ClassVar action enum) and v14's discipline (one protocol module, one adapter per provider, callbacks + policy over class hierarchy)?
+- **Credential precedence.** Does the env-first + three-state semantics match the project's intent for Vast.ai credentials? Does the `CREDENTIALS_DISABLED` refusal correctly propagate to the zombie sweep and prevent CLI fallback?
+- **REST ownership uses same auth identity.** When REST is available, does `verify_instance_ownership_rest` use the same `hdrs` as `destroy_vastai_instance`?
+- **`verify_error` preservation.** Does the `verify_error` field on `DestroyResult` correctly carry the most recent `verify_fn` error through the protocol?
+- **`DestroyResult` invariants.** Do the `__post_init__` checks correctly reject `refusal`-with-non-zero-`attempts` / `last_status_code` / `stop_error` / `verify_error`?
+- **Biolab-runners precedent.** The biolab-runners v15 PR ([#88](https://github.com/Lambda-Biolab/biolab-runners/pull/88)) and v14 PR ([#82](https://github.com/Lambda-Biolab/biolab-runners/pull/82)) are the precedent. Does this design match v15's discipline (localised observation sequence, frozen dataclass plans, ClassVar action enum) and v14's discipline (one protocol module, one adapter per provider, callbacks + policy over class hierarchy)?
 
 Discussion thread: the PR comments.
