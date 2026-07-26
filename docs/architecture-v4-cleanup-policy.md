@@ -97,17 +97,72 @@ in `VastaiProviderConfig` (because the runner also needs
 `docker_image`, `setup_commands`, etc.); the cleanup-policy factory
 takes them directly.
 
-## What changes vs the v4 first + second + third + fourth + fifth + sixth drafts
+## What changes vs the v4 first + second + third + fourth + fifth + sixth + seventh + eighth drafts
 
 The first draft was rejected with 5 BLOCKERs and 7 CONCERNs. The
 second draft was rejected with 7 BLOCKERs, 2 CONCERNs, and 3 NITs.
 The third draft was rejected with 6 BLOCKERs, 4 CONCERNs, and 2 NITs.
 The fourth draft was rejected with 5 BLOCKERs and 3 CONCERNs. The
 fifth draft was rejected with 2 BLOCKERs, 2 CONCERNs, and 1 NIT. The
-sixth draft was rejected with 1 BLOCKER, 4 CONCERNs, and 2 NITs.
-This seventh draft addresses every finding.
+sixth draft was rejected with 1 BLOCKER, 4 CONCERNs, and 2 NITs. The
+seventh draft was rejected with 1 BLOCKER and 1 NIT. The eighth
+draft was rejected with 3 BLOCKERs, 2 CONCERNs, and 1 NIT.
+This ninth draft addresses every finding.
 
-### Applied from the 10th-pass review (this pass)
+### Applied from the 12th-pass review (this pass)
+
+- **Tagged `OwnershipVerification` result replaces conflated `bool`.**
+  `verify_instance_ownership` now returns an `Enum` (`OWNED`,
+  `ABSENT`, `REFUSED`, `DISABLED`) instead of a `bool` that
+  conflated "owned and present" with "absent and therefore safe".
+  The CLI fallback path dispatches on the four cases:
+  `OWNED`/`DISABLED` → CLI destroy → `CLI_ATTEMPTED`; `ABSENT`
+  → short-circuit to a new v4 verdict `ALREADY_GONE` without
+  invoking CLI destroy; `REFUSED` → `OWNERSHIP` refusal. The
+  `CleanupVerdict` enum gains a new `ALREADY_GONE` value, logged
+  at `INFO` by the orchestrator (no kill count, no destroy
+  happened, but the end-state is achieved). (BLOCKER 1)
+- **Shared `_normalize_instance_id` normalizer.** Single helper
+  used by both `list_vastai_instances` and `verify_instance_ownership`,
+  rejecting `None`/`bool`/empty/blank and canonicalising the rest
+  (stripped string for `int` or `str` IDs). Ensures padded input
+  on the caller side and padded value on the API side reduce to
+  the same canonical form. The verifier validates and normalises
+  the **entire** response before locating the requested record,
+  so a malformed record after a matching owned record is
+  detected (no early-return short-circuit). (BLOCKER 2)
+- **Outermost `except Exception` boundary.** The verifier's
+  declared contract ("unexpected exceptions → REFUSED") is now
+  actually enforced: a top-level `except Exception` boundary
+  converts any escaped exception (subprocess errors downstream
+  of the explicit `(RuntimeError, JSONDecodeError)` clauses,
+  `ownership.matches` failures, etc.) to `REFUSED` with an
+  `ERROR`-level log. All failure-path log levels are now
+  `ERROR` (was `WARNING` for the original two), so the operator
+  sees "destroy refused" rather than "ambiguous state". (BLOCKER 3)
+- **`_describe_destroy_result` for `CREDENTIALS_DISABLED`.** The
+  refusal path that previously discarded the shared diagnostic
+  now includes `_describe_destroy_result(result)` in the error
+  string, keeping the v4 commitment that the helper is used
+  across both verdict and refusal paths. (CONCERN)
+- **Test catalogue expanded.** The eight tests that produced
+  the prior verification pass are replaced by a parameterized
+  enumeration (`None`/`""`/`"   "` valid-ID cases), malformed-
+  record-BEFORE / malformed-record-AFTER ordering tests,
+  numeric and padded ID cases, and `caplog` severity tests
+  for every failure path. Plus a new factory test asserting
+  that an `ABSENT` verification result short-circuits to
+  `ALREADY_GONE` WITHOUT invoking `vastai destroy instance`.
+  The "eight tests" count is dropped in favor of describing
+  the cases exhaustively. (CONCERN)
+- **`is_candidate` references replaced with the actual mechanism.**
+  The review-process section now refers to "orchestrator
+  label/tracked-ID filtering followed by the factory `_destroy`
+  eligibility gate" — both of which exist in the v4 design
+  — instead of the non-existent `is_candidate` short-circuit.
+  (NIT)
+
+### Applied from the 11th-pass review (prior pass)
 
 - **`verify_instance_ownership` fails closed on malformed records.**
   Non-dict list entries, missing `id` keys, `id=None`, and
@@ -322,6 +377,73 @@ def _repository(ref: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+class OwnershipVerification(Enum):
+    """Result of ``verify_instance_ownership`` (the CLI ownership check).
+
+    Tagged union — replaces v2's conflated ``bool`` (which conflated
+    "owned and present" with "absent and therefore safe"). Used by the
+    CLI fallback path in ``build_vastai_cleanup_policy._cli_fallback``
+    to dispatch:
+
+    - ``OWNED``    → instance exists, image matches the policy → CLI
+                     destroy may proceed (returns ``CLI_ATTEMPTED``).
+    - ``ABSENT``   → instance is gone from the API; the verifier has
+                     proved absence from a well-formed response. The
+                     fallback can translate this directly into the
+                     configured "already gone" verdict (caller's
+                     choice — not the verifier's).
+    - ``REFUSED``  → instance exists but image does not match, or the
+                     API response was malformed in a way that prevents
+                     proving absence (non-dict record, missing / null /
+                     empty / whitespace-only ``id``, non-list response,
+                     unexpected exception). The verifier refuses the
+                     destroy to the caller.
+    - ``DISABLED`` → ownership checking is disabled (no policy).
+                     Bypasses the API call entirely.
+    """
+
+    OWNED = "owned"
+    ABSENT = "absent"
+    REFUSED = "refused"
+    DISABLED = "disabled"
+
+
+def _normalize_instance_id(raw_id: object) -> Optional[str]:
+    """Canonicalize a Vast.ai instance ID for comparison.
+
+    Shared normalizer used by ``list_vastai_instances`` and
+    ``verify_instance_ownership`` so the two agree on what counts as
+    a "valid ID" and how to compare.
+
+    Returns:
+        - ``None`` for inputs that are not valid IDs (``None``,
+          ``bool``, anything that is not ``str`` or ``int``, empty
+          string, blank whitespace-only string).
+        - The stripped string for valid inputs.
+
+    Rationale:
+
+    - Vast.ai sometimes returns numeric IDs (JSON ``int``). We
+      stringify them. Booleans are explicitly rejected: ``True``
+      stringifies to ``"True"`` which is not the intended ID and
+      would silently shadow a real one.
+    - Whitespace-only IDs are rejected (after ``strip()``, empty).
+      Padded IDs (``" 123 "``) are accepted and canonicalised to
+      ``"123"``.
+    - The same rule is applied uniformly by both enumeration and
+      verification; padded input on the caller side and padded value
+      on the API side both reduce to the canonical form.
+    """
+    if isinstance(raw_id, bool) or raw_id is None:
+        return None
+    if not isinstance(raw_id, (str, int)):
+        return None
+    canonical = str(raw_id).strip()
+    if not canonical:
+        return None
+    return canonical
+
+
 @dataclass(frozen=True)
 class OwnershipPolicy:
     """Shared ownership semantics — runner and cleanup adapter both call this.
@@ -405,10 +527,20 @@ class CleanupVerdict(Enum):
 
     ``CLI_ATTEMPTED`` is a v4 verdict produced by the factory's
     CLI fallback path — it is NOT a v3 protocol verdict.
+    ``ALREADY_GONE`` is a v4 verdict produced by the CLI
+    fallback path when the ownership verifier proves absence
+    from a fully well-formed response — the fallback short-
+    circuits and does NOT invoke CLI destruction (which would
+    otherwise invent a spurious ``UNKNOWN`` from a 'not found'
+    CLI exit code). The orchestrator does NOT count
+    ``ALREADY_GONE`` toward ``killed`` (no destroy happened);
+    it logs at ``INFO`` because the desired end-state was
+    already achieved by the absence.
     """
 
     DESTROYED = "destroyed"
     CLI_ATTEMPTED = "cli_attempted"  # CLI fallback ran; destruction not confirmed
+    ALREADY_GONE = "already_gone"    # CLI verifier proved absence; no destroy
     LEAKED = "leaked"                # Protocol ran but instance was resurrected
     UNKNOWN = "unknown"              # Protocol did not report a clear outcome
 
@@ -881,87 +1013,136 @@ def verify_instance_ownership(
     instance_id: str,
     *,
     ownership: OwnershipPolicy,
-) -> bool:
-    """Check that a Vast.ai instance belongs to the caller before destruction.
+) -> OwnershipVerification:
+    """CLI-side ownership check for a single instance (v4 factory).
 
-    Uses ``ownership.matches(image_uuid)`` for the ownership check.
     This is the CLI-auth verification used by the v4 factory's
     CLI fallback path (separate auth context from the REST path).
+    Returns a tagged ``OwnershipVerification`` so the caller can
+    distinguish three operationally-different outcomes that v2
+    conflated into ``bool``:
 
-    Return-value contract (fail-closed on malformed responses):
+    - ``OWNED``    → instance exists and is owned; CLI destroy may
+                     proceed.
+    - ``ABSENT``   → instance is not in the API response (already
+                     destroyed). The verifier has proved absence
+                     from a fully well-formed response and the
+                     caller can choose the desired verdict for
+                     "already gone" without invoking destruction.
+    - ``REFUSED``  → instance exists but is unowned, OR the API
+                     response was so malformed that absence cannot
+                     be proved, OR any other verifier-level failure.
+                     Refusal means "do not destroy". Failure is
+                     fail-closed.
+    - ``DISABLED`` → ownership checking is disabled (no policy).
+                     This is a short-circuit that bypasses the API
+                     call entirely.
 
-    - ``True``  → ownership checking is disabled (no policy), OR a
-      well-formed response does NOT contain the requested instance
-      (treat as "already destroyed").
-    - ``False`` → API error, malformed JSON, malformed response
-      shape, any non-dict / missing-ID / empty-ID record that
-      prevents proving the instance's absence, ownership
-      mismatch, or an unexpected exception.
+    Implementation notes (carefully ordered):
 
-    A single malformed record fails the whole check rather than
-    being skipped: if the response is so mangled that one entry
-    is missing a usable ``id``, we cannot reliably prove the
-    requested ``instance_id`` is absent. We refuse the destroy
-    and ask the operator to clean the API response. This
-    mirrors ``list_vastai_instances``'s defensive ``isinstance``
-    checks so the declared ``-> bool`` contract is upheld.
+    1. **One short-circuit up front** (DISABLED): skip the API call
+       entirely when ``owned_images is None``.
+    2. **One canonical form for the requested ID**: ``_normalize_instance_id``.
+       Padded, numeric, and string IDs reduce to the same canonical
+       form before comparison.
+    3. **One outermost ``except Exception`` boundary**: subprocess
+       failures, JSON parsing, response-shape problems, or even
+       downstream ``ownership.matches`` failures cannot escape the
+       function. (They're translated to ``REFUSED``.)
+    4. **Validate-and-normalize the entire response first**, then
+       locate and evaluate the requested record. A single malformed
+       entry anywhere in the list fails the whole check
+       (conservatively — we cannot prove absence of one ID when
+       another entry is unreadable). We do NOT short-circuit on
+       the first match, because a malformed record *after* a match
+       would otherwise be ignored.
+    5. **Failures are logged at ERROR** level so the operator sees
+       the destroy has been refused (not "ambiguous state").
+
+    The function never returns ``True`` / ``False`` — the contract
+    is encoded in the enum so callers must explicitly handle each
+    case. v2's conflated bool cannot represent "instance is owned
+    AND present" separately from "instance is already absent".
     """
     if ownership.owned_images is None:
-        return True
+        return OwnershipVerification.DISABLED
+
+    canonical_target = _normalize_instance_id(instance_id)
+    if canonical_target is None:
+        logger.error(
+            "REFUSING: requested instance_id %r is not a valid ID — refusing to destroy",
+            instance_id,
+        )
+        return OwnershipVerification.REFUSED
+
     try:
         raw = vastai_cmd(["show", "instances", "--raw"], timeout=15)
         instances = json.loads(raw)
     except (RuntimeError, json.JSONDecodeError) as exc:
-        logger.warning(
-            "Cannot verify ownership of instance %s (API error: %s) — refusing to destroy",
+        logger.error(
+            "REFUSING: cannot verify ownership of instance %s "
+            "(API error: %s) — destroy refused. Resolve the API response and retry.",
             instance_id,
             exc,
         )
-        return False
+        return OwnershipVerification.REFUSED
+
     if not isinstance(instances, list):
-        logger.warning(
-            "Cannot verify ownership of instance %s — response is not a list (got %s)",
+        logger.error(
+            "REFUSING: cannot verify ownership of instance %s — "
+            "response is not a list (got %s). Destroy refused.",
             instance_id,
             type(instances).__name__,
         )
-        return False
+        return OwnershipVerification.REFUSED
+
+    # Validate and normalize the entire response first. A single
+    # malformed record anywhere in the list fails the check — we
+    # cannot prove absence of the requested ID when another entry
+    # has no usable ``id``. Refusing on a malformed record AFTER a
+    # matching record is the conservative position.
+    normalised_records: list[tuple[str, str]] = []  # (canonical_id, image_uuid)
     for raw_record in instances:
-        # Every record must be a well-formed ``{"id": str, ...}`` so
-        # we can definitively prove the requested ``instance_id`` is
-        # absent. Anything else (non-dict, missing ``id``, empty/null
-        # ``id``) fails the verification — a partial record that we
-        # cannot read could be the requested instance under another
-        # image, and we will NOT cross the safety boundary on its
-        # behalf.
         if not isinstance(raw_record, dict):
             logger.error(
-                "REFUSING: instance %s cannot be verified — malformed record "
-                "(not a dict: %r). Resolve the API response and retry.",
+                "REFUSING: instance %s cannot be verified — "
+                "response contains a non-object record: %r. "
+                "Destroy refused.",
                 instance_id,
                 raw_record,
             )
-            return False
-        record_id = raw_record.get("id")
-        if not isinstance(record_id, str) or not record_id.strip():
+            return OwnershipVerification.REFUSED
+        canonical_id = _normalize_instance_id(raw_record.get("id"))
+        if canonical_id is None:
             logger.error(
-                "REFUSING: instance %s cannot be verified — record has missing "
-                "or empty id field: %r. Resolve the API response and retry.",
+                "REFUSING: instance %s cannot be verified — "
+                "record has missing/null/invalid id: %r. Destroy refused.",
                 instance_id,
                 raw_record,
             )
-            return False
-        if record_id == str(instance_id):
-            image = str(raw_record.get("image_uuid", ""))
-            if ownership.matches(image):
-                return True
+            return OwnershipVerification.REFUSED
+        # Strip the image_uuid exactly the same way list_vastai_instances does,
+        # so verification matches enumeration.
+        image_uuid = str(raw_record.get("image_uuid", ""))
+        normalised_records.append((canonical_id, image_uuid))
+
+    # Locate the requested record in the validated, normalized list.
+    for record_id, image_uuid in normalised_records:
+        if record_id == canonical_target:
+            if ownership.matches(image_uuid):
+                return OwnershipVerification.OWNED
             logger.error(
                 "BLOCKED: instance %s belongs to another project (image=%s). Will NOT destroy.",
                 instance_id,
-                image,
+                image_uuid,
             )
-            return False
-    logger.info("Instance %s not found in account (already destroyed?)", instance_id)
-    return True
+            return OwnershipVerification.REFUSED
+
+    logger.info(
+        "Instance %s not found in account (already destroyed?)",
+        instance_id,
+    )
+    return OwnershipVerification.ABSENT
 
 
 # ---------------------------------------------------------------------------
@@ -1337,22 +1518,34 @@ def build_vastai_cleanup_policy(
 
         The v3 adapter returns NO_CREDENTIALS when the API key is
         not configured. We then verify ownership via the CLI auth
-        context (which uses the file-based key), and if owned, run
-        the CLI destroy. CLI destruction is unconfirmed — we report
-        CLI_ATTEMPTED, not DESTROYED.
+        context (which uses the file-based key) and dispatch on
+        the verifier's tagged result:
+
+        - ``OWNED``    → run CLI destroy; report ``CLI_ATTEMPTED``
+                         (destruction unconfirmed — CLI exit is not
+                         a REST confirmation).
+        - ``DISABLED`` → ownership checking is off; proceed straight
+                         to CLI destroy (same ``CLI_ATTEMPTED``
+                         translation as ``OWNED``).
+        - ``ABSENT``   → the verifier proved the instance is already
+                         gone from a fully well-formed response.
+                         Short-circuit to ``ALREADY_GONE`` without
+                         invoking CLI destroy (a 'not found' CLI
+                         error would otherwise fabricate a spurious
+                         ``UNKNOWN``).
+        - ``REFUSED``  → the instance exists but is unowned, or the
+                         response is too malformed to prove absence.
+                         Refuse with ``OWNERSHIP`` and a diagnostic.
+
+        The function never raises: any unexpected exception in
+        CLI destroy becomes an ``UNKNOWN`` outcome with a
+        non-empty error string.
         """
         try:
-            if not verify_instance_ownership(
+            verification = verify_instance_ownership(
                 candidate.instance_id,
                 ownership=ownership,
-            ):
-                return CleanupResult(
-                    refusal=CleanupRefusal.OWNERSHIP,
-                    error=(
-                        "CLI ownership check rejected "
-                        f"{candidate.instance_id!r}"
-                    ),
-                )
+            )
         except Exception as exc:
             return CleanupResult(
                 verdict=CleanupVerdict.UNKNOWN,
@@ -1361,6 +1554,24 @@ def build_vastai_cleanup_policy(
                     f"{type(exc).__name__}: {exc}"
                 ),
             )
+        if verification is OwnershipVerification.REFUSED:
+            return CleanupResult(
+                refusal=CleanupRefusal.OWNERSHIP,
+                error=(
+                    "CLI ownership check refused "
+                    f"{candidate.instance_id!r} (instance unowned "
+                    "or response malformed)"
+                ),
+            )
+        if verification is OwnershipVerification.ABSENT:
+            return CleanupResult(
+                verdict=CleanupVerdict.ALREADY_GONE,
+                error=(
+                    "CLI ownership verifier proved absence in a "
+                    "well-formed response; nothing to destroy."
+                ),
+            )
+        # OWNED or DISABLED — proceed to CLI destroy.
         try:
             vastai_cmd(["destroy", "instance", candidate.instance_id], timeout=15)
             return CleanupResult(
@@ -1418,7 +1629,8 @@ def build_vastai_cleanup_policy(
             return CleanupResult(
                 refusal=CleanupRefusal.CREDENTIALS_DISABLED,
                 error=(
-                    "v3 adapter refused: VASTAI_API_KEY explicitly empty"
+                    f"v3 adapter refused: VASTAI_API_KEY explicitly empty; "
+                    f"{_describe_destroy_result(result)}"
                 ),
             )
         # 5. Translate verdicts exhaustively.
@@ -1499,6 +1711,16 @@ def _sweep_zombies(self) -> int:
         elif result.verdict == CleanupVerdict.CLI_ATTEMPTED:
             logger.warning(
                 "Zombie sweep: %s CLI fallback attempted (destruction not confirmed): %s",
+                candidate.instance_id,
+                result.error,
+            )
+        elif result.verdict == CleanupVerdict.ALREADY_GONE:
+            # Verifier proved absence from a well-formed response;
+            # no destroy was performed. INFO because the desired
+            # end-state was already achieved — not an operational
+            # failure.
+            logger.info(
+                "Zombie sweep: %s already gone (CLI verifier proved absence): %s",
                 candidate.instance_id,
                 result.error,
             )
@@ -1857,33 +2079,78 @@ steps then build on v3's `providers/destroy.py` module
   - `VastaiRunner.from_config` round-trips with `VastaiProviderConfig`.
   - `VastaiRunner(allowed_images=frozenset({img}))` (deprecated) emits `DeprecationWarning` + builds equivalent `OwnershipPolicy`.
   - Simultaneous `ownership=` and `allowed_images=` raises `ValueError`.
-  - `verify_instance_ownership` uses `OwnershipPolicy.matches()`.
-  - `verify_instance_ownership` fails closed on malformed records:
-    - non-dict record in the list (e.g. `[{"id": "x"}, "oops"]`) → `False`
-    - dict record with missing `id` key → `False`
-    - dict record with `id=None` → `False`
-    - dict record with `id=""` (empty after strip) → `False`
-    - well-formed list missing the requested `instance_id` → `True`
-    - well-formed list containing the requested `instance_id` with
-      a matching `image_uuid` → `True`
-    - well-formed list containing the requested `instance_id` with
-      a non-matching `image_uuid` → `False` + `ERROR`-level log
-    - `OwnershipPolicy(owned_images=None)` short-circuits to `True`
-      without an API call (`patch.object` on `vastai_cmd`).
+  - `verify_instance_ownership` returns `OwnershipVerification`
+    (tagged enum; **not** ``bool``). Test the four-way contract:
+    - `DISABLED`: `OwnershipPolicy(owned_images=None)` returns
+      `DISABLED` without an API call (`patch.object` on
+      `vastai_cmd`).
+    - `OWNED`: well-formed response containing the canonical
+      requested ID with a matching `image_uuid` → `OWNED`.
+    - `REFUSED` on ownership mismatch: well-formed response with
+      the requested ID but a non-matching `image_uuid` →
+      `REFUSED` + `ERROR`-level log.
+    - `ABSENT`: well-formed response where the requested ID is
+      not present → `ABSENT`. Crucially, the CLI fallback
+      short-circuits to `ALREADY_GONE` (see factory tests).
+    - `REFUSED` on malformed record AFTER a matching owned record:
+      ensures the entire response is validated before the
+      match is returned.
+    - `REFUSED` on malformed record BEFORE a matching owned
+      record: same fail-closed reasoning.
+    - Invalid requested ID itself (`None`, `""`, `"   "`,
+      non-str/non-int) → `REFUSED` + `ERROR`-level log.
+  - `_normalize_instance_id` shared normalizer (parametric):
+    - `None` → `None`
+    - `True` / `False` (bool) → `None`
+    - `""` → `None`
+    - `"   "` (whitespace) → `None`
+    - `" 123 "` (padded) → `"123"` (canonical stripped form)
+    - `123` (int) → `"123"`
+    - `"abc"` → `"abc"`
+  - Invalid-API-response coverage with `caplog`:
+    - `RuntimeError` from `vastai_cmd` → `REFUSED` + `ERROR`-level
+    - `json.JSONDecodeError` → `REFUSED` + `ERROR`-level
+    - non-list response (e.g. `{"foo": "bar"}`) → `REFUSED` +
+      `ERROR`-level
+    - non-dict record in a list → `REFUSED` + `ERROR`-level
+    - record with `id=None` or `id=""` or `id="   "` (parameterized)
+      → `REFUSED` + `ERROR`-level
+    - Unexpected empty-message `RuntimeError("")` → `REFUSED` +
+      `ERROR`-level (does not escape; covered by the outermost
+      `except Exception` boundary).
   - `list_vastai_instances` returns `list[InstanceCandidate]` with `gpu_model` + `cost_per_hour` populated; skips records where `inst` is not a dict, `id` is `None`, `id` is empty after strip; returns `[]` on API error.
   - `build_vastai_cleanup_policy(*, ownership, credentials)`:
     - EXPLICITLY_DISABLED list: returns `[]` without `vastai_cmd`.
-    - ABSENT destroy: factory intercepts `NO_CREDENTIALS` → CLI ownership verify → CLI destroy → `CLI_ATTEMPTED` (success) or `UNKNOWN` (failure).
+    - ABSENT destroy — CLI fallback dispatch:
+      - verifier `OWNED` → CLI destroy (`vastai destroy instance`)
+        → `CLI_ATTEMPTED`.
+      - verifier `DISABLED` → CLI destroy → `CLI_ATTEMPTED`.
+      - verifier `ABSENT` → short-circuit to `ALREADY_GONE`
+        WITHOUT invoking `vastai destroy instance` (factory-level
+        test; patch both `verify_instance_ownership` and
+        `vastai_cmd` and assert the destroy invocation is
+        absent).
+      - verifier `REFUSED` → `OWNERSHIP` refusal.
+      - CLI destroy exception → `UNKNOWN`.
     - AVAILABLE destroy: v3 DESTROYED → `verdict=DESTROYED`.
     - LEAKED / UNKNOWN translate with `_describe_destroy_result()` diagnostic.
-    - OWNERSHIP / NO_CREDENTIALS / CREDENTIALS_DISABLED translate correctly.
-    - INELIGIBLE_STATE for `state in VASTAI_TERMINAL_STATES` or empty state.
+    - OWNERSHIP / NO_CREDENTIALS / CREDENTIALS_DISABLED translate
+      correctly; `CREDENTIALS_DISABLED` includes
+      `_describe_destroy_result(result)` in the diagnostic
+      (CONCERN 2).
+    - INELIGIBLE_STATE for `state in VASTAI_TERMINAL_STATES` or
+      empty state.
   - `VastaiRunner.destroy_instance` logs typed result: LEAKED → `ERROR`, UNKNOWN → `WARNING`, refusals → `ERROR`; returns `False`.
 - `tests/test_batch.py`:
   - `_sweep_zombies` calls `cleanup_policy.list_instances()` exactly once.
   - `_sweep_zombies` calls `cleanup_policy.destroy(candidate)` for every label-matching, untracked candidate.
-  - `_sweep_zombies` counts only `verdict=DESTROYED` outcomes.
-  - `_sweep_zombies` logs `LEAKED` at `ERROR`, `UNKNOWN` / `CLI_ATTEMPTED` / `CREDENTIALS_DISABLED` at `WARNING`, unexpected `NO_CREDENTIALS` at `WARNING`, refusals at `INFO` (`caplog`).
+  - `_sweep_zombies` counts only `verdict=DESTROYED` outcomes (an
+    `ALREADY_GONE` outcome is NOT counted as a kill — no destroy
+    happened).
+  - `_sweep_zombies` logs `LEAKED` at `ERROR`, `UNKNOWN` /
+    `CLI_ATTEMPTED` / `CREDENTIALS_DISABLED` at `WARNING`,
+    `ALREADY_GONE` at `INFO`, unexpected `NO_CREDENTIALS` at
+    `WARNING`, refusals at `INFO` (`caplog`).
   - `_sweep_zombies` continues on `destroy_fn` exceptions.
   - `_sweep_zombies` does NOT import provider modules (`inspect.getsource`).
 - `tests/integration/test_cleanup_policy_integration.py` — 14 scenarios from step 6 above.
@@ -1920,15 +2187,29 @@ match in `cli.py:instances` is removed.
 
 ## Review process
 
-This is the seventh review pass on the v4 architecture. Each prior
+This is the ninth review pass on the v4 architecture. Each prior
 draft was rejected and addressed. This draft addresses every
-finding from the 10th-pass review:
+finding from the 12th-pass review:
 
-- BLOCKER 1: `verify_instance_ownership` fail-closed on malformed records.
-- NIT 2: Draft/review-pass bookkeeping corrected from "sixth" to
-  "seventh" / "10th-pass → 11th-pass" where applicable.
+- BLOCKER 1: `verify_instance_ownership` conflated absent and
+  owned; replaced with a tagged `OwnershipVerification` enum
+  (`OWNED | ABSENT | REFUSED | DISABLED`).
+- BLOCKER 2: ID-semantic mismatch between enumeration and
+  verification; `None`/`bool`/empty/blank IDs now rejected via
+  shared `_normalize_instance_id`. The verifier validates the
+  entire response before locating the matching record.
+- BLOCKER 3: Outermost `except Exception` boundary plus
+  `ERROR`-level log on every failure path.
+- CONCERN 1: Test catalogue expanded with parameterized
+  invalid-ID cases, malformed-record-BEFORE/AFTER ordering
+  tests, numeric/padded IDs, and `caplog` severity assertions
+  for every failure path.
+- CONCERN 2: `_describe_destroy_result(result)` now appears in
+  the `CREDENTIALS_DISABLED` refusal diagnostic.
+- NIT 3: `is_candidate` references replaced with the actual
+  orchestrator label/tracked-ID filtering mechanism.
 
-The 11th-pass review prompt for ChatGPT-with-GitHub-plugin:
+The 13th-pass review prompt for ChatGPT-with-GitHub-plugin:
 
 > Review the v4 architecture design at PR #22 (file:
 > docs/architecture-v4-cleanup-policy.md) against the v3 design at
@@ -1937,50 +2218,55 @@ The 11th-pass review prompt for ChatGPT-with-GitHub-plugin:
 > src/vastai_gpu_runner/providers/vastai.py. The v4 design
 > resolves issue #19.
 >
-> The seventh draft (applied to 10th-pass findings) addressed:
+> The ninth draft (applied to 12th-pass findings) introduced:
 >
-> 1. **BLOCKER 1: `verify_instance_ownership` fail-closed**:
->    - Verify the function rejects (returns `False`) for: non-dict
->      list entries, dict records with missing `id` key,
->      `id=None`, `id=""` (empty), and `id="   "` (whitespace-only).
->    - Confirm the docstring's return contract states `True` is
->      returned only when ownership is disabled OR a fully-well-
->      formed response does NOT contain the requested instance.
->    - Verify the new test cases (8) in the test plan cover the
->      fail-closed paths AND the still-`True` "already destroyed"
->      path.
-> 2. **NIT 2: draft/review-pass bookkeeping**: confirm:
->    - "What changes vs ..." header now reads "first + second + third + fourth + fifth + sixth drafts"
->    - "This seventh draft addresses every finding"
->    - "Review process" section now reads "seventh review pass" / "11th-pass"
->    - Prior passes quoted correctly (fifth, sixth)
+> 1. **`OwnershipVerification` tagged enum** replacing the
+>    conflated `bool`. Verify the four-way contract: `OWNED` for
+>    present-and-matching, `ABSENT` for present-but-not-in-API,
+>    `REFUSED` for unowned-or-malformed, `DISABLED` for ownership
+>    checking off.
+> 2. **`_normalize_instance_id` shared normalizer** between
+>    `list_vastai_instances` and `verify_instance_ownership`,
+>    rejecting invalid IDs (`None`/`bool`/empty/blank) and
+>    canonicalising valid ones. The verifier validates the entire
+>    response (no early-return on first match) before locating
+>    the requested record.
+> 3. **`except Exception` outermost boundary** on the verifier
+>    with `ERROR`-level log for every failure path (was `WARNING`
+>    on the original two paths).
+> 4. **`ALREADY_GONE` v4 verdict** added to `CleanupVerdict`;
+>    factory's CLI fallback short-circuits `ABSENT` to it
+>    WITHOUT invoking CLI destroy.
+> 5. **`_describe_destroy_result` for `CREDENTIALS_DISABLED`**.
+> 6. **Test catalogue** exhaustively covers the new branches
+>    (parameterized invalid-ID, malformed-record-BEFORE/AFTER,
+>    numeric/padded IDs, caplog severity, factory
+>    ABSENT-short-circuits-destroy).
 >
 > Additionally, identify any new BLOCKERs or CONCERNs. Focus on:
 >
-> - Does `verify_instance_ownership`'s fail-closed behavior interact
->   correctly with the `is_candidate` short-circuit? (If `is_candidate`
->   has already filtered the candidate, the verifier only ever runs
->   on instances we plan to destroy, so its malformed-record rejection
->   cannot accidentally protect a legitimate instance that another
->   process is destroying independently.)
-> - Does the "already destroyed" path (well-formed list, missing
->   instance ID) interact correctly with the cleanup policy's
->   try/except? (A True return is a release-the-candidate signal,
->   not an error, so `ProviderCleanupPolicy.destroy` should not
->   substitute a `CleanupResult(verdict=UNKNOWN)` for it.)
-> - Does the docstring's exhaustive return-value contract make the
->   "True = proof of absence" claim defensible under formal review?
-> - Are the 8 new test cases exhaustive of all malformed-record
->   flavours? (non-dict, missing key, None id, empty id, whitespace id,
->   well-formed match, well-formed mismatch, policy-disabled short-circuit)
-> - The cleanup policy's `_destroy` callback: does it correctly
->   call `_describe_destroy_result` for both verdict and refusal
->   paths?
-> - The runner's `destroy_instance`: does it correctly log all
->   typed outcomes (verdict + refusal + diagnostic context)?
-> - The migration checklist: are the v3 prerequisites explicit?
-> - The unused imports: any other imports that are no longer
->   used?
+> - Does the new `ALREADY_GONE` verdict integrate cleanly with
+>   the orchestrator's logging and kill-counting logic? (It
+>   should NOT count toward `killed`, and it should log at
+>   `INFO`.)
+> - Does the tagged-result dispatch in `_cli_fallback` cover all
+>   four cases without a default clause? (Adding a `match`
+>   statement with an exhaustive `case` would prove it.)
+> - Are there any places in the existing v2 code or v3 design
+>   that pass `bool` (the old return type) to anything that
+>   now expects `OwnershipVerification`? (The migration
+>   checklist should call this out explicitly.)
+> - Does the `OwnershipVerification` enum's `DISABLED` value
+>   correctly distinguish from `OWNED`? (With no policy, every
+>   instance is treated as owned — but we shouldn't pretend we
+>   confirmed its presence. `DISABLED` is "no policy check was
+>   run", `OWNED` is "the API confirmed presence".)
+> - Could the new `ALREADY_GONE` verdict collide with a future
+>   v3 verdict translation? (DESTROYED → DESTROYED; LEAKED →
+>   LEAKED; UNKNOWN → UNKNOWN; new ALREADY_GONE has no v3
+>   counterpart, so no collisions.)
+> - Does the test plan still cover all the v3 prerequisite
+>   scenarios from migration step 6 (14 integration scenarios)?
 >
 > Return a labeled list of findings. Each finding is one of:
 > BLOCKER (must fix before merge), CONCERN (should fix, but not
