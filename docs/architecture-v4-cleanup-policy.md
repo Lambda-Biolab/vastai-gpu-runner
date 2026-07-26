@@ -97,16 +97,31 @@ in `VastaiProviderConfig` (because the runner also needs
 `docker_image`, `setup_commands`, etc.); the cleanup-policy factory
 takes them directly.
 
-## What changes vs the v4 first + second + third + fourth + fifth drafts
+## What changes vs the v4 first + second + third + fourth + fifth + sixth drafts
 
 The first draft was rejected with 5 BLOCKERs and 7 CONCERNs. The
 second draft was rejected with 7 BLOCKERs, 2 CONCERNs, and 3 NITs.
 The third draft was rejected with 6 BLOCKERs, 4 CONCERNs, and 2 NITs.
 The fourth draft was rejected with 5 BLOCKERs and 3 CONCERNs. The
-fifth draft was rejected with 2 BLOCKERs, 2 CONCERNs, and 1 NIT.
-This sixth draft addresses every finding.
+fifth draft was rejected with 2 BLOCKERs, 2 CONCERNs, and 1 NIT. The
+sixth draft was rejected with 1 BLOCKER, 4 CONCERNs, and 2 NITs.
+This seventh draft addresses every finding.
 
-### Applied from the 9th-pass review (this pass)
+### Applied from the 10th-pass review (this pass)
+
+- **`verify_instance_ownership` fails closed on malformed records.**
+  Non-dict list entries, missing `id` keys, `id=None`, and
+  empty/blank `id` strings all return `False` (refuse the destroy)
+  rather than being skipped. The function's return contract now
+  states: `True` only when ownership is disabled OR a fully-well-
+  formed response does not contain the requested instance;
+  `False` for any API error, response-shape failure, or
+  unparseable record that prevents proving absence. Eight new
+  test cases in `tests/test_providers_vastai.py` cover the
+  fail-closed paths plus the still-`True` "already destroyed"
+  path. (BLOCKER 1)
+
+### Applied from the 9th-pass review (prior pass)
 
 - **Removed the v4 `providers/destroy.py` block.** The doc no longer claims to add or redefine `DestroyVerdict` / `DestroyRefusal` / `DestroyResult`. v3's `providers/destroy.py` is referenced as the authoritative source; the v4 migration checklist makes v3 implementation a hard prerequisite (either land v3 first or merge v3 as part of the same PR). (BLOCKER 2)
 - **`DestroyResult` not redefined.** The v4 doc references v3's `DestroyResult` verbatim — `attempts: int = 0`, `stop_error: str | None = None`, `last_status_code: int | None = None`, `verify_error: str | None = None`, with v3's invariants (`attempts == 0` for refusal, `attempts >= 1` for verdict, no protocol context on refusals). The v4 doc's diagnostic helper reads fields by name (order-independent). (BLOCKER 1)
@@ -873,12 +888,23 @@ def verify_instance_ownership(
     This is the CLI-auth verification used by the v4 factory's
     CLI fallback path (separate auth context from the REST path).
 
-    Returns True when the instance is not in a well-formed
-    response (treated as "already destroyed"). Returns False on
-    API error, malformed response, ownership mismatch, or any
-    unexpected exception. Mirrors ``list_vastai_instances``'s
-    defensive ``isinstance`` checks so direct callers see the
-    declared ``-> bool`` contract upheld.
+    Return-value contract (fail-closed on malformed responses):
+
+    - ``True``  → ownership checking is disabled (no policy), OR a
+      well-formed response does NOT contain the requested instance
+      (treat as "already destroyed").
+    - ``False`` → API error, malformed JSON, malformed response
+      shape, any non-dict / missing-ID / empty-ID record that
+      prevents proving the instance's absence, ownership
+      mismatch, or an unexpected exception.
+
+    A single malformed record fails the whole check rather than
+    being skipped: if the response is so mangled that one entry
+    is missing a usable ``id``, we cannot reliably prove the
+    requested ``instance_id`` is absent. We refuse the destroy
+    and ask the operator to clean the API response. This
+    mirrors ``list_vastai_instances``'s defensive ``isinstance``
+    checks so the declared ``-> bool`` contract is upheld.
     """
     if ownership.owned_images is None:
         return True
@@ -899,15 +925,33 @@ def verify_instance_ownership(
             type(instances).__name__,
         )
         return False
-    for inst in instances:
-        if not isinstance(inst, dict):
-            logger.warning(
-                "Cannot verify ownership — encountered non-object instance record: %r",
-                inst,
+    for raw_record in instances:
+        # Every record must be a well-formed ``{"id": str, ...}`` so
+        # we can definitively prove the requested ``instance_id`` is
+        # absent. Anything else (non-dict, missing ``id``, empty/null
+        # ``id``) fails the verification — a partial record that we
+        # cannot read could be the requested instance under another
+        # image, and we will NOT cross the safety boundary on its
+        # behalf.
+        if not isinstance(raw_record, dict):
+            logger.error(
+                "REFUSING: instance %s cannot be verified — malformed record "
+                "(not a dict: %r). Resolve the API response and retry.",
+                instance_id,
+                raw_record,
             )
-            continue
-        if str(inst.get("id")) == str(instance_id):
-            image = str(inst.get("image_uuid", ""))
+            return False
+        record_id = raw_record.get("id")
+        if not isinstance(record_id, str) or not record_id.strip():
+            logger.error(
+                "REFUSING: instance %s cannot be verified — record has missing "
+                "or empty id field: %r. Resolve the API response and retry.",
+                instance_id,
+                raw_record,
+            )
+            return False
+        if record_id == str(instance_id):
+            image = str(raw_record.get("image_uuid", ""))
             if ownership.matches(image):
                 return True
             logger.error(
@@ -1814,6 +1858,18 @@ steps then build on v3's `providers/destroy.py` module
   - `VastaiRunner(allowed_images=frozenset({img}))` (deprecated) emits `DeprecationWarning` + builds equivalent `OwnershipPolicy`.
   - Simultaneous `ownership=` and `allowed_images=` raises `ValueError`.
   - `verify_instance_ownership` uses `OwnershipPolicy.matches()`.
+  - `verify_instance_ownership` fails closed on malformed records:
+    - non-dict record in the list (e.g. `[{"id": "x"}, "oops"]`) → `False`
+    - dict record with missing `id` key → `False`
+    - dict record with `id=None` → `False`
+    - dict record with `id=""` (empty after strip) → `False`
+    - well-formed list missing the requested `instance_id` → `True`
+    - well-formed list containing the requested `instance_id` with
+      a matching `image_uuid` → `True`
+    - well-formed list containing the requested `instance_id` with
+      a non-matching `image_uuid` → `False` + `ERROR`-level log
+    - `OwnershipPolicy(owned_images=None)` short-circuits to `True`
+      without an API call (`patch.object` on `vastai_cmd`).
   - `list_vastai_instances` returns `list[InstanceCandidate]` with `gpu_model` + `cost_per_hour` populated; skips records where `inst` is not a dict, `id` is `None`, `id` is empty after strip; returns `[]` on API error.
   - `build_vastai_cleanup_policy(*, ownership, credentials)`:
     - EXPLICITLY_DISABLED list: returns `[]` without `vastai_cmd`.
@@ -1864,11 +1920,15 @@ match in `cli.py:instances` is removed.
 
 ## Review process
 
-This is the sixth review pass on the v4 architecture. Each prior
+This is the seventh review pass on the v4 architecture. Each prior
 draft was rejected and addressed. This draft addresses every
-finding from the 9th-pass review.
+finding from the 10th-pass review:
 
-The sixth review prompt for ChatGPT-with-GitHub-plugin:
+- BLOCKER 1: `verify_instance_ownership` fail-closed on malformed records.
+- NIT 2: Draft/review-pass bookkeeping corrected from "sixth" to
+  "seventh" / "10th-pass → 11th-pass" where applicable.
+
+The 11th-pass review prompt for ChatGPT-with-GitHub-plugin:
 
 > Review the v4 architecture design at PR #22 (file:
 > docs/architecture-v4-cleanup-policy.md) against the v3 design at
@@ -1877,69 +1937,42 @@ The sixth review prompt for ChatGPT-with-GitHub-plugin:
 > src/vastai_gpu_runner/providers/vastai.py. The v4 design
 > resolves issue #19.
 >
-> The fifth draft was rejected with 2 BLOCKERs, 2 CONCERNs, and
-> 1 NIT. Verify each finding is addressed:
+> The seventh draft (applied to 10th-pass findings) addressed:
 >
-> 1. **BLOCKER 1 (DestroyResult verbatim)**: confirm the v4 doc
->    does NOT redefine `DestroyResult`. The doc should reference
->    v3's `providers/destroy.py` module as the authoritative
->    source for `DestroyResult`, `DestroyVerdict`, `DestroyRefusal`.
->    The v3 contract (per the reviewer) is:
->    ```python
->    attempts: int = 0
->    stop_error: str | None = None
->    last_status_code: int | None = None
->    verify_error: str | None = None
->    ```
->    with refusal requiring `attempts == 0` and verdict requiring
->    `attempts >= 1`. The v4 doc should not contradict this.
-> 2. **BLOCKER 2 (providers/destroy.py incomplete)**: confirm the
->    v4 doc does NOT include a `providers/destroy.py` code block.
->    The v3 prerequisite module is referenced as authoritative;
->    v4 only amends the adapter's `destroy_vastai_instance`
->    signature. Migration step 1 makes v3 implementation a hard
->    prerequisite.
-> 3. **CONCERN 3 (duplicated _describe, omits verdict/refusal)**:
->    confirm there is ONE shared `_describe_destroy_result`
->    helper in `providers/vastai.py`, used by both
->    `VastaiRunner.destroy_instance` and `build_vastai_cleanup_policy._destroy`.
->    Confirm the helper includes `verdict` and `refusal` in the
->    output (not just attempts + errors).
-> 4. **CONCERN 4 (instances command ownership migration)**: confirm
->    migration step 5 expands the `cli.py:instances` migration:
->    - construct `OwnershipPolicy` (with comma trimming like `cleanup`)
->    - use `ownership.matches(candidate.ownership_key)` for the
->      "Owned" column
->    - tests covering malicious prefixes, registry ports, tags,
->      digests, empty sets
-> 5. **CONCERN 5 (_normalised narrowing)**: confirm
->    `OwnershipPolicy.matches` reads `self._normalised` into a
->    local `normalised` variable and returns `False` if
->    `normalised is None`, so Pyright strict mode can infer the
->    invariant.
-> 6. **NIT 6 (unused imports)**: confirm `cleanup_policy.py` no
->    longer imports `Iterable` or `StrEnum`; confirm
->    `providers/vastai.py` no longer imports `Optional` (in the
->    shown code).
+> 1. **BLOCKER 1: `verify_instance_ownership` fail-closed**:
+>    - Verify the function rejects (returns `False`) for: non-dict
+>      list entries, dict records with missing `id` key,
+>      `id=None`, `id=""` (empty), and `id="   "` (whitespace-only).
+>    - Confirm the docstring's return contract states `True` is
+>      returned only when ownership is disabled OR a fully-well-
+>      formed response does NOT contain the requested instance.
+>    - Verify the new test cases (8) in the test plan cover the
+>      fail-closed paths AND the still-`True` "already destroyed"
+>      path.
+> 2. **NIT 2: draft/review-pass bookkeeping**: confirm:
+>    - "What changes vs ..." header now reads "first + second + third + fourth + fifth + sixth drafts"
+>    - "This seventh draft addresses every finding"
+>    - "Review process" section now reads "seventh review pass" / "11th-pass"
+>    - Prior passes quoted correctly (fifth, sixth)
 >
-> Additionally, identify any new BLOCKERs or CONCERNs introduced
-> by the sixth draft. Focus on:
+> Additionally, identify any new BLOCKERs or CONCERNs. Focus on:
 >
-> - The v3 prerequisite: does the migration checklist make it
->   clear that v3 must be implemented first? Are the v3 module
->   dependencies correctly listed (belt_and_suspenders,
->   DestroyPolicy, VerifyVerdict, VerifyResult, callback
->   protocols)?
-> - The `_describe_destroy_result` helper: is it called from
->   both the runner's typed-result logging and the factory's
->   refusal/verdict translation? Does it include all four
->   structured fields plus verdict + refusal?
-> - The instances command code shape: does it correctly
->   construct `OwnershipPolicy` with comma trimming? Does it use
->   `ownership.matches(candidate.ownership_key)` (not the v2
->   substring match)?
-> - The `OwnershipPolicy.matches` narrowing: does Pyright strict
->   mode accept the local-variable pattern?
+> - Does `verify_instance_ownership`'s fail-closed behavior interact
+>   correctly with the `is_candidate` short-circuit? (If `is_candidate`
+>   has already filtered the candidate, the verifier only ever runs
+>   on instances we plan to destroy, so its malformed-record rejection
+>   cannot accidentally protect a legitimate instance that another
+>   process is destroying independently.)
+> - Does the "already destroyed" path (well-formed list, missing
+>   instance ID) interact correctly with the cleanup policy's
+>   try/except? (A True return is a release-the-candidate signal,
+>   not an error, so `ProviderCleanupPolicy.destroy` should not
+>   substitute a `CleanupResult(verdict=UNKNOWN)` for it.)
+> - Does the docstring's exhaustive return-value contract make the
+>   "True = proof of absence" claim defensible under formal review?
+> - Are the 8 new test cases exhaustive of all malformed-record
+>   flavours? (non-dict, missing key, None id, empty id, whitespace id,
+>   well-formed match, well-formed mismatch, policy-disabled short-circuit)
 > - The cleanup policy's `_destroy` callback: does it correctly
 >   call `_describe_destroy_result` for both verdict and refusal
 >   paths?
