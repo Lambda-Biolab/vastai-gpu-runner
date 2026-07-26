@@ -157,11 +157,13 @@ This sixth draft addresses every finding.
 
 ## Module taxonomy
 
-The v4 doc adds one new module (`cleanup_policy.py`) and modifies two
-existing modules (`providers/destroy_adapters/vastai.py` and
-`providers/vastai.py`). The v3 modules (`providers/destroy.py`,
-`unit_lifecycle.py`, `BatchOrchestrator`, `CloudRunner`) are
-referenced unchanged.
+The v4 doc adds one new module (`cleanup_policy.py`) and modifies
+**four** existing modules (`providers/destroy_adapters/vastai.py`,
+`providers/vastai.py`, `batch.py`, `cli.py`) and deletes legacy
+helpers from `orchestrator.py`. The v3 modules
+(`providers/destroy.py`, `unit_lifecycle.py`) and the `CloudRunner`
+ABC are referenced unchanged. `BatchOrchestrator` is **modified**
+(adds `cleanup_policy` parameter, replaces `_sweep_zombies`).
 
 ### Module ownership (clarified)
 
@@ -170,6 +172,9 @@ referenced unchanged.
 | `providers/destroy.py` (v3 prerequisite) | `DestroyVerdict`, `DestroyRefusal`, `DestroyResult`, `VerifyVerdict`, `VerifyResult`, `DestroyPolicy`, callback protocols, `belt_and_suspenders` | None — referenced verbatim |
 | `providers/destroy_adapters/vastai.py` (v3 + v4) | `CredentialState`, `CredentialResolution`, `read_vastai_api_key()` (env-first), `destroy_vastai_instance()` (amended signature) | Env-first credentials; amended adapter signature |
 | `providers/vastai.py` (v4) | `VastaiProviderConfig`, `VastaiRunner`, `vastai_cmd`, `verify_instance_ownership`, `list_vastai_instances()`, `build_vastai_cleanup_policy()`, `_describe_destroy_result`, `VASTAI_TERMINAL_STATES` | Many (see diff) |
+| `batch.py` (v4) | `BatchOrchestrator` (modified) | Adds required `cleanup_policy: ProviderCleanupPolicy` parameter; replaces `_sweep_zombies` (policy-driven); removes `sweep_zombie_instances` import |
+| `cli.py` (v4) | CLI commands | Refactored `batch` / `cleanup` / `instances` commands; `cli.py:instances` "Owned" column uses `OwnershipPolicy.matches()` (v2 substring match removed) |
+| `orchestrator.py` (v4 deletion) | — | Delete `sweep_zombie_instances`, `load_vastai_api_key` |
 | `cleanup_policy.py` (v4) | `OwnershipPolicy`, `InstanceCandidate`, `CleanupVerdict`, `CleanupRefusal`, `CleanupResult`, `ProviderCleanupPolicy` | New module |
 
 The core `cleanup_policy.py` module imports nothing from `providers/`.
@@ -523,7 +528,7 @@ class ProviderCleanupPolicy:
         on every call, then delegates to ``destroy_fn`` which
         applies eligibility / ownership / credential checks.
 
-        Never raises. Three safety guarantees:
+        Never raises. Two safety guarantees:
 
         1. The catch-all uses ``f"{type(exc).__name__}: {exc}"``
            so the error string is always non-empty (preserves
@@ -573,21 +578,39 @@ class ProviderCleanupPolicy:
         return result
 ```
 
-## `providers/destroy_adapters/vastai.py` — v3 + v4 amendments
+## `providers/destroy_adapters/vastai.py` — v4 amendments (patch-style excerpt)
 
-The v3 design's `CredentialState` + `CredentialResolution` types plus
-the amended `destroy_vastai_instance` signature. The adapter
-**imports** the destroy types from `providers/destroy.py` (v3
-prerequisite); it does not redefine them.
+The v4 design adds the `CredentialState` + `CredentialResolution`
+types plus the amended `destroy_vastai_instance` signature. The
+adapter **imports** the destroy types from `providers/destroy.py`
+(v3 prerequisite); it does not redefine them.
+
+The block below is a **patch-style excerpt** showing only the
+v4-amended content. The unchanged v3 imports (the existing REST
+callbacks, `VASTAI_POLICY`, `belt_and_suspenders`, etc.) remain
+in the file. Implementing this block literally does NOT replace
+the v3 adapter — it only adds the new credential types, the
+env-first resolver, and the amended `destroy_vastai_instance`
+signature.
 
 ```python
 # src/vastai_gpu_runner/providers/destroy_adapters/vastai.py
+#
+# --- v3 imports (unchanged) ---
+#
+# from vastai_gpu_runner.providers.destroy import (
+#     VerifyVerdict, VerifyResult, DestroyPolicy,
+#     belt_and_suspenders,
+# )
+# import requests  # for the v3 REST callbacks
+# import logging  # VASTAI_POLICY timing support
+#
+# --- v4 additions ---
+
 from __future__ import annotations
 
 import logging
 import os
-import subprocess
-import time
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -849,6 +872,13 @@ def verify_instance_ownership(
     Uses ``ownership.matches(image_uuid)`` for the ownership check.
     This is the CLI-auth verification used by the v4 factory's
     CLI fallback path (separate auth context from the REST path).
+
+    Returns True when the instance is not in a well-formed
+    response (treated as "already destroyed"). Returns False on
+    API error, malformed response, ownership mismatch, or any
+    unexpected exception. Mirrors ``list_vastai_instances``'s
+    defensive ``isinstance`` checks so direct callers see the
+    declared ``-> bool`` contract upheld.
     """
     if ownership.owned_images is None:
         return True
@@ -862,7 +892,20 @@ def verify_instance_ownership(
             exc,
         )
         return False
+    if not isinstance(instances, list):
+        logger.warning(
+            "Cannot verify ownership of instance %s — response is not a list (got %s)",
+            instance_id,
+            type(instances).__name__,
+        )
+        return False
     for inst in instances:
+        if not isinstance(inst, dict):
+            logger.warning(
+                "Cannot verify ownership — encountered non-object instance record: %r",
+                inst,
+            )
+            continue
         if str(inst.get("id")) == str(instance_id):
             image = str(inst.get("image_uuid", ""))
             if ownership.matches(image):
@@ -1623,6 +1666,7 @@ def instances(
     from rich.console import Console
     from rich.table import Table
     from vastai_gpu_runner.cleanup_policy import OwnershipPolicy
+    from vastai_gpu_runner.providers.vastai import list_vastai_instances
 
     console = Console()
     candidates = list_vastai_instances()
@@ -1743,7 +1787,7 @@ steps then build on v3's `providers/destroy.py` module
      - **CLI --allowed-images None**: opt-out (every image considered owned).
      - **destroy_fn returns None**: orchestrator receives `CleanupResult(verdict=UNKNOWN, error="...invalid result type NoneType")`.
      - **VastaiRunner logs typed result**: LEAKED outcome produces an `ERROR`-level log line with the structured diagnostic context.
-     - **instances command ownership column**: malicious prefix `myorg/app-malicious:latest` shown as `no` when `--allowed-images myorg/app:1.0`; tag-insensitive `myorg/app:latest` shown as `yes`; registry-port `registry:5000/myorg/app:1.0` shown as `no` when `--allowed-images myorg/app`; empty set `--allowed-images ""` shows every instance as `no`.
+     - **instances command ownership column**: malicious prefix `myorg/app-malicious:latest` shown as `no` when `--allowed-images myorg/app:1.0`; tag-insensitive `myorg/app:latest` shown as `yes`; digest `myorg/app@sha256:<digest>` shown as `yes` when `--allowed-images myorg/app:1.0` (tag-insensitive repository match); registry-port `registry:5000/myorg/app:1.0` shown as `no` when `--allowed-images myorg/app`; positive registry-port `registry:5000/myorg/app:1.0` shown as `yes` when `--allowed-images registry:5000/myorg/app:1.0`; empty set `--allowed-images ""` shows every instance as `no`.
 
 7. **Delete legacy sweep + duplicated helpers after a repository-wide caller audit.**
    - `audit_caller_sites.sh` (run before deletion): grep for external callers of `orchestrator.sweep_zombie_instances`, `orchestrator.load_vastai_api_key`, `VastaiRunner.allowed_images` (read-only external use), `providers.vastai._image_is_allowed`, `cli.instances`'s substring match. Update external callers.
