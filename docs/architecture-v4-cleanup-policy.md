@@ -14,6 +14,14 @@ next step. Issue #19's fifth-pass review recommended Option B
 (canonical config) over Option A (per-runner `destroy_zombie`) — the
 v4 design implements Option B.
 
+The v4 design **does not redefine any v3 types**. The v3 module
+`providers/destroy.py` is a hard prerequisite: it owns
+`DestroyVerdict`, `DestroyRefusal`, `DestroyResult`, `VerifyVerdict`,
+`VerifyResult`, `DestroyPolicy`, the callback protocols, and
+`belt_and_suspenders`. The v4 implementation either lands v3 first
+or merges v3 as part of the same PR. The v4 doc references v3
+verbatim and only amends `destroy_vastai_instance`'s signature.
+
 [i19]: https://github.com/Lambda-Biolab/vastai-gpu-runner/issues/19
 
 ## What changes vs v3
@@ -43,23 +51,26 @@ matching its operational impact (`LEAKED` = `ERROR`, unexpected
 `CREDENTIALS_DISABLED` = `WARNING`, refusals = `INFO`). The
 `VastaiRunner.destroy_instance` method delegates entirely to the v3
 adapter (no v2 regression) and logs the typed `DestroyResult` for
-non-`DESTROYED` outcomes.
+non-`DESTROYED` outcomes. The `cli.py:instances` command's "Owned"
+column uses `OwnershipPolicy.matches()` (the v2 substring/prefix
+match is removed).
 
 Diff vs v3 once v3 is implemented:
 
-- **+** `src/vastai_gpu_runner/cleanup_policy.py` — `ProviderCleanupPolicy` (frozen, `kw_only`), `InstanceCandidate` (frozen, non-empty `instance_id` invariant), `CleanupVerdict` enum (`DESTROYED | CLI_ATTEMPTED | LEAKED | UNKNOWN`), `CleanupRefusal` enum (`OWNERSHIP | NO_CREDENTIALS | CREDENTIALS_DISABLED | INELIGIBLE_STATE | PROVIDER_MISMATCH`), `CleanupResult` (typed return with `__post_init__` invariants), `OwnershipPolicy` (frozen, `matches(image_ref)`, declared `_normalised` cache field). The `ProviderCleanupPolicy.destroy()` method validates the `destroy_fn` callback return type (cannot return `None` or a non-`CleanupResult`).
-- **+** `src/vastai_gpu_runner/providers/destroy.py` — `DestroyVerdict`, `DestroyRefusal`, `DestroyResult` (v3 verbatim — the canonical destroy types live here, not in the adapter).
-- **~** `src/vastai_gpu_runner/providers/destroy_adapters/vastai.py` — only `CredentialState`, `CredentialResolution`, `read_vastai_api_key()` (v3 env-first + fail-closed semantics), and the amended `destroy_vastai_instance()` signature (`ownership: OwnershipPolicy`, `credentials: CredentialResolution | None`). The destroy types are imported from `providers/destroy.py`, not redefined.
+- **+** `src/vastai_gpu_runner/cleanup_policy.py` — `ProviderCleanupPolicy` (frozen, `kw_only`), `InstanceCandidate` (frozen, non-empty `instance_id` invariant), `CleanupVerdict` enum (`DESTROYED | CLI_ATTEMPTED | LEAKED | UNKNOWN`), `CleanupRefusal` enum (`OWNERSHIP | NO_CREDENTIALS | CREDENTIALS_DISABLED | INELIGIBLE_STATE | PROVIDER_MISMATCH`), `CleanupResult` (typed return with `__post_init__` invariants), `OwnershipPolicy` (frozen, `matches(image_ref)`, declared `_normalised` cache field, narrowed for strict type checking).
 - **+** `src/vastai_gpu_runner/providers/vastai.py:VastaiProviderConfig` (frozen, owns `ownership: OwnershipPolicy`, `credentials: CredentialResolution`, `docker_image`, etc.)
 - **+** `src/vastai_gpu_runner/providers/vastai.py:build_vastai_cleanup_policy(*, ownership, credentials)` — provider-owned factory that takes the two canonical objects directly (no config wrapper)
 - **+** `src/vastai_gpu_runner/providers/vastai.py:list_vastai_instances()` — read-only enumeration returning `list[InstanceCandidate]`, validates `instance_id` is a non-`None` non-empty string
+- **+** `src/vastai_gpu_runner/providers/vastai.py:_describe_destroy_result(result)` — single shared diagnostic helper, used by both the runner and the factory; includes `verdict` + `refusal` in the output
+- **~** `providers/destroy_adapters/vastai.py:destroy_vastai_instance` accepts `ownership: OwnershipPolicy` directly (replaces `allowed_images: frozenset[str]`); accepts `credentials: CredentialResolution | None` (defaults to `read_vastai_api_key()` for back-compat direct callers). The v3 implementation must adopt this signature.
+- **~** `providers/destroy_adapters/vastai.py:read_vastai_api_key()` — v3 env-first + fail-closed semantics (env var first, then file fallback with warning + `ABSENT` on blank/unreadable file)
 - **~** `VastaiRunner.__init__` accepts `ownership: OwnershipPolicy | None` and `credentials: CredentialResolution | None`; rejects simultaneous `ownership=` and deprecated `allowed_images=` with `ValueError`.
 - **~** `VastaiRunner.from_config(config)` preserves both `canonical.ownership` and `canonical.credentials`.
 - **~** `VastaiRunner.destroy_instance` delegates entirely to `destroy_vastai_instance(...)` — no v2-style inline ownership pre-check, no inline REST stop/delete/verify. Returns `bool` from the typed adapter result, logging the typed `DestroyResult` for non-`DESTROYED` outcomes.
 - **~** `BatchOrchestrator.__init__` accepts `cleanup_policy: ProviderCleanupPolicy` (required). The orchestrator calls `policy.list_instances()` and `policy.destroy(candidate)` — never branches on `Provider`, never imports provider modules.
 - **~** `BatchOrchestrator._sweep_zombies` is policy-driven end-to-end. The label-prefix filter and tracked-id exclusion stay on the orchestrator. Every other decision is delegated to `policy.destroy()`. The orchestrator logs every non-`DESTROYED` outcome at severity matching operational impact.
-- **~** `cli.py:cleanup` and `cli.py:instances` — refactored to use the new API. The `--allowed-images` flag is the canonical primary; `--owned-images` is an alias. Empty `--allowed-images ""` is **fail-closed** (empty set rejects every image), not opt-out.
-- **—** `orchestrator.py:sweep_zombie_instances` (v3 deletion) — reaffirmed. The v4 implementation removes the last direct caller.
+- **~** `cli.py:cleanup` and `cli.py:instances` — refactored to use the new API. The `--allowed-images` flag is the canonical primary; `--owned-images` is an alias. Empty `--allowed-images ""` is **fail-closed** (empty set rejects every image), not opt-out. The `instances` command's "Owned" column uses `OwnershipPolicy.matches()` (the v2 unsafe substring/prefix match is removed).
+- **—** `orchestrator.py:sweep_zombie_instances` (v3 deletion) — reaffirmed.
 - **—** `orchestrator.py:load_vastai_api_key` (v3 deletion) — reaffirmed.
 - **—** `providers/vastai.py:_image_is_allowed` (raw set check) — replaced by `OwnershipPolicy.matches()`.
 - **~** `tests/test_orchestrator.py` and `tests/test_batch.py` — mock `cleanup_policy.list_instances()` and `cleanup_policy.destroy()` instead of `sweep_zombie_instances`.
@@ -86,51 +97,49 @@ in `VastaiProviderConfig` (because the runner also needs
 `docker_image`, `setup_commands`, etc.); the cleanup-policy factory
 takes them directly.
 
-## What changes vs the v4 first + second + third + fourth drafts
+## What changes vs the v4 first + second + third + fourth + fifth drafts
 
 The first draft was rejected with 5 BLOCKERs and 7 CONCERNs. The
 second draft was rejected with 7 BLOCKERs, 2 CONCERNs, and 3 NITs.
 The third draft was rejected with 6 BLOCKERs, 4 CONCERNs, and 2 NITs.
-The fourth draft was rejected with 5 BLOCKERs and 3 CONCERNs. This
-fifth draft addresses every finding.
+The fourth draft was rejected with 5 BLOCKERs and 3 CONCERNs. The
+fifth draft was rejected with 2 BLOCKERs, 2 CONCERNs, and 1 NIT.
+This sixth draft addresses every finding.
 
-### Applied from the 8th-pass review (this pass)
+### Applied from the 9th-pass review (this pass)
 
-- **Module ownership corrected.** `DestroyVerdict` / `DestroyRefusal` / `DestroyResult` are now defined in `providers/destroy.py` (v3 verbatim) and *imported* by the adapter and the runner — not redefined in the adapter. The runner's `providers/vastai.py` imports them from `providers.destroy`, not from `providers.destroy_adapters.vastai`. `vastai_cmd` and `verify_instance_ownership` are local to `providers/vastai.py` (no import). (BLOCKER 1)
-- **`read_vastai_api_key` rewritten per v3 env-first contract.** Inspects `VASTAI_API_KEY` env var first (present-but-empty → `EXPLICITLY_DISABLED`, present-and-non-empty → `AVAILABLE`); falls back to credential files; blank/unreadable files log a warning and continue as `ABSENT` (NOT disabled); catches `OSError`. (BLOCKER 2)
-- **`DestroyResult` types referenced from v3 verbatim.** The adapter block no longer defines `DestroyResult` / `DestroyVerdict` / `DestroyRefusal`. The v4 factory imports them from `providers.destroy`. Optional diagnostic fields with `None` defaults; invariants enforced in `__post_init__`: exactly one of verdict/refusal, no protocol context on refusals, ≥1 attempt on verdict outcomes. `_describe()` handles `None` fields gracefully. (BLOCKER 3)
-- **Empty `--allowed-images` is fail-closed.** The cleanup CLI distinguishes `None` (flag omitted → opt-out `OwnershipPolicy()`) from `""` (explicit empty → empty set `OwnershipPolicy(owned_images=frozenset())` → reject everything). Whitespace-only entries in comma-separated input are stripped. (BLOCKER 4)
-- **Null provider ID rejected.** `list_vastai_instances` validates `inst` is a dict, then explicitly checks `inst.get("id") is None` (catches `id: null` JSON which `str(None)` would convert to the literal `"None"`). Records with null/empty/whitespace IDs are skipped with a warning. (BLOCKER 5)
-- **`destroy_fn` return type validated.** `ProviderCleanupPolicy.destroy()` checks the callback's return is a `CleanupResult` instance; if not, returns `CleanupResult(verdict=UNKNOWN, error="destroy_fn returned invalid result type ...")` so the orchestrator never sees a non-`CleanupResult`. (CONCERN 6)
-- **Unexpected `NO_CREDENTIALS` escalated to WARNING.** If the factory's CLI fallback path is bypassed and `NO_CREDENTIALS` reaches the orchestrator, that means the orphan was not cleaned up. Bumped from INFO to WARNING. (CONCERN 7)
-- **`VastaiRunner.destroy_instance` logs the typed result.** The runner keeps the single adapter call but logs `DestroyResult` verdict/refusal + diagnostic context before returning `False`. No v2 inline destroy logic reintroduced. (CONCERN 8)
+- **Removed the v4 `providers/destroy.py` block.** The doc no longer claims to add or redefine `DestroyVerdict` / `DestroyRefusal` / `DestroyResult`. v3's `providers/destroy.py` is referenced as the authoritative source; the v4 migration checklist makes v3 implementation a hard prerequisite (either land v3 first or merge v3 as part of the same PR). (BLOCKER 2)
+- **`DestroyResult` not redefined.** The v4 doc references v3's `DestroyResult` verbatim — `attempts: int = 0`, `stop_error: str | None = None`, `last_status_code: int | None = None`, `verify_error: str | None = None`, with v3's invariants (`attempts == 0` for refusal, `attempts >= 1` for verdict, no protocol context on refusals). The v4 doc's diagnostic helper reads fields by name (order-independent). (BLOCKER 1)
+- **`_describe_destroy_result` consolidated and enriched.** Single shared helper in `providers/vastai.py`, used by both the runner and the factory. Output includes `verdict` and `refusal` (not just attempts + errors) so the fallback "unrecognised result" log exposes the actual typed outcome. (CONCERN 3)
+- **`cli.py:instances` migration expanded.** The migration step now requires `OwnershipPolicy` construction (with comma trimming like `cleanup`), `ownership.matches(candidate.ownership_key)` for the "Owned" column (no v2 substring match), and tests covering malicious prefixes, registry ports, tags, digests, and empty sets. (CONCERN 4)
+- **`OwnershipPolicy.matches` narrowed for strict type checking.** `self._normalised` is read into a local `normalised` variable; the function returns `False` if `normalised is None`, otherwise tests membership. Pyright strict mode can now infer the invariant. (CONCERN 5)
+- **Unused imports removed.** `Iterable` and `StrEnum` are no longer imported in `cleanup_policy.py`; `Optional` is no longer imported in `providers/vastai.py`. (NIT 6)
+
+### Applied from the 8th-pass review (fifth pass)
+
+- Module ownership corrected (destroy types in `providers.destroy`, imports in adapter and runner).
+- `read_vastai_api_key` env-first.
+- Empty `--allowed-images` fail-closed.
+- Null provider ID rejected.
+- `destroy_fn` return type validated.
+- `NO_CREDENTIALS` WARNING.
+- `VastaiRunner.destroy_instance` typed logging.
 
 ### Applied from the 7th-pass review (fourth pass)
 
-- ABSENT-credential CLI fallback (factory intercepts `NO_CREDENTIALS`).
-- Correct v3 `DestroyResult` translation (no `result.error`, use `_describe()`).
-- `VastaiRunner.destroy_instance` delegation (superseded by CONCERN 8 above).
-- Non-empty catch error (`f"{type(exc).__name__}: {exc}"`).
-- `build_vastai_cleanup_policy(*, ownership, credentials)` direct args.
-- `instance_id` non-empty validation (superseded by BLOCKER 5 above).
-- `_normalised` declared as `field(init=False, repr=False, compare=False)`.
-- `CredentialState(StrEnum)`.
-- `VASTAI_TERMINAL_STATES` (negative allowlist).
-- Severity logging (LEAKED = ERROR, etc.).
-- `--allowed-images` canonical (superseded by BLOCKER 4 above).
-- Historical `is_candidate` reference removed.
+- ABSENT-credential CLI fallback.
+- Correct v3 `DestroyResult` translation.
+- `VastaiRunner.destroy_instance` delegation.
+- Non-empty catch error.
 
 ### Applied from the 6th-pass review (third pass)
 
-- `_repository(image_ref)` strips digest, strips only the final tag separator, preserves registry and port.
+- `_repository` strips digest, strips only the final tag separator, preserves registry and port.
 - Runner and adapter consume `OwnershipPolicy.matches()` directly.
-- v3 type names used exactly.
 - `EXPLICITLY_DISABLED` short-circuits before enumeration.
-- `docker_image` non-empty + pre-stripped invariant.
-- Undefined names fixed (logger import, OwnershipPolicy imports).
+- `docker_image` non-empty invariant.
 - `CleanupResult` invariants tightened.
-- Authoritative eligibility implemented (later replaced by negative terminal-states list).
-- `InstanceCandidate` enriched with `gpu_model`, `cost_per_hour`, `ownership_key`.
+- Authoritative eligibility (later replaced by negative terminal-states list).
 
 ### Applied from the 5th-pass review (second pass)
 
@@ -138,28 +147,30 @@ fifth draft addresses every finding.
 - `list_instances_fn` + `list_instances()` method on the policy.
 - `destroy()` is authoritative.
 - Hostile check removed.
-- `OwnershipPolicy.matches()` introduced.
 - CLI uses `dataclasses.replace`.
 - Provider factories moved to `providers/vastai.py`.
-- `CleanupResult` invariants added.
-- `from_runpod_config` removed.
 - Migration order revised.
+
+### Applied from the 5th-pass review (first draft)
+
+- Initial structural fixes from the first review.
 
 ## Module taxonomy
 
-The v4 doc adds one new module at the layer above the v3 destroy
-protocol. The `CloudRunner` ABC, `BatchOrchestrator`, `unit_lifecycle`,
-`providers/destroy`, and `providers/destroy_adapters/vastai` are
-unchanged in shape (v3 implementation is still a prerequisite).
+The v4 doc adds one new module (`cleanup_policy.py`) and modifies two
+existing modules (`providers/destroy_adapters/vastai.py` and
+`providers/vastai.py`). The v3 modules (`providers/destroy.py`,
+`unit_lifecycle.py`, `BatchOrchestrator`, `CloudRunner`) are
+referenced unchanged.
 
 ### Module ownership (clarified)
 
-| Module | Owns |
-|---|---|
-| `providers/destroy.py` (v3) | `DestroyVerdict`, `DestroyRefusal`, `DestroyResult` (canonical destroy types) |
-| `providers/destroy_adapters/vastai.py` (v3 + v4) | `CredentialState`, `CredentialResolution`, `read_vastai_api_key()` (env-first), `destroy_vastai_instance()` (amended signature: `ownership: OwnershipPolicy`, `credentials: CredentialResolution \| None`) |
-| `providers/vastai.py` (v4) | `VastaiProviderConfig`, `VastaiRunner` (delegates destroy to v3 adapter), `vastai_cmd`, `verify_instance_ownership`, `list_vastai_instances()`, `build_vastai_cleanup_policy()`, `VASTAI_TERMINAL_STATES` |
-| `cleanup_policy.py` (v4) | `OwnershipPolicy`, `InstanceCandidate`, `CleanupVerdict`, `CleanupRefusal`, `CleanupResult`, `ProviderCleanupPolicy` |
+| Module | Owns | v4 changes |
+|---|---|---|
+| `providers/destroy.py` (v3 prerequisite) | `DestroyVerdict`, `DestroyRefusal`, `DestroyResult`, `VerifyVerdict`, `VerifyResult`, `DestroyPolicy`, callback protocols, `belt_and_suspenders` | None — referenced verbatim |
+| `providers/destroy_adapters/vastai.py` (v3 + v4) | `CredentialState`, `CredentialResolution`, `read_vastai_api_key()` (env-first), `destroy_vastai_instance()` (amended signature) | Env-first credentials; amended adapter signature |
+| `providers/vastai.py` (v4) | `VastaiProviderConfig`, `VastaiRunner`, `vastai_cmd`, `verify_instance_ownership`, `list_vastai_instances()`, `build_vastai_cleanup_policy()`, `_describe_destroy_result`, `VASTAI_TERMINAL_STATES` | Many (see diff) |
+| `cleanup_policy.py` (v4) | `OwnershipPolicy`, `InstanceCandidate`, `CleanupVerdict`, `CleanupRefusal`, `CleanupResult`, `ProviderCleanupPolicy` | New module |
 
 The core `cleanup_policy.py` module imports nothing from `providers/`.
 The `providers/vastai.py` module imports from both `providers/destroy`
@@ -213,9 +224,10 @@ RunPod adapter (roadmap item 2).
 ├─────────────────────────────────────────────────┤
 │  unit_lifecycle (unit_lifecycle.py)             │  v3: decision tree, no side effects
 ├─────────────────────────────────────────────────┤
-│  providers/destroy (providers/destroy.py)       │  v3: canonical DestroyResult types
-│    └── DestroyVerdict | DestroyRefusal |        │
-│        DestroyResult                            │
+│  providers/destroy (providers/destroy.py)       │  v3 PREREQUITE: belt-and-suspenders
+│    └── DestroyVerdict | DestroyRefusal |        │  protocol + canonical types
+│        DestroyResult | belt_and_suspenders |   │
+│        DestroyPolicy | callback protocols       │
 ├─────────────────────────────────────────────────┤
 │  providers/destroy_adapters/vastai.py           │  v3 + v4: Vast.ai adapter
 │    └── CredentialState | CredentialResolution | │
@@ -239,9 +251,8 @@ imports and references resolve within one block.
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable
 from dataclasses import dataclass, field
-from enum import Enum, StrEnum
+from enum import Enum
 from typing import AbstractSet, Callable, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -340,15 +351,23 @@ class OwnershipPolicy:
         the tag-insensitive repository of ``image_ref`` matches
         the tag-insensitive repository of any entry in
         ``owned_images``.
+
+        The local ``normalised`` variable narrows the
+        ``_normalised`` type so Pyright strict mode can infer the
+        cross-field invariant (when ``owned_images is not None``,
+        ``_normalised`` is a frozenset, not None).
         """
+        normalised = self._normalised
         if self.owned_images is None:
             return True
+        if normalised is None:
+            return False
         if not image_ref:
             return False
         repo = _repository(image_ref)
         if not repo:
             return False
-        return repo in self._normalised
+        return repo in normalised
 
 
 # ---------------------------------------------------------------------------
@@ -504,7 +523,7 @@ class ProviderCleanupPolicy:
         on every call, then delegates to ``destroy_fn`` which
         applies eligibility / ownership / credential checks.
 
-        Never raises. Two safety guarantees:
+        Never raises. Three safety guarantees:
 
         1. The catch-all uses ``f"{type(exc).__name__}: {exc}"``
            so the error string is always non-empty (preserves
@@ -554,89 +573,12 @@ class ProviderCleanupPolicy:
         return result
 ```
 
-## `providers/destroy.py` — v3 canonical destroy types (NEW)
+## `providers/destroy_adapters/vastai.py` — v3 + v4 amendments
 
-The v3 design places the canonical destroy types here. The v4 design
-uses them unchanged.
-
-```python
-# src/vastai_gpu_runner/providers/destroy.py
-from __future__ import annotations
-
-from dataclasses import dataclass
-from enum import StrEnum
-from typing import Optional
-
-
-class DestroyVerdict(StrEnum):
-    """Outcome verdicts returned by the v3 belt-and-suspenders protocol.
-
-    Three values. ``CLI_ATTEMPTED`` is NOT a v3 verdict — it is a v4
-    ``CleanupVerdict`` produced by the factory's CLI fallback path.
-    """
-    DESTROYED = "destroyed"
-    LEAKED = "leaked"
-    UNKNOWN = "unknown"
-
-
-class DestroyRefusal(StrEnum):
-    """Pre-protocol refusal reasons returned by ``destroy_vastai_instance``."""
-    OWNERSHIP = "ownership"
-    NO_CREDENTIALS = "no_credentials"
-    CREDENTIALS_DISABLED = "credentials_disabled"
-
-
-@dataclass(frozen=True)
-class DestroyResult:
-    """Outcome of the v3 belt-and-suspenders destroy protocol.
-
-    Exactly one of ``verdict`` (DestroyVerdict) or ``refusal``
-    (DestroyRefusal) is set — never both. Optional diagnostic
-    fields carry the per-step status and error context. No
-    generic ``error`` field exists — refusals use the structured
-    refusal reason, verdicts use the per-step diagnostic fields.
-
-    Invariants (enforced in ``__post_init__``):
-        - Exactly one of ``verdict`` / ``refusal`` is set.
-        - Refusals carry no protocol context (the diagnostic
-          fields are at their defaults).
-        - Verdict outcomes require at least one attempt.
-    """
-    verdict: Optional[DestroyVerdict] = None
-    refusal: Optional[DestroyRefusal] = None
-    attempts: Optional[int] = None
-    last_status_code: Optional[int] = None
-    stop_error: Optional[str] = None
-    verify_error: Optional[str] = None
-
-    def __post_init__(self) -> None:
-        if (self.verdict is None) == (self.refusal is None):
-            raise ValueError(
-                "DestroyResult: exactly one of verdict or refusal must be set"
-            )
-        if self.refusal is not None:
-            if (
-                self.attempts is not None
-                or self.last_status_code is not None
-                or self.stop_error is not None
-                or self.verify_error is not None
-            ):
-                raise ValueError(
-                    "DestroyResult: refusal must not carry protocol context"
-                )
-        else:
-            # verdict is set; require at least one attempt.
-            if self.attempts is None or self.attempts < 1:
-                raise ValueError(
-                    "DestroyResult: verdict outcomes require attempts >= 1"
-                )
-```
-
-## `providers/destroy_adapters/vastai.py` — v3 + v4 additions
-
-The credential types + the env-first resolver + the amended
-`destroy_vastai_instance` signature. The adapter imports the
-destroy types from `providers/destroy.py` (not redefined here).
+The v3 design's `CredentialState` + `CredentialResolution` types plus
+the amended `destroy_vastai_instance` signature. The adapter
+**imports** the destroy types from `providers/destroy.py` (v3
+prerequisite); it does not redefine them.
 
 ```python
 # src/vastai_gpu_runner/providers/destroy_adapters/vastai.py
@@ -649,7 +591,6 @@ import time
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Optional
 
 from vastai_gpu_runner.cleanup_policy import OwnershipPolicy
 from vastai_gpu_runner.providers.destroy import (
@@ -760,7 +701,7 @@ def read_vastai_api_key() -> CredentialResolution:
 
 
 # ---------------------------------------------------------------------------
-# destroy_vastai_instance — amended signature
+# destroy_vastai_instance — amended signature (v4)
 # ---------------------------------------------------------------------------
 
 
@@ -768,7 +709,7 @@ def destroy_vastai_instance(
     instance_id: str,
     *,
     ownership: OwnershipPolicy,
-    credentials: Optional[CredentialResolution] = None,
+    credentials: CredentialResolution | None = None,
 ) -> DestroyResult:
     """Stop + delete + verify a Vast.ai instance.
 
@@ -802,10 +743,11 @@ def destroy_vastai_instance(
         return DestroyResult(refusal=DestroyRefusal.CREDENTIALS_DISABLED)
     if resolution.state == CredentialState.ABSENT:
         return DestroyResult(refusal=DestroyRefusal.NO_CREDENTIALS)
-    # AVAILABLE: REST path.
-    # ... ownership check via API, belt-and-suspenders, return
-    # DestroyResult with verdict=DESTROYED/LEAKED/UNKNOWN and the
-    # structured diagnostic fields populated ...
+    # AVAILABLE: REST path. The implementation calls
+    # belt_and_suspenders(stop_fn, delete_fn, verify_fn, *, policy)
+    # from providers/destroy.py, with the v3 policy. The runner
+    # and the cleanup adapter both delegate to this entry point
+    # via this function — they do NOT have inline REST logic.
 ```
 
 ## `providers/vastai.py` — full module updates
@@ -814,8 +756,8 @@ The `VastaiProviderConfig`, `VastaiRunner`, `list_vastai_instances`,
 and `build_vastai_cleanup_policy` shapes. The destroy types are
 imported from `providers/destroy.py`; the credential types and the
 adapter are imported from `providers/destroy_adapters/vastai.py`.
-The local `vastai_cmd` and `verify_instance_ownership` helpers are
-not imported from elsewhere.
+The local `vastai_cmd`, `verify_instance_ownership`, and
+`_describe_destroy_result` helpers are not imported from elsewhere.
 
 ```python
 # src/vastai_gpu_runner/providers/vastai.py
@@ -828,7 +770,7 @@ import time
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import AbstractSet, Optional
+from typing import AbstractSet
 
 from vastai_gpu_runner.cleanup_policy import (
     CleanupRefusal,
@@ -933,6 +875,29 @@ def verify_instance_ownership(
             return False
     logger.info("Instance %s not found in account (already destroyed?)", instance_id)
     return True
+
+
+# ---------------------------------------------------------------------------
+# _describe_destroy_result — single shared diagnostic helper
+# ---------------------------------------------------------------------------
+
+
+def _describe_destroy_result(result: DestroyResult) -> str:
+    """Build diagnostic text from v3 DestroyResult structured fields.
+
+    Single shared helper used by both ``VastaiRunner.destroy_instance``
+    and ``build_vastai_cleanup_policy._destroy``. Includes verdict +
+    refusal so the fallback "unrecognised result" log exposes the
+    actual typed outcome. Handles ``None`` fields gracefully (v3 uses
+    optional diagnostics). Always produces non-empty output.
+    """
+    return (
+        f"verdict={result.verdict!r}, refusal={result.refusal!r}, "
+        f"attempts={result.attempts}, "
+        f"last_status_code={result.last_status_code}, "
+        f"verify_error={result.verify_error!r}, "
+        f"stop_error={result.stop_error!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1122,53 +1087,39 @@ class VastaiRunner(CloudRunner):
             logger.error(
                 "Destroy %s LEAKED — manual review required: %s",
                 instance.instance_id,
-                _describe(result),
+                _describe_destroy_result(result),
             )
         elif result.verdict == DestroyVerdict.UNKNOWN:
             logger.warning(
                 "Destroy %s outcome=UNKNOWN: %s",
                 instance.instance_id,
-                _describe(result),
+                _describe_destroy_result(result),
             )
         elif result.refusal == DestroyRefusal.OWNERSHIP:
             logger.error(
                 "Destroy %s refused (ownership check rejected): %s",
                 instance.instance_id,
-                _describe(result),
+                _describe_destroy_result(result),
             )
         elif result.refusal == DestroyRefusal.NO_CREDENTIALS:
             logger.error(
                 "Destroy %s refused (no credentials): %s",
                 instance.instance_id,
-                _describe(result),
+                _describe_destroy_result(result),
             )
         elif result.refusal == DestroyRefusal.CREDENTIALS_DISABLED:
             logger.error(
                 "Destroy %s refused (credentials disabled): %s",
                 instance.instance_id,
-                _describe(result),
+                _describe_destroy_result(result),
             )
         else:
             logger.error(
                 "Destroy %s returned unrecognised result: %s",
                 instance.instance_id,
-                _describe(result),
+                _describe_destroy_result(result),
             )
         return False
-
-
-def _describe(result: DestroyResult) -> str:
-    """Build diagnostic text from v3 DestroyResult structured fields.
-
-    Handles ``None`` fields gracefully (v3 uses optional diagnostics).
-    Always produces non-empty output.
-    """
-    return (
-        f"attempts={result.attempts}, "
-        f"last_status={result.last_status_code}, "
-        f"verify_error={result.verify_error!r}, "
-        f"stop_error={result.stop_error!r}"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -1372,7 +1323,8 @@ def build_vastai_cleanup_policy(
                 refusal=CleanupRefusal.OWNERSHIP,
                 error=(
                     f"v3 adapter refused: ownership check rejected "
-                    f"{candidate.instance_id!r}"
+                    f"{candidate.instance_id!r}; "
+                    f"{_describe_destroy_result(result)}"
                 ),
             )
         if result.refusal == DestroyRefusal.CREDENTIALS_DISABLED:
@@ -1400,20 +1352,6 @@ def build_vastai_cleanup_policy(
         ownership=ownership,
         list_instances_fn=_list_instances,
         destroy_fn=_destroy,
-    )
-
-
-def _describe_destroy_result(result: DestroyResult) -> str:
-    """Build diagnostic text from v3 DestroyResult structured fields.
-
-    Handles ``None`` fields gracefully (v3 uses optional diagnostics).
-    Always produces non-empty output.
-    """
-    return (
-        f"attempts={result.attempts}, "
-        f"last_status={result.last_status_code}, "
-        f"verify_error={result.verify_error!r}, "
-        f"stop_error={result.stop_error!r}"
     )
 ```
 
@@ -1518,7 +1456,9 @@ The CLI is the one place that builds the canonical config (for the
 runner) and the two canonical objects (for the cleanup policy). It
 threads both into the v3 + v4 entry points. Empty
 `--allowed-images` is **fail-closed** (empty set, reject every
-image), not opt-out.
+image), not opt-out. The `cli.py:instances` command's "Owned"
+column uses `OwnershipPolicy.matches()` (the v2 unsafe substring
+match is removed).
 
 ```python
 # src/vastai_gpu_runner/cli.py (new "batch" subcommand)
@@ -1656,23 +1596,101 @@ def cleanup(
     console.print(f"\nDestroyed {destroyed}/{len(matches)} instance(s).")
 ```
 
+The `cli.py:instances` command migrates to use `list_vastai_instances`
+and the v4 `OwnershipPolicy.matches()` for the "Owned" column. The
+v2 unsafe substring/prefix match is removed.
+
+```python
+# src/vastai_gpu_runner/cli.py (instances command)
+@app.command()
+def instances(
+    verbose: Annotated[bool, typer.Option("--verbose", "-v")] = False,
+    allowed_images: Annotated[
+        str | None,
+        typer.Option(
+            "--allowed-images",  # canonical
+            "--owned-images",     # alias
+            help=(
+                "Comma-separated Docker images owned by this project. "
+                "Used for the 'Owned' column. Empty string → fail-closed "
+                "(every instance shown as not owned)."
+            ),
+        ),
+    ] = None,
+) -> None:
+    """List active Vast.ai instances with status and ownership info."""
+    _setup_logging(verbose)
+    from rich.console import Console
+    from rich.table import Table
+    from vastai_gpu_runner.cleanup_policy import OwnershipPolicy
+
+    console = Console()
+    candidates = list_vastai_instances()
+    if not candidates:
+        console.print("No active instances.")
+        return
+
+    # Comma trimming matches the cleanup command. None → opt-out.
+    if allowed_images is None:
+        ownership = OwnershipPolicy()
+    else:
+        images = frozenset(
+            item.strip()
+            for item in allowed_images.split(",")
+            if item.strip()
+        )
+        ownership = OwnershipPolicy(owned_images=images)
+
+    table = Table(title=f"{len(candidates)} Active Instance(s)")
+    table.add_column("ID", style="cyan")
+    table.add_column("GPU")
+    table.add_column("Status")
+    table.add_column("Label")
+    table.add_column("$/hr", justify="right", style="green")
+    table.add_column("Owned", justify="center")
+
+    total_hourly = 0.0
+    running = 0
+    for c in candidates:
+        owned = ownership.matches(c.ownership_key)
+        total_hourly += c.cost_per_hour
+        if c.state == "running":
+            running += 1
+        table.add_row(
+            c.instance_id,
+            c.gpu_model,
+            c.state,
+            c.label,
+            f"${c.cost_per_hour:.3f}",
+            "[green]yes[/green]" if owned else "[red]no[/red]",
+        )
+
+    console.print(table)
+    console.print(f"\nRunning: {running}/{len(candidates)}, Total: ${total_hourly:.2f}/hr")
+```
+
 ## Migration checklist
 
-Seven steps. Each step is independently testable but the rollout
-lands as one PR because the intermediate states are not stable.
+Seven steps. The v3 implementation is a **hard prerequisite**:
+either land v3 first or merge v3 as part of the same PR. The v4
+steps then build on v3's `providers/destroy.py` module
+(`DestroyVerdict`, `DestroyRefusal`, `DestroyResult`, `VerifyVerdict`,
+`VerifyResult`, `DestroyPolicy`, callback protocols,
+`belt_and_suspenders`).
 
-1. **Add canonical credential + ownership-policy types + invariants + contract tests.**
-   - `cleanup_policy.py:OwnershipPolicy` (frozen, `matches(image_ref)` with `_repository`; declared `_normalised` cache field).
-   - `providers/destroy.py:DestroyVerdict` (StrEnum: `DESTROYED | LEAKED | UNKNOWN`), `DestroyRefusal` (StrEnum: `OWNERSHIP | NO_CREDENTIALS | CREDENTIALS_DISABLED`), `DestroyResult` (frozen dataclass with `__post_init__` invariants).
-   - `providers/destroy_adapters/vastai.py:CredentialState` (StrEnum) + `CredentialResolution` (frozen dataclass).
-   - Property tests: `OwnershipPolicy.matches` is reflexive, tag-insensitive, sha256-by-repo, registry-port-aware, fail-closed on empty sets and malformed references.
-   - `CredentialResolution` invariants: AVAILABLE requires non-empty pre-stripped key; ABSENT and EXPLICITLY_DISABLED require empty key.
-   - `DestroyResult` invariants: exactly one of verdict/refusal, no protocol context on refusals, ≥1 attempt on verdict outcomes.
+1. **Land v3 implementation.** Implement the `unit_lifecycle.py`,
+   `providers/destroy.py` (with `belt_and_suspenders`, `DestroyPolicy`,
+   `DestroyVerdict`, `DestroyRefusal`, `DestroyResult`, `VerifyVerdict`,
+   `VerifyResult`, callback protocols), and `providers/destroy_adapters/vastai.py`
+   (with the v3-shape credential types, `read_vastai_api_key()`,
+   and the amended `destroy_vastai_instance()` signature). This must
+   land first because v4 amends v3's adapter signature and references
+   v3's `DestroyResult` / `DestroyVerdict` / `DestroyRefusal` types.
 
-2. **Amend v3 adapter with v4 signature + env-first resolver.**
-   - `destroy_vastai_instance(instance_id, *, ownership: OwnershipPolicy, credentials: CredentialResolution | None = None) -> DestroyResult`. Back-compat: `credentials=None` calls `read_vastai_api_key()`.
-   - `read_vastai_api_key()` env-first: inspect `VASTAI_API_KEY` first (empty → `EXPLICITLY_DISABLED`, non-empty → `AVAILABLE`); fall back to file paths (blank/unreadable → warning + `ABSENT`, not disabled); catch `OSError`.
-   - Adapter tests: ownership match uses `OwnershipPolicy.matches()`; credential state drives refusal type; AVAILABLE runs the REST path; ABSENT returns `NO_CREDENTIALS`; EXPLICITLY_DISABLED returns `CREDENTIALS_DISABLED`.
+2. **Add canonical ownership-policy type + invariant tests.**
+   - `cleanup_policy.py:OwnershipPolicy` (frozen, `matches(image_ref)` with `_repository`; declared `_normalised` cache field, narrowed for strict type checking).
+   - Property tests: `OwnershipPolicy.matches` is reflexive, tag-insensitive, sha256-by-repo, registry-port-aware, fail-closed on empty sets, malformed reference rejection.
+   - The `_normalised` is precomputed in `__post_init__`; `matches` is O(1) per call.
 
 3. **Add Vast.ai runner + cleanup adapter.**
    - `providers/vastai.py:VastaiProviderConfig` (frozen, with `__post_init__` invariants).
@@ -1682,6 +1700,7 @@ lands as one PR because the intermediate states are not stable.
    - `verify_instance_ownership(instance_id, *, ownership: OwnershipPolicy)` — local to `providers/vastai.py`, replaces `_image_is_allowed`.
    - `list_vastai_instances()` returns `list[InstanceCandidate]`; validates `inst` is dict, `id` is not `None`, `instance_id` is non-empty after strip.
    - `VASTAI_TERMINAL_STATES: frozenset[str]` module constant.
+   - `_describe_destroy_result(result)` — single shared diagnostic helper with `verdict` + `refusal` + structured fields.
    - `build_vastai_cleanup_policy(*, ownership: OwnershipPolicy, credentials: CredentialResolution) -> ProviderCleanupPolicy`.
    - Adapter tests:
      - EXPLICITLY_DISABLED: `list_instances()` returns `[]` without invoking `vastai_cmd`.
@@ -1705,7 +1724,7 @@ lands as one PR because the intermediate states are not stable.
 5. **Update every composition root, subclass, and existing CLI command.**
    - `cli.py:batch`: build `VastaiProviderConfig` via `from_env()` + `replace()`, pass to `VastaiRunner.from_config` and `build_vastai_cleanup_policy(ownership, credentials)`.
    - `cli.py:cleanup`: build `OwnershipPolicy` and `CredentialResolution` directly (no `VastaiProviderConfig`); distinguish `None` (opt-out) from `""` (fail-closed).
-   - `cli.py:instances`: use `list_vastai_instances()` for the table. `--allowed-images` canonical, `--owned-images` alias.
+   - `cli.py:instances`: use `list_vastai_instances()` for the table; construct `OwnershipPolicy` (with comma trimming like `cleanup`); call `ownership.matches(candidate.ownership_key)` for the "Owned" column. The v2 unsafe substring/prefix match (`any(img.split(":")[0] in image for img in images_set)`) is **removed**.
    - `BatchOrchestrator` subclasses: update composition to supply `cleanup_policy`.
    - Test fixtures: `VastaiProviderConfig` + `OwnershipPolicy` + `CredentialResolution` factory fixtures.
 
@@ -1724,12 +1743,14 @@ lands as one PR because the intermediate states are not stable.
      - **CLI --allowed-images None**: opt-out (every image considered owned).
      - **destroy_fn returns None**: orchestrator receives `CleanupResult(verdict=UNKNOWN, error="...invalid result type NoneType")`.
      - **VastaiRunner logs typed result**: LEAKED outcome produces an `ERROR`-level log line with the structured diagnostic context.
+     - **instances command ownership column**: malicious prefix `myorg/app-malicious:latest` shown as `no` when `--allowed-images myorg/app:1.0`; tag-insensitive `myorg/app:latest` shown as `yes`; registry-port `registry:5000/myorg/app:1.0` shown as `no` when `--allowed-images myorg/app`; empty set `--allowed-images ""` shows every instance as `no`.
 
 7. **Delete legacy sweep + duplicated helpers after a repository-wide caller audit.**
-   - `audit_caller_sites.sh` (run before deletion): grep for external callers of `orchestrator.sweep_zombie_instances`, `orchestrator.load_vastai_api_key`, `VastaiRunner.allowed_images` (read-only external use), `providers.vastai._image_is_allowed`. Update external callers.
+   - `audit_caller_sites.sh` (run before deletion): grep for external callers of `orchestrator.sweep_zombie_instances`, `orchestrator.load_vastai_api_key`, `VastaiRunner.allowed_images` (read-only external use), `providers.vastai._image_is_allowed`, `cli.instances`'s substring match. Update external callers.
    - Delete `orchestrator.sweep_zombie_instances`.
    - Delete `orchestrator.load_vastai_api_key`.
    - Delete `providers/vastai.py:_image_is_allowed`.
+   - Delete the v2 substring/prefix match in `cli.py:instances`.
    - Delete direct `vastai_cmd(["show", "instances", "--raw"])` parsing in `cli.py:cleanup` and `cli.py:instances`.
    - Update `tests/test_orchestrator.py` and `tests/test_batch.py` to mock `cleanup_policy.list_instances` and `cleanup_policy.destroy`.
 
@@ -1737,14 +1758,12 @@ lands as one PR because the intermediate states are not stable.
 
 - `tests/test_cleanup_policy.py`:
   - `_repository`: 13+ cases (digest, registry ports, malformed, empty, whitespace).
-  - `OwnershipPolicy.matches`: reflexive, tag-insensitive, sha256-by-repo, registry-port-aware, fail-closed on empty sets, malformed reference rejection.
+  - `OwnershipPolicy.matches`: reflexive, tag-insensitive, sha256-by-repo, registry-port-aware, fail-closed on empty sets, malformed reference rejection, narrow type-checked.
   - `OwnershipPolicy._normalised`: declared field; precomputed in `__post_init__`; `matches` is O(1) per call.
   - `ProviderCleanupPolicy.list_instances`: returns wired list; catches and returns `[]` on exception.
   - `ProviderCleanupPolicy.destroy`: provider mismatch returns `PROVIDER_MISMATCH`; catches `destroy_fn` exceptions with `f"{type(exc).__name__}: {exc}"` (non-empty even for `RuntimeError()` with no message); validates `destroy_fn` return is `CleanupResult` (returns `CleanupResult(verdict=UNKNOWN, ...)` on `None` or non-`CleanupResult`).
   - `CleanupResult` invariants: 5 cases (verdict/refusal exclusivity, error non-empty on non-DESTROYED, error empty on DESTROYED).
   - `InstanceCandidate.__post_init__`: empty `instance_id` raises; whitespace-only `instance_id` raises.
-- `tests/test_providers_destroy.py`:
-  - `DestroyResult` invariants: exactly one of verdict/refusal; refusal must not carry protocol context; verdict requires ≥1 attempt.
 - `tests/test_providers_vastai.py`:
   - `read_vastai_api_key` env-first: `VASTAI_API_KEY=""` → `EXPLICITLY_DISABLED`; `VASTAI_API_KEY="key"` → `AVAILABLE`; no env + file → `AVAILABLE`; no env + blank file → `ABSENT` (with warning); `OSError` → `ABSENT` (with warning).
   - `VastaiRunner.from_config` round-trips with `VastaiProviderConfig`.
@@ -1767,7 +1786,7 @@ lands as one PR because the intermediate states are not stable.
   - `_sweep_zombies` logs `LEAKED` at `ERROR`, `UNKNOWN` / `CLI_ATTEMPTED` / `CREDENTIALS_DISABLED` at `WARNING`, unexpected `NO_CREDENTIALS` at `WARNING`, refusals at `INFO` (`caplog`).
   - `_sweep_zombies` continues on `destroy_fn` exceptions.
   - `_sweep_zombies` does NOT import provider modules (`inspect.getsource`).
-- `tests/integration/test_cleanup_policy_integration.py` — 13 scenarios from step 6 above.
+- `tests/integration/test_cleanup_policy_integration.py` — 14 scenarios from step 6 above.
 
 ## Backwards compatibility
 
@@ -1785,7 +1804,8 @@ The `cli.py:cleanup` and `cli.py:instances` commands are refactored
 in v4 step 5. The `--allowed-images` flag is preserved as canonical;
 `--owned-images` is added as a documented alias. Empty
 `--allowed-images ""` is **fail-closed** (not opt-out) — this is a
-behaviour change from the previous CLI default.
+behaviour change from the previous CLI default. The v2 substring
+match in `cli.py:instances` is removed.
 
 ## Out of scope
 
@@ -1800,11 +1820,11 @@ behaviour change from the previous CLI default.
 
 ## Review process
 
-This is the fifth review pass on the v4 architecture. Each prior
+This is the sixth review pass on the v4 architecture. Each prior
 draft was rejected and addressed. This draft addresses every
-finding from the 8th-pass review.
+finding from the 9th-pass review.
 
-The fifth review prompt for ChatGPT-with-GitHub-plugin:
+The sixth review prompt for ChatGPT-with-GitHub-plugin:
 
 > Review the v4 architecture design at PR #22 (file:
 > docs/architecture-v4-cleanup-policy.md) against the v3 design at
@@ -1813,83 +1833,77 @@ The fifth review prompt for ChatGPT-with-GitHub-plugin:
 > src/vastai_gpu_runner/providers/vastai.py. The v4 design
 > resolves issue #19.
 >
-> The fourth draft was rejected with 5 BLOCKERs and 3 CONCERNs.
-> Verify each finding is addressed:
+> The fifth draft was rejected with 2 BLOCKERs, 2 CONCERNs, and
+> 1 NIT. Verify each finding is addressed:
 >
-> 1. **BLOCKER 1 (module ownership)**: confirm
->    `DestroyVerdict` / `DestroyRefusal` / `DestroyResult` are
->    defined in `providers/destroy.py` (NOT in the Vast.ai
->    adapter). Confirm `providers/vastai.py` imports them from
->    `providers.destroy`, not from
->    `providers.destroy_adapters.vastai`. Confirm `vastai_cmd`
->    and `verify_instance_ownership` are local to
->    `providers/vastai.py` (no import from the adapter).
-> 2. **BLOCKER 2 (env-first credentials)**: confirm
->    `read_vastai_api_key()` inspects `VASTAI_API_KEY` first
->    (empty → `EXPLICITLY_DISABLED`, non-empty → `AVAILABLE`),
->    then falls back to file paths (blank/unreadable → warning +
->    `ABSENT`). Confirm `OSError` is caught.
-> 3. **BLOCKER 3 (DestroyResult verbatim)**: confirm
->    `DestroyResult` is NOT redefined in the adapter; confirm
->    the v3 types from `providers.destroy` use optional fields
->    and `__post_init__` invariants. Confirm `_describe()`
->    handles `None` fields.
-> 4. **BLOCKER 4 (empty --allowed-images fail-closed)**:
->    confirm the cleanup CLI distinguishes `None` (opt-out)
->    from `""` (fail-closed empty set). Confirm whitespace-only
->    entries in comma-separated input are stripped.
-> 5. **BLOCKER 5 (null ID rejected)**: confirm
->    `list_vastai_instances` checks `inst` is a dict, then
->    checks `inst.get("id") is None` explicitly (catches
->    JSON `null` before `str()` converts to `"None"`).
-> 6. **CONCERN 6 (destroy_fn return validated)**: confirm
->    `ProviderCleanupPolicy.destroy()` checks `isinstance(result,
->    CleanupResult)` and substitutes `CleanupResult(verdict=UNKNOWN,
->    ...)` when the callback returns `None` or non-`CleanupResult`.
-> 7. **CONCERN 7 (NO_CREDENTIALS WARNING)**: confirm unexpected
->    `NO_CREDENTIALS` is logged at `WARNING`, not `INFO`.
-> 8. **CONCERN 8 (runner logs typed result)**: confirm
->    `VastaiRunner.destroy_instance` logs the typed
->    `DestroyResult` (verdict/refusal + diagnostic context)
->    before returning `False` for non-`DESTROYED` outcomes.
+> 1. **BLOCKER 1 (DestroyResult verbatim)**: confirm the v4 doc
+>    does NOT redefine `DestroyResult`. The doc should reference
+>    v3's `providers/destroy.py` module as the authoritative
+>    source for `DestroyResult`, `DestroyVerdict`, `DestroyRefusal`.
+>    The v3 contract (per the reviewer) is:
+>    ```python
+>    attempts: int = 0
+>    stop_error: str | None = None
+>    last_status_code: int | None = None
+>    verify_error: str | None = None
+>    ```
+>    with refusal requiring `attempts == 0` and verdict requiring
+>    `attempts >= 1`. The v4 doc should not contradict this.
+> 2. **BLOCKER 2 (providers/destroy.py incomplete)**: confirm the
+>    v4 doc does NOT include a `providers/destroy.py` code block.
+>    The v3 prerequisite module is referenced as authoritative;
+>    v4 only amends the adapter's `destroy_vastai_instance`
+>    signature. Migration step 1 makes v3 implementation a hard
+>    prerequisite.
+> 3. **CONCERN 3 (duplicated _describe, omits verdict/refusal)**:
+>    confirm there is ONE shared `_describe_destroy_result`
+>    helper in `providers/vastai.py`, used by both
+>    `VastaiRunner.destroy_instance` and `build_vastai_cleanup_policy._destroy`.
+>    Confirm the helper includes `verdict` and `refusal` in the
+>    output (not just attempts + errors).
+> 4. **CONCERN 4 (instances command ownership migration)**: confirm
+>    migration step 5 expands the `cli.py:instances` migration:
+>    - construct `OwnershipPolicy` (with comma trimming like `cleanup`)
+>    - use `ownership.matches(candidate.ownership_key)` for the
+>      "Owned" column
+>    - tests covering malicious prefixes, registry ports, tags,
+>      digests, empty sets
+> 5. **CONCERN 5 (_normalised narrowing)**: confirm
+>    `OwnershipPolicy.matches` reads `self._normalised` into a
+>    local `normalised` variable and returns `False` if
+>    `normalised is None`, so Pyright strict mode can infer the
+>    invariant.
+> 6. **NIT 6 (unused imports)**: confirm `cleanup_policy.py` no
+>    longer imports `Iterable` or `StrEnum`; confirm
+>    `providers/vastai.py` no longer imports `Optional` (in the
+>    shown code).
 >
 > Additionally, identify any new BLOCKERs or CONCERNs introduced
-> by the fifth draft. Focus on:
+> by the sixth draft. Focus on:
 >
-> - The module boundary: does `providers/vastai.py` import
->   `DestroyRefusal` / `DestroyResult` / `DestroyVerdict` ONLY
->   from `providers.destroy` (and NOT from the adapter)?
-> - The env-first `read_vastai_api_key`: does the env-var
->   branch correctly handle `os.environ.get("VASTAI_API_KEY")`
->   returning `None` (unset), empty string, whitespace, and
->   non-empty?
-> - The `DestroyResult.__post_init__` invariants: does
->   `attempts >= 1` correctly accept `attempts=1`?
-> - The `_describe()` helpers (one in `providers/vastai.py`,
->   one in the factory): are they duplicated? Should they be
->   shared? Or are they acceptably local?
-> - The `list_vastai_instances` validation order: is the
->   `isinstance(inst, dict)` check before `inst.get("id")`?
->   Does the outer `try` block still catch `AttributeError`
->   on a non-dict element?
-> - The `build_vastai_cleanup_policy` import: does the
->   factory import `DestroyRefusal` / `DestroyResult` /
->   `DestroyVerdict` from `providers.destroy` (NOT from the
->   adapter)?
-> - The CLI cleanup command: does the empty `--allowed-images`
->   handling correctly distinguish `None` vs `""` vs
->   `","` vs `"a, ,b"`?
-> - The `VastaiRunner.destroy_instance` typed logging: is the
->   `_describe()` call correct? Are the log levels appropriate?
-> - The orchestrator's `NO_CREDENTIALS` WARNING: does the
->   conditional correctly handle the case where `refusal ==
->   NO_CREDENTIALS` but `verdict is None`?
-> - The `DestroyResult` invariants and the `_describe()` helper:
->   when `result.attempts is None` (shouldn't happen after
->   `__post_init__`, but defensively), does `_describe()`
->   produce non-empty output?
-> - The migration step 5: are the CLI changes correctly
->   described?
+> - The v3 prerequisite: does the migration checklist make it
+>   clear that v3 must be implemented first? Are the v3 module
+>   dependencies correctly listed (belt_and_suspenders,
+>   DestroyPolicy, VerifyVerdict, VerifyResult, callback
+>   protocols)?
+> - The `_describe_destroy_result` helper: is it called from
+>   both the runner's typed-result logging and the factory's
+>   refusal/verdict translation? Does it include all four
+>   structured fields plus verdict + refusal?
+> - The instances command code shape: does it correctly
+>   construct `OwnershipPolicy` with comma trimming? Does it use
+>   `ownership.matches(candidate.ownership_key)` (not the v2
+>   substring match)?
+> - The `OwnershipPolicy.matches` narrowing: does Pyright strict
+>   mode accept the local-variable pattern?
+> - The cleanup policy's `_destroy` callback: does it correctly
+>   call `_describe_destroy_result` for both verdict and refusal
+>   paths?
+> - The runner's `destroy_instance`: does it correctly log all
+>   typed outcomes (verdict + refusal + diagnostic context)?
+> - The migration checklist: are the v3 prerequisites explicit?
+> - The unused imports: any other imports that are no longer
+>   used?
 >
 > Return a labeled list of findings. Each finding is one of:
 > BLOCKER (must fix before merge), CONCERN (should fix, but not
