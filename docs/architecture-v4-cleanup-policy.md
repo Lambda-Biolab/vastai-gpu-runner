@@ -100,7 +100,7 @@ in `VastaiProviderConfig` (because the runner also needs
 `docker_image`, `setup_commands`, etc.); the cleanup-policy factory
 takes them directly.
 
-## What changes vs the v4 first + second + third + fourth + fifth + sixth + seventh + eighth + ninth + tenth + eleventh + twelfth + thirteenth + fourteenth + fifteenth + sixteenth + seventeenth + eighteenth + nineteenth drafts
+## What changes vs the v4 first + second + third + fourth + fifth + sixth + seventh + eighth + ninth + tenth + eleventh + twelfth + thirteenth + fourteenth + fifteenth + sixteenth + seventeenth + eighteenth + nineteenth + twentieth drafts
 
 The first draft was rejected with 5 BLOCKERs and 7 CONCERNs. The
 second draft was rejected with 7 BLOCKERs, 2 CONCERNs, and 3 NITs.
@@ -114,9 +114,25 @@ draft was rejected with 4 BLOCKERs, 2 CONCERNs, and 1 NIT. The tenth
 draft was rejected with 2 BLOCKERs, 1 CONCERN, and 1 NIT. The
 eleventh draft was rejected with 3 BLOCKERs and 2 CONCERNs. The twelfth
 draft was rejected with 2 BLOCKERs and 2 CONCERNs. The thirteenth
-draft was rejected with 3 BLOCKERs, 2 CONCERNs, and 1 NIT. This
-twentieth draft addresses every finding.
-### Applied from the 22nd-pass review (this pass)
+draft was rejected with 3 BLOCKERs, 2 CONCERNs, and 1 NIT. The
+thirteenth draft was rejected with 3 BLOCKERs, 2 CONCERNs, and 1 NIT.
+The fourteenth draft was rejected with 2 BLOCKERs and 2 CONCERNs. The
+fifteenth draft was rejected with 2 BLOCKERs and 2 CONCERNs. The
+sixteenth draft was rejected with 3 BLOCKERs and 2 CONCERNs. The
+seventeenth draft was rejected with 3 BLOCKERs and 2 CONCERNs. The
+eighteenth draft was rejected with 3 BLOCKERs and 2 CONCERNs. The
+nineteenth draft was rejected with 3 BLOCKERs and 3 CONCERNs. The
+twentieth draft was rejected with 3 BLOCKERs, 2 CONCERNs, and 1 NIT.
+This twenty-first draft addresses every finding.
+
+### Applied from the 24th-pass review (this pass)
+
+- **`normalize_instance_id` lives only where the call sites need it.** (BLOCKER 1)
+- **Schema-0 terminal states recover the correct identity pair and respect `state_cls.TERMINAL_STATUSES`.** (BLOCKER 2)
+- **Persisted unit collections are validated as lists; raw TypeError paths are converted to `StateMigrationError`.** (BLOCKER 3)
+- **No fabricated fixes in the review ledger.** (NIT 1)
+
+### Applied from the 22nd-pass review (prior pass)
 
 - **`normalize_instance_id` is re-imported and both call sites work.** (BLOCKER 1)
 - **Nested `ShardState` / `JobState` are reconstructed on load.** (BLOCKER 2)
@@ -1214,6 +1230,7 @@ from vastai_gpu_runner.cleanup_policy import (
     CleanupResult,
     CleanupVerdict,
     InstanceCandidate,
+    normalize_instance_id,
     OwnershipPolicy,
     OwnershipVerification,
     ProviderCleanupPolicy,
@@ -2123,7 +2140,6 @@ from vastai_gpu_runner.cleanup_policy import (
     CleanupResult,
     CleanupVerdict,
     InstanceCandidate,
-    normalize_instance_id,
     OwnershipPolicy,
     OwnershipVerification,
     ProviderCleanupPolicy,
@@ -2138,7 +2154,7 @@ CURRENT_SCHEMA_VERSION = 1
 _VALID_SCHEMA_VERSIONS = frozenset({0, CURRENT_SCHEMA_VERSION})
 _LABEL_SUFFIX_LEN = 12
 TERMINAL_UNIT_STATUSES = frozenset(
-    {"completed", "downloaded", "failed", "archived"}
+    {"completed", "downloaded", "failed", "archived", "destroyed"}
 )
 
 
@@ -2174,14 +2190,21 @@ def _migrate_pre_v4(data: dict, *, state_cls: type) -> tuple[dict, str | None]:
     label_scope = data.get("label_scope", "") or ""
     raw_units = list(data.get("shards") or []) + list(data.get("jobs") or [])
     has_units = bool(raw_units)
+    terminal_statuses = getattr(
+        state_cls, "TERMINAL_STATUSES", TERMINAL_UNIT_STATUSES
+    )
     all_terminal = (
         has_units
         and all(
-            isinstance(u, dict) and u.get("status") in TERMINAL_UNIT_STATUSES
+            isinstance(u, dict) and u.get("status") in terminal_statuses
             for u in raw_units
         )
     )
     nonterminal = has_units and not all_terminal
+    if not isinstance(data.get("shards"), (list, type(None))):
+        return data, "shards must be a list or null in schema_version 0"
+    if not isinstance(data.get("jobs"), (list, type(None))):
+        return data, "jobs must be a list or null in schema_version 0"
     if nonterminal:
         effective_scope = label_scope or legacy_label
         if not effective_scope:
@@ -2245,6 +2268,14 @@ def load_batch_state(
         raise StateMigrationError(
             f"unsupported schema_version {schema_version}; "
             f"expected one of {sorted(_VALID_SCHEMA_VERSIONS)}"
+        )
+    if not isinstance(data.get("shards"), (list, type(None))):
+        raise StateMigrationError(
+            "persisted shards must be a list or null"
+        )
+    if not isinstance(data.get("jobs"), (list, type(None))):
+        raise StateMigrationError(
+            "persisted jobs must be a list or null"
         )
     if schema_version == 0:
         data, migration_error = _migrate_pre_v4(data, state_cls=state_cls)
@@ -3013,12 +3044,19 @@ match in `cli.py:instances` is removed.
 
 ## Review process
 
-This is the twentieth design draft of the v4 architecture. Each prior
-draft was rejected and addressed. The nineteenth draft was rejected
-with 3 BLOCKERs and 3 CONCERNs. This draft addresses every finding
-from the 22nd-pass review:
+This is the twenty-first design draft of the v4 architecture. Each prior
+draft was rejected and addressed. The twentieth draft was rejected
+with 3 BLOCKERs, 2 CONCERNs, and 1 NIT. This draft addresses every
+finding from the 24th-pass review:
 
-### Applied from the 22nd-pass review (this pass)
+### Applied from the 24th-pass review (this pass)
+
+- **`normalize_instance_id` lives only where the call sites need it.** (BLOCKER 1)
+- **Schema-0 terminal states recover the correct identity pair and respect `state_cls.TERMINAL_STATUSES`.** (BLOCKER 2)
+- **Persisted unit collections are validated as lists; raw TypeError paths are converted to `StateMigrationError`.** (BLOCKER 3)
+- **No fabricated fixes in the review ledger.** (NIT 1)
+
+### Applied from the 22nd-pass review (prior pass)
 
 - **`normalize_instance_id` is re-imported and both call sites work.** (BLOCKER 1)
 - **Nested `ShardState` / `JobState` are reconstructed on load.** (BLOCKER 2)
@@ -3112,7 +3150,7 @@ from the 22nd-pass review:
 - NIT 1: `ABSENT` means the requested instance is absent from the
   fully validated API response.
 
-The 23rd-pass review prompt for ChatGPT-with-GitHub-plugin:
+The 25th-pass review prompt for ChatGPT-with-GitHub-plugin:
 
 > Review the v4 architecture design at PR #22 (file:
 > docs/architecture-v4-cleanup-policy.md) against the v3 design at
@@ -3121,14 +3159,11 @@ The 23rd-pass review prompt for ChatGPT-with-GitHub-plugin:
 > src/vastai_gpu_runner/providers/vastai.py. The v4 design
 > resolves issue #19.
 >
-> The twentieth draft (applied to 22nd-pass findings) introduced:
+> The twenty-first draft (applied to 24th-pass findings) introduced:
 >
-> 1. **`normalize_instance_id` is imported and used in both call sites.** (BLOCKER 1)
-> 2. **`load_batch_state` reconstructs `ShardState` / `JobState` from raw dicts.** (BLOCKER 2)
-> 3. **Schema-0 migration parses the canonical legacy scope and recovers the requested prefix.** (BLOCKER 3)
-> 4. **Every persisted-state failure is converted to `StateMigrationError`, including type-confused `schema_version`.** (CONCERN 1)
-> 5. **Nonterminal detection uses the unit terminal-status policy.** (CONCERN 2)
-> 6. **`--allow-adjacent-scopes` help matches the implementation's prefix test.** (CONCERN 3)
+> 1. **`normalize_instance_id` lives only where the call sites need it.** (BLOCKER 1)
+> 2. **Schema-0 terminal states recover the correct identity pair and respect `state_cls.TERMINAL_STATUSES`.** (BLOCKER 2)
+> 3. **Persisted unit collections are validated as lists; raw TypeError paths are converted to `StateMigrationError`.** (BLOCKER 3)
 >
 > Additionally, identify any new BLOCKERs or CONCERNs. Focus on:
 >
