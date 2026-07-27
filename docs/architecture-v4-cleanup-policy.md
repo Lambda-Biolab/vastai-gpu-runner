@@ -1035,6 +1035,10 @@ class CredentialResolution:
     key: str = ""
 
     def __post_init__(self) -> None:
+        if not isinstance(self.state, CredentialState):
+            raise ValueError("CredentialResolution.state must be a CredentialState")
+        if not isinstance(self.key, str):
+            raise ValueError("CredentialResolution.key must be a string")
         if self.state == CredentialState.AVAILABLE:
             if not self.key or self.key != self.key.strip():
                 raise ValueError(
@@ -2091,15 +2095,27 @@ from uuid import uuid4
 def resolve_label_scope(
     requested_prefix: str,
     persisted_scope: str | None,
+    persisted_requested_prefix: str | None = None,
 ) -> str:
     """Reuse a persisted scope or create one for a new batch."""
     requested = validate_label_prefix(requested_prefix)
     if persisted_scope:
         persisted = validate_label_prefix(persisted_scope)
-        if not persisted.startswith(f"{requested}-"):
-            raise ValueError(
-                "persisted label scope does not match the requested batch prefix"
-            )
+        if persisted_requested_prefix is not None:
+            stored_request = validate_label_prefix(persisted_requested_prefix)
+            if stored_request != requested:
+                raise ValueError(
+                    "persisted batch prefix does not match the requested label"
+                )
+        else:
+            if not (
+                persisted.startswith(f"{requested}-")
+                and len(persisted) == len(requested) + 1 + 12
+                and all(c in "0123456789abcdef" for c in persisted[len(requested) + 1:])
+            ):
+                raise ValueError(
+                    "persisted label scope does not match the requested batch prefix"
+                )
         return persisted
     return f"{requested}-{uuid4().hex[:12]}"
 
@@ -2114,7 +2130,9 @@ def _sweep_zombies(self) -> int:
     Routes through the cleanup policy:
     1. Enumerate instances via ``policy.list_instances()`` (which
        may short-circuit on EXPLICITLY_DISABLED).
-    2. Filter by label prefix (orchestrator's per-batch scope).
+    2. Filter by the exact delimited label scope
+       ``f"{self._label_prefix}-"`` so adjacent scopes like
+       ``f"{label_prefix}evil"`` cannot match.
     3. Exclude tracked IDs (the existing semantics).
     4. For every remaining candidate, call ``policy.destroy(candidate)``.
     5. Count ``verdict == DESTROYED`` outcomes.
@@ -2127,8 +2145,9 @@ def _sweep_zombies(self) -> int:
         }
     candidates = self._cleanup_policy.list_instances()
     killed = 0
+    scope_prefix = f"{self._label_prefix}-"
     for candidate in candidates:
-        if not candidate.label.startswith(self._label_prefix):
+        if not candidate.label.startswith(scope_prefix):
             continue
         if candidate.instance_id in tracked_ids:
             continue
@@ -2519,7 +2538,7 @@ steps then build on v3's `providers/destroy.py` module
 
    - `BatchOrchestrator.__init__` accepts `cleanup_policy: ProviderCleanupPolicy` (required) and stores `validate_label_prefix(label_prefix)`; empty, whitespace-only, or padded prefixes raise `ValueError` before enumeration.
    - `_sweep_zombies` is policy-driven; logs every non-`DESTROYED` outcome at severity matching operational impact.
-   - Persist `label_scope: str = ""` in both `BatchState` (rename the unused `label` field) and `JobBatchState`; fresh state generates it once, resume loads it before runner/orchestrator construction, persisted scope wins, and a requested-prefix drift is rejected. Crash-after-create and reconstruction-failure resumes retain the old scope.
+   - Persist `label_scope: str = ""` and `requested_label_prefix: str = ""` in both `BatchState` (rename the unused `label` field) and `JobBatchState`. Define an explicit `SCHEMA_VERSION` and a migration loader: legacy state without `label_scope` keeps an empty value and is re-promoted only if the requested CLI prefix matches the legacy `label` field; otherwise `load_or_none()` raises a typed migration error and never silently re-scopes. Add a real pre-v4 JSON fixture test asserting the migration path is taken and legacy state is not silently re-scoped.
    - Orchestrator tests:
      - Severity logging: `LEAKED` = `ERROR`, `UNKNOWN` / `CLI_ATTEMPTED` / `CREDENTIALS_DISABLED` = `WARNING`, unexpected `NO_CREDENTIALS` = `WARNING`, refusals = `INFO` (verified with `caplog`).
      - `_sweep_zombies` continues on `destroy_fn` exceptions (they return `verdict=UNKNOWN` with `type(exc).__name__: exc`).
@@ -2545,7 +2564,7 @@ steps then build on v3's `providers/destroy.py` module
      - **severity logging**: orchestrator logs `LEAKED` at `ERROR`, `UNKNOWN` at `WARNING`, unexpected `NO_CREDENTIALS` at `WARNING`, refusals at `INFO`.
      - **non-empty error from empty exception**: `raise RuntimeError()` → orchestrator logs with non-empty error.
      - **null instance_id / nullable safety fields in enumeration**: JSON `{id: null, label: null, actual_status: null, image_uuid: null, ...}` is skipped for invalid ID; valid IDs normalize null fields to empty strings, cannot match a non-empty label scope, and are refused as ineligible on empty state rather than receiving literal `"None"` values.
-     - **label-prefix safety and persistence**: `BatchOrchestrator`, `batch --label`, and `cleanup --label` reject `""`, `" "`, and `" padded "` before enumeration; no implicit account-wide wildcard exists. A created orphan is labeled with its persisted canonical batch scope, selected by its own batch, and not selected by a concurrent batch scope. Restart tests cover a crash immediately after provider creation and a reconstruction failure; both reload the original `label_scope` before composition and reject scope drift.
+     - **label-prefix safety, persistence, and delimiter**: `BatchOrchestrator`, `batch --label`, and `cleanup --label` reject `""`, `" "`, and `" padded "` before enumeration. `_sweep_zombies` uses the exact delimited scope `f"{label_prefix}-"` so `f"{label_prefix}evil"` cannot match. A created orphan is labeled with its persisted canonical batch scope, selected by its own batch, and not selected by a concurrent batch scope. Restart tests cover a crash immediately after provider creation and a reconstruction failure; both reload the original `label_scope` before composition and reject scope drift.
      - **CLI --allowed-images empty string**: fail-closed (empty set, refuses every candidate).
      - **CLI --allowed-images None**: opt-out (every image considered owned).
      - **destroy_fn returns None**: orchestrator receives `CleanupResult(verdict=UNKNOWN, error="...invalid result type NoneType")`.
@@ -2577,7 +2596,7 @@ steps then build on v3's `providers/destroy.py` module
    - `InstanceCandidate.__post_init__`: invalid provider or non-string `label`, `state`, `image_uuid`, `ownership_key`, or `gpu_model` raises; empty/whitespace `instance_id` raises.
 
 - `tests/test_providers_vastai.py`:
-  - `read_vastai_api_key` env-first: `VASTAI_API_KEY=""` → `EXPLICITLY_DISABLED`; `VASTAI_API_KEY="key"` → `AVAILABLE`; no env + file → `AVAILABLE`; no env + blank file → `ABSENT` (with warning); `OSError` → `ABSENT` (with warning).
+  - `read_vastai_api_key` env-first: `VASTAI_API_KEY=""` → `EXPLICITLY_DISABLED`; `VASTAI_API_KEY="key"` → `AVAILABLE`; no env + file → `AVAILABLE`; no env + blank file → `ABSENT` (with warning); `OSError` → `ABSENT` (with warning). Plus invalid input rejection: `state="unknown"` or `key=123` raises; unknown `state` is not silently used.
   - Canonical destructive-key identity: pass `CredentialResolution(AVAILABLE, "canonical-key")`, make `read_vastai_api_key()` fail if called, and assert `Authorization: Bearer canonical-key` reaches the ownership GET, stop PUT, every DELETE retry, and every verification GET/redestroy callback.
   - `VastaiRunner.from_config` round-trips with `VastaiProviderConfig`.
    - `VastaiRunner(allowed_images=frozenset({img}))` (deprecated) emits `DeprecationWarning` + builds equivalent `OwnershipPolicy`.
@@ -2666,7 +2685,7 @@ steps then build on v3's `providers/destroy.py` module
   - `VastaiRunner.destroy_instance` logs typed result: LEAKED → `ERROR`, UNKNOWN → `WARNING`, refusals → `ERROR`; returns `False`.
 - `tests/test_batch.py`:
   - `validate_label_prefix` and `BatchOrchestrator.__init__` accept a non-empty pre-stripped string and reject `None`, non-strings, `""`, `" "`, and padded values before `cleanup_policy.list_instances()` can run.
-  - `resolve_label_scope` creates one scope only for new state, reuses persisted `BatchState` / `JobBatchState.label_scope` on restart, and rejects a requested-prefix mismatch; crash-after-create and reconstruction-failure tests keep the original sweep scope.
+  - `resolve_label_scope` creates one scope only for new state, reuses persisted `BatchState` / `JobBatchState.label_scope` on restart, and rejects a requested-prefix mismatch (also covering overlapping prefixes such as `prod` vs `prod-us`); crash-after-create and reconstruction-failure tests keep the original sweep scope. `_sweep_zombies` requires the canonical delimiter so adjacent scopes (`prod` vs `prod-evil`) cannot match.
   - `_sweep_zombies` calls `cleanup_policy.list_instances()` exactly once.
   - `_sweep_zombies` calls `cleanup_policy.destroy(candidate)` for every label-matching, untracked candidate.
   - `_sweep_zombies` counts only `verdict=DESTROYED` outcomes (an
