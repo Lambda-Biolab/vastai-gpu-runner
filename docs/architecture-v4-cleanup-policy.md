@@ -100,7 +100,7 @@ in `VastaiProviderConfig` (because the runner also needs
 `docker_image`, `setup_commands`, etc.); the cleanup-policy factory
 takes them directly.
 
-## What changes vs the v4 first + second + third + fourth + fifth + sixth + seventh + eighth + ninth + tenth + eleventh + twelfth + thirteenth drafts
+## What changes vs the v4 first + second + third + fourth + fifth + sixth + seventh + eighth + ninth + tenth + eleventh + twelfth + thirteenth + fourteenth + fifteenth + sixteenth + seventeenth + eighteenth + nineteenth drafts
 
 The first draft was rejected with 5 BLOCKERs and 7 CONCERNs. The
 second draft was rejected with 7 BLOCKERs, 2 CONCERNs, and 3 NITs.
@@ -115,9 +115,17 @@ draft was rejected with 2 BLOCKERs, 1 CONCERN, and 1 NIT. The
 eleventh draft was rejected with 3 BLOCKERs and 2 CONCERNs. The twelfth
 draft was rejected with 2 BLOCKERs and 2 CONCERNs. The thirteenth
 draft was rejected with 3 BLOCKERs, 2 CONCERNs, and 1 NIT. This
-fourteenth draft addresses every finding.
+twentieth draft addresses every finding.
+### Applied from the 22nd-pass review (this pass)
 
-### Applied from the 17th-pass review (this pass)
+- **`normalize_instance_id` is re-imported and both call sites work.** (BLOCKER 1)
+- **Nested `ShardState` / `JobState` are reconstructed on load.** (BLOCKER 2)
+- **Schema-0 migration parses the canonical legacy scope and recovers the requested prefix.** (BLOCKER 3)
+- **Every persisted-state failure becomes `StateMigrationError`, including type-confused `schema_version`.** (CONCERN 1)
+- **Nonterminal detection uses the unit terminal-status policy, not just "any units present".** (CONCERN 2)
+- **`--allow-adjacent-scopes` help matches the implementation's prefix test.** (CONCERN 3)
+
+### Applied from the 21st-pass review (prior pass)
 
 - **Persistent batch label scope.** `BatchState` and `JobBatchState`
   persist `label_scope`; resume loads it before runner/orchestrator
@@ -3005,12 +3013,21 @@ match in `cli.py:instances` is removed.
 
 ## Review process
 
-This is the fourteenth design draft of the v4 architecture. Each prior
-draft was rejected and addressed. The thirteenth draft was rejected
-with 3 BLOCKERs, 2 CONCERNs, and 1 NIT. This draft addresses every
-finding from the 17th-pass review:
+This is the twentieth design draft of the v4 architecture. Each prior
+draft was rejected and addressed. The nineteenth draft was rejected
+with 3 BLOCKERs and 3 CONCERNs. This draft addresses every finding
+from the 22nd-pass review:
 
-### Applied from the 17th-pass review (this pass)
+### Applied from the 22nd-pass review (this pass)
+
+- **`normalize_instance_id` is re-imported and both call sites work.** (BLOCKER 1)
+- **Nested `ShardState` / `JobState` are reconstructed on load.** (BLOCKER 2)
+- **Schema-0 migration parses the canonical legacy scope and recovers the requested prefix.** (BLOCKER 3)
+- **Every persisted-state failure becomes `StateMigrationError`, including type-confused `schema_version`.** (CONCERN 1)
+- **Nonterminal detection uses the unit terminal-status policy, not just "any units present".** (CONCERN 2)
+- **`--allow-adjacent-scopes` help matches the implementation's prefix test.** (CONCERN 3)
+
+### Applied from the 21st-pass review (prior pass)
 
 - **Label scope survives crash recovery.** `BatchState` and
   `JobBatchState` persist the scope; resume restores it before all
@@ -3095,7 +3112,7 @@ finding from the 17th-pass review:
 - NIT 1: `ABSENT` means the requested instance is absent from the
   fully validated API response.
 
-The 18th-pass review prompt for ChatGPT-with-GitHub-plugin:
+The 23rd-pass review prompt for ChatGPT-with-GitHub-plugin:
 
 > Review the v4 architecture design at PR #22 (file:
 > docs/architecture-v4-cleanup-policy.md) against the v3 design at
@@ -3104,35 +3121,25 @@ The 18th-pass review prompt for ChatGPT-with-GitHub-plugin:
 > src/vastai_gpu_runner/providers/vastai.py. The v4 design
 > resolves issue #19.
 >
-> The fourteenth draft (applied to 17th-pass findings) introduced:
+> The twentieth draft (applied to 22nd-pass findings) introduced:
 >
-> 1. **Crash-stable batch label identity.** `BatchState` and
->    `JobBatchState` persist `label_scope`. Fresh batches generate it
->    once; resume loads it before config/runner/orchestrator creation,
->    reuses it, and rejects requested-prefix drift. Tests cover crash
->    immediately after provider creation and reconstruction failure.
-> 2. **Strict verifier image UUIDs.** Every response record requires a
->    string `image_uuid`; null, integer, float, bool, list, or dict
->    values on requested or unrelated records return `REFUSED`.
-> 3. **Exact OCI digest algorithm grammar.** Algorithm components use
->    lowercase `[a-z0-9]+`; uppercase variants are rejected and
->    digit-leading generic algorithms remain valid. Registered digest
->    lengths/encodings are still enforced.
-> 4. **Runtime InstanceCandidate invariants.** Provider and all safety
->    string fields are type-checked in `__post_init__`, so malformed
->    callback candidates cannot crash `startswith` before containment.
-> 5. **Current review metadata.** The document is the fourteenth draft
->    and records the 17th-pass findings before requesting pass 18.
+> 1. **`normalize_instance_id` is imported and used in both call sites.** (BLOCKER 1)
+> 2. **`load_batch_state` reconstructs `ShardState` / `JobState` from raw dicts.** (BLOCKER 2)
+> 3. **Schema-0 migration parses the canonical legacy scope and recovers the requested prefix.** (BLOCKER 3)
+> 4. **Every persisted-state failure is converted to `StateMigrationError`, including type-confused `schema_version`.** (CONCERN 1)
+> 5. **Nonterminal detection uses the unit terminal-status policy.** (CONCERN 2)
+> 6. **`--allow-adjacent-scopes` help matches the implementation's prefix test.** (CONCERN 3)
 >
 > Additionally, identify any new BLOCKERs or CONCERNs. Focus on:
 >
-> - Does resume always restore one persisted label scope before any
->   runner/orchestrator construction, including crash/reconstruction
->   failure paths, and reject scope drift?
+> - Can a legacy pre-v4 state with a nonterminal unit (e.g.
+>   ``status: running``) and a canonical `label` recover the correct
+>   identity pair and be deserialized as proper `ShardState` /
+>   `JobState` objects?
+> - Do all persisted-state failures funnel through `StateMigrationError`
+>   rather than raising raw `ValueError` or `TypeError`?
 > - Can any malformed or non-string `image_uuid` reach affirmative CLI
 >   ownership matching?
-> - Does digest validation reject uppercase algorithms while accepting
->   valid digit-leading generic algorithms and registered encodings?
 > - Can any malformed callback candidate escape DTO validation and
 >   crash label filtering or logging?
 > - Does the migration/test plan cover all 14 v3 prerequisite scenarios
