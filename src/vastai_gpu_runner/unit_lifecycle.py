@@ -25,10 +25,13 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, ClassVar, Protocol, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol, TypeVar
 
 UnitT = TypeVar("UnitT")
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from vastai_gpu_runner.types import CloudInstance
 
 
 class Action(StrEnum):
@@ -115,13 +118,26 @@ UnitAction = Continue | Complete | Preempt
 
 
 class CloudRunnerLike(Protocol):
-    def check_progress(self, instance: object) -> dict[str, object]: ...
+    """Minimal interface required by ``decide_next_action``.
+
+    Defined here (not imported from ``runner.py``) so the
+    unit_lifecycle module has no provider-coupling. Any object with
+    a ``check_progress(instance) -> dict[str, object]`` method
+    satisfies the protocol — ``CloudRunner`` in production,
+    a ``FakeRunner`` in tests.
+
+    The instance parameter is typed as ``CloudInstance`` (the
+    production shape) for protocol-compatibility with the
+    production ``CloudRunner.check_progress`` signature.
+    """
+
+    def check_progress(self, instance: CloudInstance) -> dict[str, object]: ...
 
 
 def decide_next_action(
     unit: UnitT,
     runner: CloudRunnerLike,
-    instance: object,
+    instance: CloudInstance,
     is_done_in_r2: Callable[[UnitT], bool],
 ) -> UnitAction:
     """Classify a live unit and return the next action.

@@ -444,74 +444,112 @@ class TestDeployBudgetOk:
 
 
 # ---------------------------------------------------------------------------
-# Poll / classify (_classify_live_unit)
+# Dispatch helper (post-v3: _handle_preempted_unit + _dispatch_unit_action)
 # ---------------------------------------------------------------------------
+#
+# The pure decision tree (R2 → SSH → re-check) lives in
+# ``vastai_gpu_runner.unit_lifecycle.decide_next_action``; see
+# ``tests/test_unit_lifecycle.py`` for the unit-lifecycle tests.
+# These tests cover the orchestrator's side-effectful dispatch path that
+# applies the action plan.
 
 
-class TestClassifyLiveUnit:
+class TestHandlePreemptedUnit:
     def _setup(self, unit: Unit, runner: CloudRunner) -> ConcreteOrchestrator:
         o = _orch([unit])
         inst = _instance(unit.instance_id or "i1")
         o._live_runners[unit.key] = (runner, inst, unit)
         return o
 
-    def test_r2_done_returns_terminal(self) -> None:
-        unit = Unit(key="u1", done_in_r2=True, status="deployed")
+    def test_captures_diagnostics_then_destroys_then_loss(self) -> None:
+        """Phase-B: capture_preempt_diagnostics -> destroy_instance -> loss."""
+        unit = Unit(key="u1", status="deployed", instance_id="i1")
         runner = _mock_runner()
         o = self._setup(unit, runner)
-        verdict = o._classify_live_unit(runner, _instance(), unit)
-        assert verdict == "terminal"
-        runner.check_progress.assert_not_called()
+        o._handle_preempted_unit(runner, _instance(), unit, unit.key)
+        # destroy_instance called once
+        runner.destroy_instance.assert_called_once()
+        # instance loss recorded (retryable → on_unit_preempted → status="pending")
+        assert "preempted" in unit.events
+        assert unit.status == "pending"
+        assert unit.key not in o._live_runners
 
-    def test_ssh_complete_returns_terminal(self) -> None:
-        unit = Unit(key="u1", status="deployed")
-        runner = _mock_runner(progress={"complete": True, "running": False})
+    def test_diagnostics_failure_does_not_block_destroy(self) -> None:
+        """A failing capture_preempt_diagnostics must not strand the rest."""
+        unit = Unit(key="u1", status="deployed", instance_id="i1")
+        runner = _mock_runner()
         o = self._setup(unit, runner)
-        verdict = o._classify_live_unit(runner, _instance(), unit)
-        assert verdict == "terminal"
+        o.capture_preempt_diagnostics = lambda *_a, **_k: (_ for _ in ()).throw(  # type: ignore[method-assign]
+            OSError("SSH lost")
+        )
+        o._handle_preempted_unit(runner, _instance(), unit, unit.key)
+        runner.destroy_instance.assert_called_once()
+        assert unit.status == "pending"
 
-    def test_worker_dead_r2_miss_returns_preempted(self) -> None:
-        unit = Unit(key="u1", status="deployed", done_in_r2=False)
-        runner = _mock_runner(progress={"complete": False, "worker_dead": True})
+    def test_destroy_failure_does_not_block_loss_handling(self) -> None:
+        """A failing destroy_instance must not strand instance-loss bookkeeping."""
+        unit = Unit(key="u1", status="deployed", instance_id="i1")
+        runner = _mock_runner()
+        runner.destroy_instance = MagicMock(side_effect=RuntimeError("API 503"))
         o = self._setup(unit, runner)
-        verdict = o._classify_live_unit(runner, _instance(), unit)
-        assert verdict == "preempted"
+        o._handle_preempted_unit(runner, _instance(), unit, unit.key)
+        # instance loss still recorded
+        assert unit.status == "pending"
 
-    def test_worker_dead_r2_hit_returns_terminal(self) -> None:
-        """R2 re-check after worker_dead: if results landed in R2, recover."""
-        unit = Unit(key="u1", status="deployed")
-        runner = _mock_runner(progress={"complete": False, "worker_dead": True})
-        o = self._setup(unit, runner)
-        # First call (before check_progress) → False; second (after worker_dead) → True
-        r2_calls = [False, True]
-        o.unit_is_done_in_r2 = lambda _u: r2_calls.pop(0)  # type: ignore[method-assign]
-        verdict = o._classify_live_unit(runner, _instance(), unit)
-        assert verdict == "terminal"
 
-    def test_running_stays_running(self) -> None:
-        unit = Unit(key="u1", status="deployed")
-        runner = _mock_runner(progress={"running": True, "complete": False})
-        o = self._setup(unit, runner)
-        verdict = o._classify_live_unit(runner, _instance(), unit)
-        assert verdict == "running"
+class TestDispatchUnitAction:
+    def _setup(self, unit: Unit, runner: CloudRunner) -> ConcreteOrchestrator:
+        o = _orch([unit])
+        inst = _instance(unit.instance_id or "i1")
+        o._live_runners[unit.key] = (runner, inst, unit)
+        return o
 
-    def test_check_progress_exception_stays_running(self) -> None:
-        unit = Unit(key="u1", status="deployed")
-        runner = _mock_runner(raise_progress=OSError("SSH refused"))
-        o = self._setup(unit, runner)
-        verdict = o._classify_live_unit(runner, _instance(), unit)
-        assert verdict == "running"
+    def test_continue_action_returns_running_no_side_effects(self) -> None:
+        """Continue plan: no side effects, no destroy, no finalise."""
+        from vastai_gpu_runner.unit_lifecycle import Continue as _Continue
 
-    def test_classify_is_pure_no_state_mutations(self) -> None:
-        """classify must never mutate unit state or call destroy_instance."""
-        unit = Unit(key="u1", status="deployed")
-        runner = _mock_runner(progress={"complete": True})
+        unit = Unit(key="u1", status="deployed", instance_id="i1")
+        runner = _mock_runner()
         o = self._setup(unit, runner)
-        o._classify_live_unit(runner, _instance(), unit)
-        # Unit state unchanged, destroy never called
-        assert unit.status == "deployed"
+        result = o._dispatch_unit_action(runner, _instance(), unit, _Continue())
+        assert result == "running"
         runner.destroy_instance.assert_not_called()
-        assert unit.key in o._live_runners
+        assert unit.status == "deployed"
+
+    def test_preempt_action_routes_to_handle_preempted_unit(self) -> None:
+        """Preempt plan: routes to _handle_preempted_unit."""
+        from vastai_gpu_runner.unit_lifecycle import (
+            Preempt as _Preempt,
+        )
+        from vastai_gpu_runner.unit_lifecycle import (
+            PreemptCause as _PreemptCause,
+        )
+
+        unit = Unit(key="u1", status="deployed", instance_id="i1")
+        runner = _mock_runner()
+        o = self._setup(unit, runner)
+        result = o._dispatch_unit_action(
+            runner,
+            _instance(),
+            unit,
+            _Preempt(cause=_PreemptCause.WORKER_DIED, detail="fatal"),
+        )
+        assert result == "preempted"
+        runner.destroy_instance.assert_called_once()
+        assert "preempted" in unit.events
+        assert unit.status == "pending"
+
+    def test_complete_action_routes_to_finalise_completed(self) -> None:
+        """Complete plan: routes to _finalise_completed (collect + destroy)."""
+        from vastai_gpu_runner.unit_lifecycle import Complete as _Complete
+
+        unit = Unit(key="u1", status="deployed", collect_ok=True)
+        runner = _mock_runner()
+        o = self._setup(unit, runner)
+        result = o._dispatch_unit_action(runner, _instance(), unit, _Complete())
+        assert result == "completed"
+        assert unit.status == "downloaded"
+        runner.destroy_instance.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
