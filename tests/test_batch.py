@@ -10,10 +10,15 @@ No real Vast.ai calls, no SSH. Covers:
 - collect phase: R2 recovery for failed-but-uploaded units
 - cleanup phase: destroys leftover instances
 - full run() lifecycle end-to-end
+- v4 cleanup_policy wiring: severity-by-outcome logging, label
+  delimiter safety, provider decoupling (no module imports of
+  providers/*).
 """
 
 from __future__ import annotations
 
+import inspect
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -22,6 +27,14 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from vastai_gpu_runner.batch import BatchOrchestrator, FailureVerdict
+from vastai_gpu_runner.cleanup_policy import (
+    CleanupRefusal,
+    CleanupResult,
+    CleanupVerdict,
+    InstanceCandidate,
+    Provider,
+    ProviderCleanupPolicy,
+)
 from vastai_gpu_runner.runner import CloudRunner
 from vastai_gpu_runner.types import CloudInstance, DeploymentResult
 
@@ -54,12 +67,20 @@ class FakeUnit:
 class FakeOrchestrator(BatchOrchestrator[FakeUnit]):
     """Test orchestrator that owns a list of FakeUnits and records events."""
 
-    def __init__(self, units: list[FakeUnit], **kwargs: object) -> None:
+    def __init__(
+        self,
+        units: list[FakeUnit],
+        cleanup_policy: ProviderCleanupPolicy | None = None,
+        **kwargs: object,
+    ) -> None:
         self.units = units
         self.state_saves = 0
         self.payload_builds: list[str] = []
         self.collect_calls: list[str] = []
-        super().__init__(**kwargs)  # type: ignore[arg-type]
+        super().__init__(  # type: ignore[arg-type]
+            cleanup_policy=cleanup_policy or _noop_cleanup_policy(),
+            **kwargs,
+        )
 
     def iter_pending_units(self) -> Iterable[FakeUnit]:
         return [u for u in self.units if u.status == "pending"]
@@ -172,6 +193,63 @@ def _mock_runner_factory(
         return r
 
     return factory
+
+
+def _noop_cleanup_policy() -> ProviderCleanupPolicy:
+    """Default policy for tests that don't exercise zombie sweep."""
+
+    def _list() -> list[InstanceCandidate]:
+        return []
+
+    def _destroy(candidate: InstanceCandidate) -> CleanupResult:
+        return CleanupResult(verdict=CleanupVerdict.DESTROYED)
+
+    return ProviderCleanupPolicy(
+        provider=Provider.VASTAI,
+        list_instances_fn=_list,
+        destroy_fn=_destroy,
+    )
+
+
+def _recording_cleanup_policy(
+    *,
+    candidates: list[InstanceCandidate],
+    destroy_responses: dict[str, CleanupResult] | None = None,
+    list_returns: list[InstanceCandidate] | None = None,
+) -> ProviderCleanupPolicy:
+    """Policy that exposes the candidates fed to ``list_instances`` and
+    the cleanup results dispatched to ``destroy``. Use
+    ``destroy_responses`` keyed by ``candidate.instance_id`` to drive
+    per-candidate outcomes (defaults to ``DESTROYED``). Use
+    ``list_returns`` to override what ``list_instances`` returns on
+    subsequent calls (defaults to ``candidates`` for every call).
+    """
+    responses = destroy_responses or {}
+    seen_candidates: list[InstanceCandidate] = []
+    list_invocations = 0
+    destroy_invocations: list[InstanceCandidate] = []
+
+    def _list() -> list[InstanceCandidate]:
+        nonlocal list_invocations
+        list_invocations += 1
+        return list(list_returns if list_returns is not None else candidates)
+
+    def _destroy(candidate: InstanceCandidate) -> CleanupResult:
+        seen_candidates.append(candidate)
+        destroy_invocations.append(candidate)
+        return responses.get(
+            candidate.instance_id,
+            CleanupResult(verdict=CleanupVerdict.DESTROYED),
+        )
+
+    policy = ProviderCleanupPolicy(
+        provider=Provider.VASTAI,
+        list_instances_fn=_list,
+        destroy_fn=_destroy,
+    )
+    policy.__dict__["_test_list_invocations"] = lambda: list_invocations  # type: ignore[attr-defined]
+    policy.__dict__["_test_destroy_invocations"] = lambda: list(destroy_invocations)  # type: ignore[attr-defined]
+    return policy
 
 
 # ---------------------------------------------------------------------------
@@ -682,8 +760,7 @@ class TestCollectAndCleanup:
         instance = CloudInstance(instance_id="i1")
         orch._live_runners[unit.key] = (runner, instance, unit)
 
-        with patch("vastai_gpu_runner.batch.sweep_zombie_instances", return_value=0):
-            orch._cleanup_phase()
+        orch._cleanup_phase()
 
         runner.destroy_instance.assert_called_once_with(instance)
         assert not orch._live_runners
@@ -707,8 +784,7 @@ class TestRunLifecycle:
             poll_interval_seconds=1,
         )
 
-        with patch("vastai_gpu_runner.batch.sweep_zombie_instances", return_value=0):
-            orch.run()
+        orch.run()
 
         assert unit.status == "downloaded"
         assert "deployed" in unit.events
@@ -721,8 +797,7 @@ class TestRunLifecycle:
             label_prefix="test-empty",
         )
 
-        with patch("vastai_gpu_runner.batch.sweep_zombie_instances", return_value=0):
-            orch.run()
+        orch.run()
 
         assert not orch._live_runners
 
@@ -734,8 +809,7 @@ class TestRunLifecycle:
             label_prefix="test-fail",
         )
 
-        with patch("vastai_gpu_runner.batch.sweep_zombie_instances", return_value=0):
-            orch.run()
+        orch.run()
 
         assert unit.status == "failed"
         assert "boom" in unit.failure_reason
@@ -747,33 +821,385 @@ class TestRunLifecycle:
 
 
 class TestZombieSweep:
-    def test_sweep_delegates_with_label_prefix(self) -> None:
+    """The v4 sweep delegates to ``cleanup_policy`` end-to-end.
+
+    Each test pins a specific aspect of the policy-driven contract:
+    label-scope filtering (delimiter safety), tracked-ID exclusion,
+    per-candidate destroy dispatch, severity-by-outcome logging,
+    continue-on-exception behaviour, and provider decoupling (no
+    module-level provider imports).
+    """
+
+    @staticmethod
+    def _candidate(iid: str, label: str, state: str = "running") -> InstanceCandidate:
+        return InstanceCandidate(
+            provider=Provider.VASTAI,
+            instance_id=iid,
+            label=label,
+            state=state,
+            image_uuid="img-uuid",
+            gpu_model="RTX 4090",
+            cost_per_hour=0.4,
+            started_at=0.0,
+        )
+
+    def test_sweep_calls_list_instances_once(self) -> None:
+        """policy.list_instances() is called exactly once per sweep."""
+        policy = _recording_cleanup_policy(candidates=[])
         orch = FakeOrchestrator(
             units=[],
             runner_factory=_mock_runner_factory(deploy_result=_ok_deploy()),
-            label_prefix="oralamp-boltz2-abc",
-            r2_batch_id="batch-123",
+            label_prefix="prod",
+            cleanup_policy=policy,
         )
-        with patch("vastai_gpu_runner.batch.sweep_zombie_instances", return_value=2) as mock_sweep:
-            killed = orch._sweep_zombies()
+        orch._sweep_zombies()
+        assert policy._test_list_invocations() == 1
 
+    def test_sweep_filters_by_delimited_scope(self) -> None:
+        """Only candidates with ``label.startswith(f"{label_prefix}-")`` are destroyed.
+
+        Adjacent scopes like ``f"{label_prefix}evil"`` cannot match.
+        """
+        keep = self._candidate("i1", "prod-3f9a1b2c4d5e")
+        evil = self._candidate("i2", "prodevil-abcdef012345")
+        sibling = self._candidate("i3", "other-abcdef012345")
+        policy = _recording_cleanup_policy(candidates=[keep, evil, sibling])
+        orch = FakeOrchestrator(
+            units=[],
+            runner_factory=_mock_runner_factory(deploy_result=_ok_deploy()),
+            label_prefix="prod",
+            cleanup_policy=policy,
+        )
+
+        killed = orch._sweep_zombies()
+
+        destroyed_ids = {c.instance_id for c in policy._test_destroy_invocations()}
+        assert destroyed_ids == {"i1"}
+        assert killed == 1
+
+    def test_sweep_excludes_tracked_instance_ids(self) -> None:
+        """Candidates whose ``instance_id`` is in ``_live_runners`` are skipped."""
+        tracked = self._candidate("i1", "prod-3f9a1b2c4d5e")
+        orphan = self._candidate("i2", "prod-abcdef012345")
+        policy = _recording_cleanup_policy(candidates=[tracked, orphan])
+        orch = FakeOrchestrator(
+            units=[],
+            runner_factory=_mock_runner_factory(deploy_result=_ok_deploy()),
+            label_prefix="prod",
+            cleanup_policy=policy,
+        )
+        runner = MagicMock(spec=CloudRunner)
+        instance = CloudInstance(instance_id="i1")
+        orch._live_runners["u1"] = (runner, instance, FakeUnit(key="u1"))
+
+        killed = orch._sweep_zombies()
+
+        destroyed_ids = {c.instance_id for c in policy._test_destroy_invocations()}
+        assert destroyed_ids == {"i2"}
+        assert killed == 1
+
+    def test_sweep_counts_only_destroyed(self) -> None:
+        """``ALREADY_GONE`` is not counted as a kill (no destroy happened)."""
+        c1 = self._candidate("i1", "prod-3f9a1b2c4d5e")
+        c2 = self._candidate("i2", "prod-abcdef012345")
+        c3 = self._candidate("i3", "prod-123456789abc")
+        policy = _recording_cleanup_policy(
+            candidates=[c1, c2, c3],
+            destroy_responses={
+                "i1": CleanupResult(verdict=CleanupVerdict.DESTROYED),
+                "i2": CleanupResult(verdict=CleanupVerdict.ALREADY_GONE),
+                "i3": CleanupResult(verdict=CleanupVerdict.DESTROYED),
+            },
+        )
+        orch = FakeOrchestrator(
+            units=[],
+            runner_factory=_mock_runner_factory(deploy_result=_ok_deploy()),
+            label_prefix="prod",
+            cleanup_policy=policy,
+        )
+        killed = orch._sweep_zombies()
         assert killed == 2
-        _, kwargs = mock_sweep.call_args
-        assert kwargs["label_prefix"] == "oralamp-boltz2-abc"
-        assert kwargs["r2_batch_id"] == "batch-123"
 
-    def test_sweep_failure_returns_zero(self) -> None:
+    def test_sweep_logs_leaked_at_error(self, caplog: pytest.LogCaptureFixture) -> None:
+        c1 = self._candidate("i1", "prod-3f9a1b2c4d5e")
+        policy = _recording_cleanup_policy(
+            candidates=[c1],
+            destroy_responses={
+                "i1": CleanupResult(
+                    verdict=CleanupVerdict.LEAKED,
+                    error="API still has it after destroy",
+                ),
+            },
+        )
         orch = FakeOrchestrator(
             units=[],
             runner_factory=_mock_runner_factory(deploy_result=_ok_deploy()),
-            label_prefix="test",
+            label_prefix="prod",
+            cleanup_policy=policy,
         )
-        with patch(
-            "vastai_gpu_runner.batch.sweep_zombie_instances",
-            side_effect=RuntimeError("api down"),
-        ):
-            killed = orch._sweep_zombies()
-        assert killed == 0
+        with caplog.at_level(logging.ERROR, logger="vastai_gpu_runner.batch"):
+            orch._sweep_zombies()
+        leaked_records = [r for r in caplog.records if "LEAKED" in r.getMessage()]
+        assert leaked_records
+        assert leaked_records[0].levelno == logging.ERROR
+
+    def test_sweep_logs_unknown_at_warning(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        c1 = self._candidate("i1", "prod-3f9a1b2c4d5e")
+        policy = _recording_cleanup_policy(
+            candidates=[c1],
+            destroy_responses={
+                "i1": CleanupResult(
+                    verdict=CleanupVerdict.UNKNOWN,
+                    error="boom",
+                ),
+            },
+        )
+        orch = FakeOrchestrator(
+            units=[],
+            runner_factory=_mock_runner_factory(deploy_result=_ok_deploy()),
+            label_prefix="prod",
+            cleanup_policy=policy,
+        )
+        with caplog.at_level(logging.WARNING, logger="vastai_gpu_runner.batch"):
+            orch._sweep_zombies()
+        unknown_records = [r for r in caplog.records if "UNKNOWN" in r.getMessage()]
+        assert unknown_records
+        assert unknown_records[0].levelno == logging.WARNING
+
+    def test_sweep_logs_cli_attempted_at_warning(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        c1 = self._candidate("i1", "prod-3f9a1b2c4d5e")
+        policy = _recording_cleanup_policy(
+            candidates=[c1],
+            destroy_responses={
+                "i1": CleanupResult(
+                    verdict=CleanupVerdict.CLI_ATTEMPTED,
+                    error="vastai destroy instance i1 — exit 0",
+                ),
+            },
+        )
+        orch = FakeOrchestrator(
+            units=[],
+            runner_factory=_mock_runner_factory(deploy_result=_ok_deploy()),
+            label_prefix="prod",
+            cleanup_policy=policy,
+        )
+        with caplog.at_level(logging.WARNING, logger="vastai_gpu_runner.batch"):
+            orch._sweep_zombies()
+        records = [r for r in caplog.records if "CLI fallback attempted" in r.getMessage()]
+        assert records
+        assert records[0].levelno == logging.WARNING
+
+    def test_sweep_logs_already_gone_at_info(self, caplog: pytest.LogCaptureFixture) -> None:
+        c1 = self._candidate("i1", "prod-3f9a1b2c4d5e")
+        policy = _recording_cleanup_policy(
+            candidates=[c1],
+            destroy_responses={
+                "i1": CleanupResult(verdict=CleanupVerdict.ALREADY_GONE),
+            },
+        )
+        orch = FakeOrchestrator(
+            units=[],
+            runner_factory=_mock_runner_factory(deploy_result=_ok_deploy()),
+            label_prefix="prod",
+            cleanup_policy=policy,
+        )
+        with caplog.at_level(logging.INFO, logger="vastai_gpu_runner.batch"):
+            orch._sweep_zombies()
+        records = [r for r in caplog.records if "already gone" in r.getMessage()]
+        assert records
+        assert records[0].levelno == logging.INFO
+
+    def test_sweep_logs_credentials_disabled_at_warning(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        c1 = self._candidate("i1", "prod-3f9a1b2c4d5e")
+        policy = _recording_cleanup_policy(
+            candidates=[c1],
+            destroy_responses={
+                "i1": CleanupResult(
+                    refusal=CleanupRefusal.CREDENTIALS_DISABLED,
+                    error="VASTAI_API_KEY=''",
+                ),
+            },
+        )
+        orch = FakeOrchestrator(
+            units=[],
+            runner_factory=_mock_runner_factory(deploy_result=_ok_deploy()),
+            label_prefix="prod",
+            cleanup_policy=policy,
+        )
+        with caplog.at_level(logging.WARNING, logger="vastai_gpu_runner.batch"):
+            orch._sweep_zombies()
+        records = [r for r in caplog.records if "credentials disabled" in r.getMessage()]
+        assert records
+        assert records[0].levelno == logging.WARNING
+
+    def test_sweep_logs_unexpected_no_credentials_at_warning(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        c1 = self._candidate("i1", "prod-3f9a1b2c4d5e")
+        policy = _recording_cleanup_policy(
+            candidates=[c1],
+            destroy_responses={
+                "i1": CleanupResult(
+                    refusal=CleanupRefusal.NO_CREDENTIALS,
+                    error="bypass",
+                ),
+            },
+        )
+        orch = FakeOrchestrator(
+            units=[],
+            runner_factory=_mock_runner_factory(deploy_result=_ok_deploy()),
+            label_prefix="prod",
+            cleanup_policy=policy,
+        )
+        with caplog.at_level(logging.WARNING, logger="vastai_gpu_runner.batch"):
+            orch._sweep_zombies()
+        records = [r for r in caplog.records if "NO_CREDENTIALS" in r.getMessage()]
+        assert records
+        assert records[0].levelno == logging.WARNING
+
+    def test_sweep_logs_ownership_refusal_at_info(self, caplog: pytest.LogCaptureFixture) -> None:
+        c1 = self._candidate("i1", "prod-3f9a1b2c4d5e")
+        policy = _recording_cleanup_policy(
+            candidates=[c1],
+            destroy_responses={
+                "i1": CleanupResult(
+                    refusal=CleanupRefusal.OWNERSHIP,
+                    error="image mismatch",
+                ),
+            },
+        )
+        orch = FakeOrchestrator(
+            units=[],
+            runner_factory=_mock_runner_factory(deploy_result=_ok_deploy()),
+            label_prefix="prod",
+            cleanup_policy=policy,
+        )
+        with caplog.at_level(logging.INFO, logger="vastai_gpu_runner.batch"):
+            orch._sweep_zombies()
+        records = [r for r in caplog.records if "refused (ownership)" in r.getMessage()]
+        assert records
+        assert records[0].levelno == logging.INFO
+
+    def test_sweep_logs_unrecognized_outcome_at_error(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        c1 = self._candidate("i1", "prod-3f9a1b2c4d5e")
+        # Defensive branch: construct a CleanupResult with a verdict
+        # value that's not a CleanupVerdict enum member. The orchestrator
+        # must log this at ERROR.
+        bogus_result = object.__new__(CleanupResult)
+        bogus_result.__dict__.update(
+            verdict="totally-unrecognized",
+            refusal=None,
+            error="?",
+        )
+        policy = _recording_cleanup_policy(
+            candidates=[c1],
+            destroy_responses={"i1": bogus_result},
+        )
+        orch = FakeOrchestrator(
+            units=[],
+            runner_factory=_mock_runner_factory(deploy_result=_ok_deploy()),
+            label_prefix="prod",
+            cleanup_policy=policy,
+        )
+        with caplog.at_level(logging.ERROR, logger="vastai_gpu_runner.batch"):
+            orch._sweep_zombies()
+        records = [r for r in caplog.records if "unrecognized cleanup outcome" in r.getMessage()]
+        assert records
+        assert records[0].levelno == logging.ERROR
+
+    def test_sweep_continues_on_destroy_fn_exception(self) -> None:
+        """A raising ``destroy_fn`` is contained by the policy and logged.
+
+        The orchestrator's loop continues: subsequent candidates are still
+        processed.
+        """
+
+        def _list() -> list[InstanceCandidate]:
+            return [
+                self._candidate("i1", "prod-3f9a1b2c4d5e"),
+                self._candidate("i2", "prod-abcdef012345"),
+            ]
+
+        def _destroy(candidate: InstanceCandidate) -> CleanupResult:
+            if candidate.instance_id == "i1":
+                raise RuntimeError("boom")
+            return CleanupResult(verdict=CleanupVerdict.DESTROYED)
+
+        policy = ProviderCleanupPolicy(
+            provider=Provider.VASTAI,
+            list_instances_fn=_list,
+            destroy_fn=_destroy,
+        )
+        orch = FakeOrchestrator(
+            units=[],
+            runner_factory=_mock_runner_factory(deploy_result=_ok_deploy()),
+            label_prefix="prod",
+            cleanup_policy=policy,
+        )
+        # The policy boundary converts the exception into UNKNOWN; the
+        # orchestrator logs WARNING and counts the second DESTROYED.
+        killed = orch._sweep_zombies()
+        assert killed == 1
+
+    def test_sweep_does_not_import_provider_modules(self) -> None:
+        """``batch._sweep_zombies`` source contains no ``providers.*`` references.
+
+        Keeps the orchestrator decoupled from any provider module so
+        test fixtures and consumer subclasses can import batch without
+        pulling provider SDKs. ``vastai_gpu_runner.cleanup_policy`` is
+        a local module — not a provider module — so its import path
+        is fine.
+        """
+        source = inspect.getsource(BatchOrchestrator._sweep_zombies)
+        assert "providers." not in source
+        assert "destroy_vastai_instance" not in source
+        assert "verify_instance_ownership" not in source
+
+
+# ---------------------------------------------------------------------------
+# label_prefix validation
+# ---------------------------------------------------------------------------
+
+
+class TestLabelPrefixValidation:
+    """``__init__`` enforces ``validate_label_prefix`` BEFORE any provider call."""
+
+    def test_accepts_non_empty_pre_stripped(self) -> None:
+        FakeOrchestrator(
+            units=[],
+            runner_factory=_mock_runner_factory(deploy_result=_ok_deploy()),
+            label_prefix="prod",
+        )
+
+    @pytest.mark.parametrize("bad", ["", " ", "  padded  "])
+    def test_rejects_empty_blank_padded(self, bad: str) -> None:
+        with pytest.raises(ValueError, match="label_prefix"):
+            FakeOrchestrator(
+                units=[],
+                runner_factory=_mock_runner_factory(deploy_result=_ok_deploy()),
+                label_prefix=bad,
+            )
+
+    def test_rejects_none(self) -> None:
+        with pytest.raises(ValueError, match="label_prefix"):
+            FakeOrchestrator(  # type: ignore[arg-type]
+                units=[],
+                runner_factory=_mock_runner_factory(deploy_result=_ok_deploy()),
+                label_prefix=None,  # type: ignore[arg-type]
+            )
 
 
 # ---------------------------------------------------------------------------
