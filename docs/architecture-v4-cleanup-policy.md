@@ -122,9 +122,14 @@ seventeenth draft was rejected with 3 BLOCKERs and 2 CONCERNs. The
 eighteenth draft was rejected with 3 BLOCKERs and 2 CONCERNs. The
 nineteenth draft was rejected with 3 BLOCKERs and 3 CONCERNs. The
 twentieth draft was rejected with 3 BLOCKERs, 2 CONCERNs, and 1 NIT.
-This twenty-first draft addresses every finding.
+The twenty-first draft was rejected with 1 BLOCKER and 1 NIT. This
+twenty-second draft addresses every finding.
 
-### Applied from the 24th-pass review (this pass)
+### Applied from the 26th-pass review (this pass)
+
+- **Terminal schema-0 states without a recoverable scope are accepted after the loader verifies terminal status.** (BLOCKER 1)
+- **Migration validates `label`, `label_scope`, and unit status as strings before any `rsplit` or set-membership operation; unexpected migration exceptions become `StateMigrationError`.** (BLOCKER 2)
+- **Review metadata advanced to the twenty-second draft and the 26th-pass prompt.** (NIT 1)
 
 - **`normalize_instance_id` lives only where the call sites need it.** (BLOCKER 1)
 - **Schema-0 terminal states recover the correct identity pair and respect `state_cls.TERMINAL_STATUSES`.** (BLOCKER 2)
@@ -2187,17 +2192,24 @@ def _migrate_pre_v4(data: dict, *, state_cls: type) -> tuple[dict, str | None]:
     """
     legacy_label = data.get("label", "") or ""
     label_scope = data.get("label_scope", "") or ""
+    if (
+        legacy_label and not isinstance(legacy_label, str)
+    ) or (label_scope and not isinstance(label_scope, str)):
+        return data, "legacy label and label_scope must be strings when present"
     raw_units = list(data.get("shards") or []) + list(data.get("jobs") or [])
     has_units = bool(raw_units)
     terminal_statuses = getattr(
         state_cls, "TERMINAL_STATUSES", TERMINAL_UNIT_STATUSES
     )
-    all_terminal = (
-        has_units
-        and all(
-            isinstance(u, dict) and u.get("status") in terminal_statuses
-            for u in raw_units
-        )
+
+    def _unit_status(unit: object) -> str | None:
+        if not isinstance(unit, dict):
+            return None
+        status = unit.get("status")
+        return status if isinstance(status, str) else None
+
+    all_terminal = has_units and all(
+        _unit_status(u) in terminal_statuses for u in raw_units
     )
     if not isinstance(data.get("shards"), (list, type(None))):
         return data, "shards must be a list or null in schema_version 0"
@@ -2207,12 +2219,8 @@ def _migrate_pre_v4(data: dict, *, state_cls: type) -> tuple[dict, str | None]:
     if not effective_scope:
         if has_units and not all_terminal:
             return data, "nonterminal state lacks a recoverable label scope"
-        if not has_units:
-            requested_label_prefix = ""
-            migrated_label_scope = ""
-        else:
-            requested_label_prefix = ""
-            migrated_label_scope = ""
+        requested_label_prefix = ""
+        migrated_label_scope = ""
     else:
         if (
             label_scope
@@ -2286,15 +2294,28 @@ def load_batch_state(
             "persisted jobs must be a list or null"
         )
     if schema_version == 0:
-        data, migration_error = _migrate_pre_v4(data, state_cls=state_cls)
+        try:
+            data, migration_error = _migrate_pre_v4(data, state_cls=state_cls)
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise StateMigrationError(
+                f"schema-0 migration failed: {exc}"
+            ) from exc
         if migration_error:
             raise StateMigrationError(migration_error)
-    if (
-        data.get("shards") or data.get("jobs")
-    ) and not data.get("label_scope"):
-        raise StateMigrationError(
-            "nonterminal state lacks a recoverable label scope"
+    raw_units = list(data.get("shards") or []) + list(data.get("jobs") or [])
+    has_units = bool(raw_units)
+    if has_units and not data.get("label_scope"):
+        all_terminal = all(
+            isinstance(u, dict) and isinstance(u.get("status"), str)
+            and u.get("status") in getattr(
+                state_cls, "TERMINAL_STATUSES", TERMINAL_UNIT_STATUSES
+            )
+            for u in raw_units
         )
+        if not all_terminal:
+            raise StateMigrationError(
+                "nonterminal state lacks a recoverable label scope"
+            )
     try:
         state = state_cls(**data)
     except (TypeError, ValueError) as exc:
@@ -3052,12 +3073,18 @@ match in `cli.py:instances` is removed.
 
 ## Review process
 
-This is the twenty-first design draft of the v4 architecture. Each prior
-draft was rejected and addressed. The twentieth draft was rejected
-with 3 BLOCKERs, 2 CONCERNs, and 1 NIT. This draft addresses every
-finding from the 24th-pass review:
+This is the twenty-second design draft of the v4 architecture. Each prior
+draft was rejected and addressed. The twenty-first draft was rejected
+with 1 BLOCKER and 1 NIT. This draft addresses every
+finding from the 26th-pass review:
 
-### Applied from the 24th-pass review (this pass)
+### Applied from the 26th-pass review (this pass)
+
+- **Terminal schema-0 states without a recoverable scope are accepted after the loader verifies terminal status.** (BLOCKER 1)
+- **Migration validates `label`, `label_scope`, and unit status as strings before any `rsplit` or set-membership operation; unexpected migration exceptions become `StateMigrationError`.** (BLOCKER 2)
+- **Review metadata advanced to the twenty-second draft and the 26th-pass prompt.** (NIT 1)
+
+### Applied from the 25th-pass review (prior pass)
 
 - **`normalize_instance_id` lives only where the call sites need it.** (BLOCKER 1)
 - **Schema-0 terminal states recover the correct identity pair and respect `state_cls.TERMINAL_STATUSES`.** (BLOCKER 2)
@@ -3158,7 +3185,7 @@ finding from the 24th-pass review:
 - NIT 1: `ABSENT` means the requested instance is absent from the
   fully validated API response.
 
-The 25th-pass review prompt for ChatGPT-with-GitHub-plugin:
+The 27th-pass review prompt for ChatGPT-with-GitHub-plugin:
 
 > Review the v4 architecture design at PR #22 (file:
 > docs/architecture-v4-cleanup-policy.md) against the v3 design at
@@ -3167,11 +3194,11 @@ The 25th-pass review prompt for ChatGPT-with-GitHub-plugin:
 > src/vastai_gpu_runner/providers/vastai.py. The v4 design
 > resolves issue #19.
 >
-> The twenty-first draft (applied to 24th-pass findings) introduced:
+> The twenty-second draft (applied to 26th-pass findings) introduced:
 >
-> 1. **`normalize_instance_id` lives only where the call sites need it.** (BLOCKER 1)
-> 2. **Schema-0 terminal states recover the correct identity pair and respect `state_cls.TERMINAL_STATUSES`.** (BLOCKER 2)
-> 3. **Persisted unit collections are validated as lists; raw TypeError paths are converted to `StateMigrationError`.** (BLOCKER 3)
+> 1. **Terminal schema-0 states without a recoverable scope are accepted after the loader verifies terminal status.** (BLOCKER 1)
+> 2. **Migration validates `label`, `label_scope`, and unit status as strings before any `rsplit` or set-membership operation; unexpected migration exceptions become `StateMigrationError`.** (BLOCKER 2)
+> 3. **Review metadata advanced to the twenty-second draft and the 26th-pass prompt.** (NIT 1)
 >
 > Additionally, identify any new BLOCKERs or CONCERNs. Focus on:
 >
