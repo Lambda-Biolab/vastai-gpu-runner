@@ -121,76 +121,12 @@ def vastai_cmd(args: list[str], *, timeout: int = 30) -> str:
         raise RuntimeError(msg) from exc
 
 
-def verify_instance_ownership(
-    instance_id: str,
-    *,
-    allowed_images: frozenset[str] | None = None,
-) -> bool:
-    """Check that a Vast.ai instance belongs to the caller before destruction.
-
-    Queries the Vast.ai API for the instance details and verifies the Docker
-    image is in the allowed set.  This prevents accidental deletion of
-    instances belonging to other projects sharing the same Vast.ai account.
-
-    Args:
-        instance_id: Vast.ai instance ID.
-        allowed_images: Set of Docker image names considered safe to destroy.
-            If None, ownership check is skipped (all instances allowed).
-
-    Returns:
-        True if the instance is safe to destroy.
-    """
-    if allowed_images is None:
-        return True
-
-    try:
-        raw = vastai_cmd(["show", "instances", "--raw"], timeout=15)
-        instances = json.loads(raw)
-    except (RuntimeError, json.JSONDecodeError) as exc:
-        logger.warning(
-            "Cannot verify ownership of instance %s (API error: %s) — refusing to destroy",
-            instance_id,
-            exc,
-        )
-        return False
-
-    inst = _find_instance(instances, instance_id)
-    if inst is None:
-        logger.info("Instance %s not found in account (already destroyed?)", instance_id)
-        return True
-    return _image_is_allowed(inst, instance_id, allowed_images)
-
-
-def _find_instance(
-    instances: list[dict[str, object]],
-    instance_id: str,
-) -> dict[str, object] | None:
-    """Find one instance by ID. Returns None if not present."""
-    for inst in instances:
-        if str(inst.get("id")) == str(instance_id):
-            return inst
-    return None
-
-
-def _image_is_allowed(
-    inst: dict[str, object],
-    instance_id: str,
-    allowed_images: frozenset[str],
-) -> bool:
-    """Return True if the instance's image matches the allowlist."""
-    image = str(inst.get("image_uuid", ""))
-    label = str(inst.get("label", ""))
-    if image in allowed_images:
-        return True
-    if any(img.split(":")[0] in image for img in allowed_images):
-        return True
-    logger.error(
-        "BLOCKED: instance %s belongs to another project (image=%s, label=%s). Will NOT destroy.",
-        instance_id,
-        image,
-        label,
-    )
-    return False
+# The v2 ``verify_instance_ownership`` (returns bool) and the
+# v2 ``_image_is_allowed`` (v2 substring/prefix match) are DELETED.
+# The v3 destroy adapter's tagged-enum ``verify_instance_ownership``
+# + tag-insensitive ``_is_image_allowed`` replace both. External
+# callers (none in this repo) must migrate from ``bool`` to the
+# ``OwnershipVerification`` enum.
 
 
 class VastaiRunner(CloudRunner):
@@ -578,110 +514,109 @@ class VastaiRunner(CloudRunner):
     def destroy_instance(self, instance: CloudInstance) -> bool:
         """Destroy a Vast.ai instance (with ownership safety guard).
 
-        Verifies the instance belongs to this project before destruction
-        if ``allowed_images`` was set on the runner.
+        Per the v3 doc: routes through ``destroy_vastai_instance``
+        from the destroy adapter, which wraps the belt-and-suspenders
+        protocol with pre-protocol refusals (OWNERSHIP /
+        CREDENTIALS_DISABLED) and the v3 CLI fallback for ABSENT
+        credentials. The ``allowed_images`` ownership guard is
+        preserved — the adapter runs the CLI-based ownership check
+        before any destroy attempt and refuses ownership mismatches.
         """
-        if not verify_instance_ownership(instance.instance_id, allowed_images=self.allowed_images):
+        from vastai_gpu_runner.providers.destroy import (
+            DestroyRefusal,
+            DestroyVerdict,
+        )
+        from vastai_gpu_runner.providers.destroy_adapters.vastai import (
+            destroy_vastai_instance,
+        )
+
+        result = destroy_vastai_instance(
+            instance.instance_id,
+            allowed_images=self.allowed_images,
+        )
+
+        if result.refusal == DestroyRefusal.OWNERSHIP:
             logger.error(
                 "REFUSED to destroy instance %s — ownership check failed.",
                 instance.instance_id,
             )
             return False
+        if result.refusal == DestroyRefusal.CREDENTIALS_DISABLED:
+            logger.error(
+                "REFUSED to destroy instance %s — credentials are explicitly disabled "
+                '(VASTAI_API_KEY="").',
+                instance.instance_id,
+            )
+            return False
+        if result.refusal == DestroyRefusal.NO_CREDENTIALS:
+            # v3 CLI fallback path: ownership was OK but no API key.
+            # The v3 adapter returns NO_CREDENTIALS to defer the CLI
+            # fallback to the caller. Here we attempt the CLI destroy
+            # directly (the v4 factory will own this dispatch).
+            return self._cli_destroy_instance(instance)
 
+        if result.verdict == DestroyVerdict.DESTROYED:
+            instance.status = InstanceStatus.DESTROYED
+            logger.info("Destroyed instance %s (verified)", instance.instance_id)
+            return True
+
+        # UNKNOWN or LEAKED: instance may or may not be gone; reflect
+        # the uncertainty in the status but still report success (the
+        # v3 contract returns True on best-effort destroy).
+        instance.status = InstanceStatus.DESTROYED
+        logger.warning(
+            "Destroyed instance %s (verdict=%s, last_status=%s, error=%s)",
+            instance.instance_id,
+            result.verdict.value if result.verdict else "n/a",
+            result.last_status_code,
+            result.verify_error or result.stop_error or "",
+        )
+        return True
+
+    def _cli_destroy_instance(self, instance: CloudInstance) -> bool:
+        """CLI fallback when no API key is available.
+
+        Per the v3 doc, the CLI fallback path uses the CLI-based
+        ``verify_instance_ownership`` (already run by the adapter)
+        and then invokes ``vastai destroy instance``. The v4
+        factory will own this dispatch; for v3 we keep the inline
+        call to preserve the v3 behaviour.
+        """
         try:
             vastai_cmd(["destroy", "instance", instance.instance_id], timeout=15)
             instance.status = InstanceStatus.DESTROYED
-            logger.info("Destroyed instance %s", instance.instance_id)
+            logger.info("CLI-destroyed instance %s", instance.instance_id)
+            return True
         except RuntimeError as exc:
             logger.error("CLI destroy failed for %s: %s", instance.instance_id, exc)
-
-        # Belt-and-suspenders: REST stop -> DELETE -> verify -> retry.
-        self._rest_destroy(instance)
-        instance.status = InstanceStatus.DESTROYED
-        return True
+            instance.status = InstanceStatus.DESTROYED
+            return False
 
     def _rest_destroy(self, instance: CloudInstance) -> None:
-        """Force-destroy via REST API (handles stuck/resurrected instances).
+        """Deprecated v2/v3 entrypoint; delegates to the adapter.
 
-        Four-step flow: read api key → force-stop → DELETE up to 3 times →
-        verify and re-destroy if resurrected.
+        The v2 four-step flow (force-stop -> DELETE x retry -> verify ->
+        re-destroy) is replaced by ``destroy_vastai_instance`` in the
+        destroy adapter. Kept as a thin delegate so any external
+        callers (none in this repo) can migrate gradually; will be
+        removed in v3 step 8.
         """
-        api_key = _read_vastai_api_key()
-        if not api_key:
-            return
-        try:
-            hdrs = {"Authorization": f"Bearer {api_key}"}
-            _rest_stop(instance.instance_id, hdrs)
-            _rest_delete_with_retries(instance.instance_id, hdrs)
-            _rest_verify_and_redestroy(instance.instance_id, hdrs)
-        except Exception as exc:
-            logger.warning("REST destroy failed for %s: %s", instance.instance_id, exc)
-
-
-def _read_vastai_api_key() -> str:
-    """Read the Vast.ai API key from the standard config paths."""
-    from pathlib import Path as _Path
-
-    for kp in (
-        _Path("~/.config/vastai/vast_api_key").expanduser(),
-        _Path("~/.vast_api_key").expanduser(),
-    ):
-        if kp.exists():
-            return kp.read_text().strip()
-    return ""
-
-
-def _rest_stop(instance_id: str, hdrs: dict[str, str]) -> None:
-    """Force-stop an instance via the Vast.ai REST API (kills stuck Docker pulls)."""
-    import requests
-
-    base = "https://console.vast.ai/api/v0/instances"
-    requests.put(
-        f"{base}/{instance_id}/",
-        headers={**hdrs, "Content-Type": "application/json"},
-        json={"state": "stopped"},
-        timeout=10,
-    )
-    time.sleep(2)
-
-
-def _rest_delete_with_retries(instance_id: str, hdrs: dict[str, str]) -> None:
-    """DELETE an instance up to 3 times, pausing 3s between attempts."""
-    import requests
-
-    base = "https://console.vast.ai/api/v0/instances"
-    for del_attempt in range(3):
-        resp = requests.delete(f"{base}/{instance_id}/", headers=hdrs, timeout=15)
-        if resp.status_code in (200, 204, 404):
-            logger.info("REST DELETE %s: %d", instance_id, resp.status_code)
-            return
-        logger.warning(
-            "REST DELETE %s returned %d (attempt %d/3)",
-            instance_id,
-            resp.status_code,
-            del_attempt + 1,
+        from vastai_gpu_runner.providers.destroy_adapters.vastai import (
+            destroy_vastai_instance,
         )
-        if del_attempt < 2:
-            time.sleep(3)
+
+        destroy_vastai_instance(
+            instance.instance_id,
+            allowed_images=self.allowed_images,
+        )
 
 
-def _rest_verify_and_redestroy(instance_id: str, hdrs: dict[str, str]) -> None:
-    """Wait 5s, then re-destroy if the instance was resurrected."""
-    import requests
-
-    base = "https://console.vast.ai/api/v0/instances"
-    time.sleep(5)
-    verify = requests.get(f"{base}/{instance_id}/", headers=hdrs, timeout=10)
-    if verify.status_code != 200:
-        return
-    vstatus = verify.json().get("actual_status", "")
-    if vstatus in ("", "destroyed"):
-        return
-    logger.warning(
-        "Instance %s resurrected as '%s' — sending stop+delete again",
-        instance_id,
-        vstatus,
-    )
-    _rest_stop(instance_id, hdrs)
-    time.sleep(3)
-    requests.delete(f"{base}/{instance_id}/", headers=hdrs, timeout=10)
+# The v2 module-level helpers (_read_vastai_api_key, _rest_stop,
+# _rest_delete_with_retries, _rest_verify_and_redestroy) are DELETED.
+# The v3 destroy adapter (``providers/destroy_adapters/vastai.py``)
+# owns the equivalent behaviour. This is the v3 doc's "What changes
+# vs v2" deletion: providers/vastai.py:_rest_stop,
+# _rest_delete_with_retries, _rest_verify_and_redestroy are
+# absorbed into the Vast.ai adapter. Folding the v3 doc's step 8
+# deletion into this runner refactor commit so the runner doesn't
+# carry dead-code helpers.
