@@ -822,9 +822,11 @@ class InstanceCandidate:
                 or not isinstance(value, (int, float))
                 or value != value  # NaN
                 or value in (float("inf"), float("-inf"))
+                or value < 0
             ):
                 raise ValueError(
-                    f"InstanceCandidate.{field_name} must be a finite real number"
+                    f"InstanceCandidate.{field_name} must be a non-negative "
+                    f"finite real number"
                 )
 
 
@@ -2103,39 +2105,120 @@ def validate_label_prefix(label_prefix: str) -> str:
 from uuid import uuid4
 
 
+class StateMigrationError(RuntimeError):
+    """Raised when persisted batch state cannot be migrated to v4."""
+
+
+CURRENT_SCHEMA_VERSION = 1
+_VALID_SCHEMA_VERSIONS = frozenset({CURRENT_SCHEMA_VERSION})
+
+
+_LABEL_SUFFIX_LEN = 12
+
+
+def _validate_label_scope_shape(scope: str, requested: str) -> str:
+    if not isinstance(scope, str) or not isinstance(requested, str):
+        raise StateMigrationError("label scope and request must be strings")
+    expected_prefix = f"{requested}-"
+    if not scope.startswith(expected_prefix):
+        raise StateMigrationError(
+            f"persisted label scope {scope!r} does not start with {expected_prefix!r}"
+        )
+    suffix = scope[len(expected_prefix):]
+    if len(suffix) != _LABEL_SUFFIX_LEN or not all(
+        c in "0123456789abcdef" for c in suffix
+    ):
+        raise StateMigrationError(
+            f"persisted label scope {scope!r} has malformed suffix"
+        )
+    return scope
+
+
 def resolve_label_scope(
     requested_prefix: str,
     persisted_scope: str | None,
-    persisted_requested_prefix: str = "",
+    persisted_requested_prefix: str | None = None,
 ) -> str:
     """Reuse a persisted scope or create one for a new batch.
 
-    The returned scope is always of the form
-    ``f"{requested}-{12 hex chars}"``. The persisted scope is reused
-    only when its required requested prefix matches; an unrecognized
-    persisted shape raises ``ValueError`` rather than silently
-    re-scoping an existing batch.
+    Valid input shapes:
+    - Genuinely new identity: ``persisted_scope is None`` and
+      ``persisted_requested_prefix is None``; a new canonical scope is
+      returned.
+    - Valid modern identity: ``persisted_scope`` is a canonical
+      ``f"{requested}-<12 hex>"`` scope; either no requested prefix
+      was stored or the stored prefix matches the current request.
+    - Legacy fallback: when ``persisted_scope`` is the legacy
+      ``label`` value, a stored ``requested_label_prefix`` may be
+      ``None`` and the resolver reuses the legacy value as the scope.
+
+    Every other partial or inconsistent state pair raises
+    :class:`StateMigrationError`; the resolver never silently
+    re-scopes an existing batch.
     """
+    if persisted_scope is None and persisted_requested_prefix is None:
+        return f"{validate_label_prefix(requested_prefix)}-{uuid4().hex[:_LABEL_SUFFIX_LEN]}"
+    if persisted_scope is None or persisted_requested_prefix is None:
+        raise StateMigrationError(
+            "persisted batch label identity is partial; either both "
+            "label_scope and requested_label_prefix are set, or neither is"
+        )
+    if not isinstance(persisted_scope, str) or not isinstance(persisted_requested_prefix, str):
+        raise StateMigrationError("persisted label identity fields must be strings")
     requested = validate_label_prefix(requested_prefix)
-    if not persisted_scope:
-        return f"{requested}-{uuid4().hex[:12]}"
-    persisted = validate_label_prefix(persisted_scope)
-    if persisted_requested_prefix:
-        stored_request = validate_label_prefix(persisted_requested_prefix)
-        if stored_request != requested:
-            raise ValueError(
-                "persisted batch prefix does not match the requested label"
+    stored_request = validate_label_prefix(persisted_requested_prefix)
+    if stored_request != requested:
+        raise StateMigrationError(
+            "persisted batch prefix does not match the requested label"
+        )
+    return _validate_label_scope_shape(persisted_scope, stored_request)
+
+
+def load_batch_state(
+    state_path: Path,
+    *,
+    state_cls: type,
+) -> state_cls | None:
+    """Load a v4 BatchState/JobBatchState or raise ``StateMigrationError``.
+
+    The legacy ``load_or_none`` helper always returns ``None`` on any
+    parse error, which silently re-scopes existing batches. This loader
+    raises :class:`StateMigrationError` instead whenever the persisted
+    state cannot be migrated into a v4 identity.
+    """
+    if not state_path.exists():
+        return None
+    data = json.loads(state_path.read_text())
+    schema_version = data.get("schema_version", 0)
+    if schema_version not in _VALID_SCHEMA_VERSIONS:
+        raise StateMigrationError(
+            f"unsupported schema_version {schema_version}; "
+            f"expected one of {sorted(_VALID_SCHEMA_VERSIONS)}"
+        )
+    label_scope = data.get("label_scope", "") or data.get("label", "")
+    if data.get("shards") or data.get("jobs"):
+        # Non-terminal state must have a recoverable scope.
+        if not label_scope or not _validate_label_scope_shape(label_scope, data.get("requested_label_prefix", "")):
+            raise StateMigrationError(
+                "nonterminal state lacks a recoverable label scope"
             )
-        return persisted
-    if not (
-        persisted.startswith(f"{requested}-")
-        and len(persisted) == len(requested) + 1 + 12
-        and all(c in "0123456789abcdef" for c in persisted[len(requested) + 1:])
+    return state_cls(**{**data, "schema_version": schema_version})
+
+
+def validate_label_scope_for_cleanup(scope_arg: str) -> str:
+    """Accept a full canonical scope or raise before manual cleanup."""
+    validated = validate_label_prefix(scope_arg)
+    suffix = validated.rsplit("-", 1)[-1]
+    if (
+        len(suffix) != _LABEL_SUFFIX_LEN
+        or any(c not in "0123456789abcdef" for c in suffix)
     ):
         raise ValueError(
-            "persisted label scope does not match the requested batch prefix"
+            "cleanup --label requires a full canonical scope "
+            "ending in 12 lowercase hex characters (e.g. prod-3f9a1b2c4d5e); "
+            "use --allow-adjacent-scopes to opt into broader matching"
         )
-    return persisted
+    return validated
 
 
 # BatchOrchestrator.__init__ replaces its direct assignment with:
@@ -2268,6 +2351,8 @@ creation and checkpoint persistence and reconstruction failures.
 # src/vastai_gpu_runner/cli.py (new "batch" subcommand)
 @app.command()
 def batch(
+    state_path: Annotated[str, typer.Option(help="Path to BatchState/JobBatchState JSON")] = ...,
+    job_batch: Annotated[bool, typer.Option(help="Use JobBatchState (default BatchState)")] = False,
     label: Annotated[str, typer.Option("--label", "-l")] = ...,
     image: Annotated[
         str, typer.Option("--image", help="Canonical Docker image owned by this project")
@@ -2277,36 +2362,55 @@ def batch(
 ) -> None:
     """Run a batch of cloud GPU units under the user's project image."""
     from dataclasses import replace
-    from vastai_gpu_runner.batch import resolve_label_scope
+    from pathlib import Path
+
+    from vastai_gpu_runner.batch import (
+        CURRENT_SCHEMA_VERSION,
+        StateMigrationError,
+        load_batch_state,
+        resolve_label_scope,
+    )
     from vastai_gpu_runner.cleanup_policy import OwnershipPolicy
     from vastai_gpu_runner.providers.vastai import (
         VastaiProviderConfig,
         VastaiRunner,
         build_vastai_cleanup_policy,
     )
+    from vastai_gpu_runner.state import BatchState, JobBatchState
 
-    # `persisted_label_scope` and `persisted_requested_prefix` are loaded
-    # from BatchState/JobBatchState before this composition; they are
-    # None / "" for a new batch.
+    state_path = Path(state_path)
+    state_cls = JobBatchState if job_batch else BatchState
+    try:
+        existing = load_batch_state(state_path, state_cls=state_cls)
+    except StateMigrationError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--label") from exc
+
+    persisted_scope = existing.label_scope if existing else None
+    persisted_requested_prefix = (
+        existing.requested_label_prefix if existing else None
+    )
+
     try:
         label_scope = resolve_label_scope(
             label,
-            persisted_label_scope,
+            persisted_scope,
             persisted_requested_prefix,
         )
-    except ValueError as exc:
+    except (StateMigrationError, ValueError) as exc:
         raise typer.BadParameter(str(exc), param_hint="--label") from exc
 
-    # Persist the label identity before any provider call so a crash
-    # before the first checkpoint still leaves a recoverable scope.
-    from vastai_gpu_runner.batch import persist_label_identity
-    from pathlib import Path
-    persist_label_identity(
-        Path(label_scope_state_path),
-        batch_id=label_scope,
-        label_scope=label_scope,
-        requested_label_prefix=label,
-    )
+    if existing is None:
+        state = state_cls(
+            batch_id=state_path.stem,
+            label_scope=label_scope,
+            requested_label_prefix=label,
+            schema_version=CURRENT_SCHEMA_VERSION,
+        )
+    else:
+        state = state_cls(
+            **{**existing.__dict__, "label_scope": label_scope, "requested_label_prefix": label}
+        )
+    state.save(state_path)
 
     base = VastaiProviderConfig.from_env()
     config = replace(
@@ -2338,7 +2442,19 @@ Empty `--allowed-images` is **fail-closed**:
 # src/vastai_gpu_runner/cli.py (cleanup command)
 @app.command()
 def cleanup(
-    label_prefix: Annotated[str, typer.Option("--label", "-l")] = ...,
+    scope_arg: Annotated[
+        str,
+        typer.Option(
+            "--label",
+            "-l",
+            help=(
+                "Full canonical batch scope, e.g. prod-3f9a1b2c4d5e. "
+                "Matches only labels starting with `<scope>-`. Use "
+                "--allow-adjacent-scopes to match any label that "
+                "starts with the requested prefix (DANGEROUS)."
+            ),
+        ),
+    ] = ...,
     adjacent_scopes: Annotated[
         bool,
         typer.Option(
@@ -2351,6 +2467,7 @@ def cleanup(
         ),
     ] = False,
     allowed_images: Annotated[
+
         str | None,
         typer.Option(
             "--allowed-images",  # canonical
@@ -2370,7 +2487,7 @@ def cleanup(
     """Destroy orphaned Vast.ai instances matching a label prefix."""
     _setup_logging(verbose)
     from rich.console import Console
-    from vastai_gpu_runner.batch import validate_label_prefix
+    from vastai_gpu_runner.batch import validate_label_scope_for_cleanup
     from vastai_gpu_runner.cleanup_policy import (
         CleanupVerdict,
         OwnershipPolicy,
@@ -2382,13 +2499,18 @@ def cleanup(
 
     console = Console()
     try:
-        label_prefix = validate_label_prefix(label_prefix)
+        canonical_scope = validate_label_scope_for_cleanup(scope_arg)
     except ValueError as exc:
         raise typer.BadParameter(str(exc), param_hint="--label") from exc
 
-    # Distinguish None (flag omitted → opt-out) from "" (explicit empty →
-    # fail-closed). Whitespace-only entries in comma-separated input are
-    # stripped; comma-only input becomes an empty set.
+    # Manual cleanup defaults to one exact batch scope (`<scope>-`).
+    # A broad requested-prefix match requires the dangerous opt-in.
+    scope_prefix = canonical_scope + ("-" if not adjacent_scopes else "")
+    candidates = cleanup_policy.list_instances()
+    matches = [c for c in candidates if c.label.startswith(scope_prefix)]
+    if not matches:
+        console.print(f"No instances matching label scope '{canonical_scope}'.")
+        return
     if allowed_images is None:
         ownership = OwnershipPolicy()
     else:
@@ -2588,7 +2710,7 @@ steps then build on v3's `providers/destroy.py` module
 
    - `BatchOrchestrator.__init__` accepts `cleanup_policy: ProviderCleanupPolicy` (required) and stores `validate_label_prefix(label_prefix)`; empty, whitespace-only, or padded prefixes raise `ValueError` before enumeration.
    - `_sweep_zombies` is policy-driven; logs every non-`DESTROYED` outcome at severity matching operational impact.
-   - Persist `label_scope: str = ""` and `requested_label_prefix: str = ""` in both `BatchState` (rename the unused `label` field) and `JobBatchState`. Define an explicit `SCHEMA_VERSION` and a migration loader: legacy state without `label_scope` keeps an empty value and is re-promoted only if the requested CLI prefix matches the legacy `label` field; otherwise `load_or_none()` raises a typed migration error and never silently re-scopes. Add a real pre-v4 JSON fixture test asserting the migration path is taken and legacy state is not silently re-scoped.
+   - Persist `label_scope: str = ""` and `requested_label_prefix: str = ""` in both `BatchState` (rename the unused `label` field) and `JobBatchState`; add `schema_version: int = CURRENT_SCHEMA_VERSION`. `load_or_none` raises `StateMigrationError` (not ``None``) when a nonterminal state lacks an exactly recoverable label_scope or carries an unknown schema_version. The CLI surfaces the typed exception as a fatal error before composition; legacy pre-v4 state files that the migration table cannot recover abort rather than silently re-scope. Add a real pre-v4 JSON fixture test asserting the migration path is taken and legacy state is not silently re-scoped.
    - Orchestrator tests:
      - Severity logging: `LEAKED` = `ERROR`, `UNKNOWN` / `CLI_ATTEMPTED` / `CREDENTIALS_DISABLED` = `WARNING`, unexpected `NO_CREDENTIALS` = `WARNING`, refusals = `INFO` (verified with `caplog`).
      - `_sweep_zombies` continues on `destroy_fn` exceptions (they return `verdict=UNKNOWN` with `type(exc).__name__: exc`).
@@ -2643,7 +2765,7 @@ steps then build on v3's `providers/destroy.py` module
   - `ProviderCleanupPolicy.destroy`: the outer boundary contains candidate-type/provider validation, callback execution, and result validation; malformed candidate/provider values never raise; provider mismatch returns `PROVIDER_MISMATCH` without `.value` access; callback exceptions or `None`/non-`CleanupResult` returns become `CleanupResult(verdict=UNKNOWN, ...)` with non-empty diagnostics.
   - `CleanupResult` invariants: verdict/refusal enum types and `error: str`, verdict/refusal exclusivity, empty `error` on both successful end-states (`DESTROYED` and `ALREADY_GONE`), and non-empty `error` on unresolved verdicts/refusals; string verdicts/refusals and `error=None` raise.
   - CLI cleanup and orchestrator reporting include a final defensive unknown-outcome branch rather than silently omitting an invalid `CleanupResult`.
-   - `InstanceCandidate.__post_init__`: invalid provider or non-string `label`, `state`, `image_uuid`, `ownership_key`, or `gpu_model` raises; non-finite/non-real `cost_per_hour` or `started_at` raises; empty/whitespace `instance_id` raises.
+   - `InstanceCandidate.__post_init__`: invalid provider or non-string `label`, `state`, `image_uuid`, `ownership_key`, or `gpu_model` raises; non-finite, non-real, boolean, or negative `cost_per_hour` or `started_at` raises; empty/whitespace `instance_id` raises.
 
 - `tests/test_providers_vastai.py`:
   - `read_vastai_api_key` env-first: `VASTAI_API_KEY=""` → `EXPLICITLY_DISABLED`; `VASTAI_API_KEY="key"` → `AVAILABLE`; no env + file → `AVAILABLE`; no env + blank file → `ABSENT` (with warning); `OSError` → `ABSENT` (with warning). Plus invalid input rejection: `state="unknown"` or `key=123` raises; unknown `state` is not silently used.
