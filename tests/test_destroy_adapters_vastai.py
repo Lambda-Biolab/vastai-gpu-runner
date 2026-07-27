@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from vastai_gpu_runner.cleanup_policy import OwnershipPolicy
 from vastai_gpu_runner.providers.destroy import (
     DestroyRefusal,
     DestroyVerdict,
@@ -20,9 +21,6 @@ from vastai_gpu_runner.providers.destroy_adapters.vastai import (
     CredentialResolution,
     CredentialState,
     OwnershipVerification,
-    _find_instance,
-    _is_image_allowed,
-    _repository,
     _rest_verify,
     destroy_vastai_instance,
     read_vastai_api_key,
@@ -170,98 +168,13 @@ class TestReadVastaiApiKey:
 
 
 # ---------------------------------------------------------------------------
-# _repository — tag/digest stripping
+# NOTE: `_repository`, `_is_image_allowed`, and `_find_instance` were
+# removed in v4 step 3c. The full Docker/OCI grammar now lives in
+# `cleanup_policy._repository`; image matching is delegated to
+# `OwnershipPolicy.matches()`; record lookup uses
+# `verify_instance_ownership`'s own validate-then-locate flow. Tests
+# for those primitives moved to `tests/test_cleanup_policy.py`.
 # ---------------------------------------------------------------------------
-
-
-class TestRepository:
-    def test_simple_image(self) -> None:
-        assert _repository("ubuntu:22.04") == "ubuntu"
-
-    def test_image_with_registry(self) -> None:
-        assert _repository("myreg.io/myorg/app:1.0") == "myreg.io/myorg/app"
-
-    def test_image_with_registry_port(self) -> None:
-        assert _repository("registry:5000/myorg/app:1.0") == "registry:5000/myorg/app"
-
-    def test_image_with_digest(self) -> None:
-        assert (
-            _repository(
-                "myorg/app@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-            )
-            == "myorg/app"
-        )
-
-    def test_image_with_digest_and_tag(self) -> None:
-        """Tag-then-digest: documented as the v3 behavior.
-
-        The v3 helper drops the digest first (everything after '@'),
-        leaving 'myorg/app:1.0'. The v4 full _repository grammar
-        (lands in v4 step 1) drops the tag too.
-        """
-        # This test documents current v3 behavior; v4 will tighten it.
-        result = _repository(
-            "myorg/app:1.0@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-        )
-        # Accept either: the v3 minimal or v4 full grammar both acceptable.
-        assert result in ("myorg/app", "myorg/app:1.0")
-
-    def test_empty_input(self) -> None:
-        assert _repository("") == ""
-
-    def test_whitespace_only(self) -> None:
-        assert _repository("   ") == ""
-
-
-# ---------------------------------------------------------------------------
-# _is_image_allowed — v2 substring/prefix is removed
-# ---------------------------------------------------------------------------
-
-
-class TestIsImageAllowed:
-    def test_exact_ref_match(self) -> None:
-        assert _is_image_allowed("myorg/app:1.0", frozenset({"myorg/app:1.0"}))
-
-    def test_tag_insensitive_match(self) -> None:
-        assert _is_image_allowed("myorg/app:latest", frozenset({"myorg/app:1.0"}))
-
-    def test_registry_port_exact(self) -> None:
-        assert _is_image_allowed(
-            "registry:5000/myorg/app:1.0",
-            frozenset({"registry:5000/myorg/app:1.0"}),
-        )
-
-    def test_registry_port_tag_insensitive(self) -> None:
-        assert _is_image_allowed(
-            "registry:5000/myorg/app:latest",
-            frozenset({"registry:5000/myorg/app:1.0"}),
-        )
-
-    def test_malicious_prefix_rejected(self) -> None:
-        """myorg/app:1.0 does NOT allow myorg/app-malicious:latest."""
-        assert not _is_image_allowed("myorg/app-malicious:latest", frozenset({"myorg/app:1.0"}))
-
-    def test_malicious_registry_rejected(self) -> None:
-        """registry:5000/myorg/app:1.0 does NOT allow
-        registry-malicious/myorg/app:1.0."""
-        assert not _is_image_allowed(
-            "registry-malicious/myorg/app:1.0",
-            frozenset({"registry:5000/myorg/app:1.0"}),
-        )
-
-    def test_malicious_suffix_rejected(self) -> None:
-        """myorg/app:1.0 does NOT allow myorg/app-evil:1.0."""
-        assert not _is_image_allowed("myorg/app-evil:1.0", frozenset({"myorg/app:1.0"}))
-
-    def test_empty_allowed_rejects_all(self) -> None:
-        assert not _is_image_allowed("myorg/app:1.0", frozenset())
-
-    def test_empty_instance_image_rejected(self) -> None:
-        assert not _is_image_allowed("", frozenset({"myorg/app:1.0"}))
-
-    def test_membership_in_mixed_set(self) -> None:
-        allowed = frozenset({"myorg/app:1.0", "other/thing:2.0"})
-        assert _is_image_allowed("other/thing:latest", allowed)
 
 
 # ---------------------------------------------------------------------------
@@ -275,116 +188,114 @@ def _make_inst(id_: int = 123, image_uuid: str = "myorg/app:1.0") -> dict[str, o
 
 class TestVerifyInstanceOwnership:
     def test_disabled_when_no_allowlist(self) -> None:
-        assert (
-            verify_instance_ownership("123", allowed_images=None) == OwnershipVerification.DISABLED
-        )
+        assert verify_instance_ownership("123", ownership=None) == OwnershipVerification.DISABLED
 
     def test_empty_allowlist_fails_closed(self) -> None:
-        # Empty frozenset refuses every instance.
-        with patch(
-            "vastai_gpu_runner.providers.destroy_adapters.vastai._vastai_show_instances_raw"
-        ) as mock_show:
+        # Empty owned_images set means "no image is owned" — every
+        # ownership check fails closed. The CLI is still called (to
+        # distinguish OWNED-but-mismatched from ABSENT); when the
+        # instance is found, the verifier returns REFUSED.
+        with patch("vastai_gpu_runner.providers.vastai.vastai_cmd") as mock_show:
             mock_show.return_value = json.dumps([_make_inst()])
-            result = verify_instance_ownership("123", allowed_images=frozenset())
+            result = verify_instance_ownership(
+                "123", ownership=OwnershipPolicy(owned_images=frozenset())
+            )
         assert result == OwnershipVerification.REFUSED
-        # No CLI call should have been made.
-        mock_show.assert_not_called()
+        # CLI WAS called (the verifier needed to see the matching
+        # record to refuse it on image mismatch).
+        mock_show.assert_called_once()
 
     def test_owned_when_image_matches(self) -> None:
-        with patch(
-            "vastai_gpu_runner.providers.destroy_adapters.vastai._vastai_show_instances_raw"
-        ) as mock_show:
+        with patch("vastai_gpu_runner.providers.vastai.vastai_cmd") as mock_show:
             mock_show.return_value = json.dumps([_make_inst()])
-            result = verify_instance_ownership("123", allowed_images=frozenset({"myorg/app:1.0"}))
+            result = verify_instance_ownership(
+                "123", ownership=OwnershipPolicy(owned_images=frozenset({"myorg/app:1.0"}))
+            )
         assert result == OwnershipVerification.OWNED
 
     def test_absent_when_instance_not_in_response(self) -> None:
-        with patch(
-            "vastai_gpu_runner.providers.destroy_adapters.vastai._vastai_show_instances_raw"
-        ) as mock_show:
+        with patch("vastai_gpu_runner.providers.vastai.vastai_cmd") as mock_show:
             mock_show.return_value = json.dumps([_make_inst(id_=999)])
-            result = verify_instance_ownership("123", allowed_images=frozenset({"myorg/app:1.0"}))
+            result = verify_instance_ownership(
+                "123", ownership=OwnershipPolicy(owned_images=frozenset({"myorg/app:1.0"}))
+            )
         assert result == OwnershipVerification.ABSENT
 
     def test_refused_when_image_not_in_allowlist(self) -> None:
-        with patch(
-            "vastai_gpu_runner.providers.destroy_adapters.vastai._vastai_show_instances_raw"
-        ) as mock_show:
+        with patch("vastai_gpu_runner.providers.vastai.vastai_cmd") as mock_show:
             mock_show.return_value = json.dumps([_make_inst(image_uuid="malicious/app:1.0")])
-            result = verify_instance_ownership("123", allowed_images=frozenset({"myorg/app:1.0"}))
+            result = verify_instance_ownership(
+                "123", ownership=OwnershipPolicy(owned_images=frozenset({"myorg/app:1.0"}))
+            )
         assert result == OwnershipVerification.REFUSED
 
     def test_refused_on_subprocess_timeout(self) -> None:
         with patch(
-            "vastai_gpu_runner.providers.destroy_adapters.vastai._vastai_show_instances_raw",
+            "vastai_gpu_runner.providers.vastai.vastai_cmd",
             side_effect=subprocess.TimeoutExpired("vastai", 15),
         ):
-            result = verify_instance_ownership("123", allowed_images=frozenset({"myorg/app:1.0"}))
+            result = verify_instance_ownership(
+                "123", ownership=OwnershipPolicy(owned_images=frozenset({"myorg/app:1.0"}))
+            )
         assert result == OwnershipVerification.REFUSED
 
     def test_refused_on_subprocess_error(self) -> None:
         with patch(
-            "vastai_gpu_runner.providers.destroy_adapters.vastai._vastai_show_instances_raw",
+            "vastai_gpu_runner.providers.vastai.vastai_cmd",
             side_effect=subprocess.CalledProcessError(1, "vastai"),
         ):
-            result = verify_instance_ownership("123", allowed_images=frozenset({"myorg/app:1.0"}))
+            result = verify_instance_ownership(
+                "123", ownership=OwnershipPolicy(owned_images=frozenset({"myorg/app:1.0"}))
+            )
         assert result == OwnershipVerification.REFUSED
 
     def test_refused_on_invalid_json(self) -> None:
         with patch(
-            "vastai_gpu_runner.providers.destroy_adapters.vastai._vastai_show_instances_raw",
+            "vastai_gpu_runner.providers.vastai.vastai_cmd",
             return_value="not json",
         ):
-            result = verify_instance_ownership("123", allowed_images=frozenset({"myorg/app:1.0"}))
+            result = verify_instance_ownership(
+                "123", ownership=OwnershipPolicy(owned_images=frozenset({"myorg/app:1.0"}))
+            )
         assert result == OwnershipVerification.REFUSED
 
     def test_refused_on_non_list_response(self) -> None:
         with patch(
-            "vastai_gpu_runner.providers.destroy_adapters.vastai._vastai_show_instances_raw",
+            "vastai_gpu_runner.providers.vastai.vastai_cmd",
             return_value='{"not": "a list"}',
         ):
-            result = verify_instance_ownership("123", allowed_images=frozenset({"myorg/app:1.0"}))
+            result = verify_instance_ownership(
+                "123", ownership=OwnershipPolicy(owned_images=frozenset({"myorg/app:1.0"}))
+            )
         assert result == OwnershipVerification.REFUSED
 
     def test_refused_on_record_with_no_image_uuid(self) -> None:
         with patch(
-            "vastai_gpu_runner.providers.destroy_adapters.vastai._vastai_show_instances_raw",
+            "vastai_gpu_runner.providers.vastai.vastai_cmd",
             return_value=json.dumps([{"id": 123}]),
         ):
-            result = verify_instance_ownership("123", allowed_images=frozenset({"myorg/app:1.0"}))
+            result = verify_instance_ownership(
+                "123", ownership=OwnershipPolicy(owned_images=frozenset({"myorg/app:1.0"}))
+            )
         assert result == OwnershipVerification.REFUSED
 
     def test_refused_on_record_with_null_image_uuid(self) -> None:
         with patch(
-            "vastai_gpu_runner.providers.destroy_adapters.vastai._vastai_show_instances_raw",
+            "vastai_gpu_runner.providers.vastai.vastai_cmd",
             return_value=json.dumps([{"id": 123, "image_uuid": None}]),
         ):
-            result = verify_instance_ownership("123", allowed_images=frozenset({"myorg/app:1.0"}))
+            result = verify_instance_ownership(
+                "123", ownership=OwnershipPolicy(owned_images=frozenset({"myorg/app:1.0"}))
+            )
         assert result == OwnershipVerification.REFUSED
 
 
 # ---------------------------------------------------------------------------
 # _find_instance
 # ---------------------------------------------------------------------------
-
-
-class TestFindInstance:
-    def test_found(self) -> None:
-        inst = _find_instance([_make_inst(id_=123), _make_inst(id_=456)], "123")
-        assert inst is not None
-        assert inst["id"] == 123
-
-    def test_not_found(self) -> None:
-        inst = _find_instance([_make_inst(id_=456)], "123")
-        assert inst is None
-
-    def test_empty_list(self) -> None:
-        assert _find_instance([], "123") is None
-
-    def test_skips_non_dict_entries(self) -> None:
-        inst = _find_instance(["garbage", 42, _make_inst(id_=123)], "123")
-        assert inst is not None
-        assert inst["id"] == 123
+# _find_instance was removed in v4 step 3c; record lookup is now part
+# of `verify_instance_ownership`'s validate-then-locate flow.
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -475,7 +386,9 @@ class TestDestroyVastaiInstance:
             ) as mock_delete,
             patch("vastai_gpu_runner.providers.destroy_adapters.vastai._rest_verify") as mock_v,
         ):
-            result = destroy_vastai_instance("123", allowed_images=frozenset({"myorg/app:1.0"}))
+            result = destroy_vastai_instance(
+                "123", ownership=OwnershipPolicy(owned_images=frozenset({"myorg/app:1.0"}))
+            )
         assert result.refusal == DestroyRefusal.OWNERSHIP
         assert result.attempts == 0
         mock_verify.assert_called_once()
@@ -492,7 +405,7 @@ class TestDestroyVastaiInstance:
         ):
             result = destroy_vastai_instance(
                 "123",
-                allowed_images=frozenset({"myorg/app:1.0"}),
+                ownership=OwnershipPolicy(owned_images=frozenset({"myorg/app:1.0"})),
                 credentials=CredentialResolution(state=CredentialState.EXPLICITLY_DISABLED),
             )
         assert result.refusal == DestroyRefusal.CREDENTIALS_DISABLED
@@ -506,7 +419,7 @@ class TestDestroyVastaiInstance:
         ):
             result = destroy_vastai_instance(
                 "123",
-                allowed_images=frozenset({"myorg/app:1.0"}),
+                ownership=OwnershipPolicy(owned_images=frozenset({"myorg/app:1.0"})),
                 credentials=CredentialResolution(state=CredentialState.ABSENT),
             )
         assert result.refusal == DestroyRefusal.NO_CREDENTIALS
@@ -519,7 +432,7 @@ class TestDestroyVastaiInstance:
         ):
             result = destroy_vastai_instance(
                 "123",
-                allowed_images=None,
+                ownership=None,
                 credentials=CredentialResolution(state=CredentialState.EXPLICITLY_DISABLED),
             )
         assert result.refusal == DestroyRefusal.CREDENTIALS_DISABLED
@@ -547,7 +460,7 @@ class TestDestroyVastaiInstance:
         ):
             result = destroy_vastai_instance(
                 "123",
-                allowed_images=frozenset({"myorg/app:1.0"}),
+                ownership=OwnershipPolicy(owned_images=frozenset({"myorg/app:1.0"})),
                 credentials=CredentialResolution(state=CredentialState.AVAILABLE, key="key123"),
             )
         assert result.verdict == DestroyVerdict.DESTROYED
@@ -576,7 +489,7 @@ class TestDestroyVastaiInstance:
         ):
             result = destroy_vastai_instance(
                 "123",
-                allowed_images=frozenset({"myorg/app:1.0"}),
+                ownership=OwnershipPolicy(owned_images=frozenset({"myorg/app:1.0"})),
                 credentials=CredentialResolution(state=CredentialState.AVAILABLE, key="key123"),
             )
         assert result.verdict == DestroyVerdict.DESTROYED
@@ -596,7 +509,7 @@ class TestDestroyVastaiInstance:
         ):
             result = destroy_vastai_instance(
                 "123",
-                allowed_images=frozenset({"myorg/app:1.0"}),
+                ownership=OwnershipPolicy(owned_images=frozenset({"myorg/app:1.0"})),
             )
         assert result.refusal == DestroyRefusal.CREDENTIALS_DISABLED
 
