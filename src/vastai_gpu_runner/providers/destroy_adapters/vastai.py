@@ -197,9 +197,6 @@ def _credential_file_paths() -> tuple[Path, ...]:
 from vastai_gpu_runner.cleanup_policy import (  # noqa: E402  (kept after local definitions for grouping)
     OwnershipVerification as _CleanupPolicyOwnershipVerification,
 )
-from vastai_gpu_runner.providers.vastai import (  # noqa: E402
-    verify_instance_ownership as _verify_instance_ownership_v4,
-)
 
 # Re-export the canonical (v4) enum under the v3 name so existing
 # import paths (`from vastai_gpu_runner.providers.destroy_adapters.vastai
@@ -219,6 +216,14 @@ def verify_instance_ownership(
     v3 callers passing ``allowed_images=`` are translated to an
     ``OwnershipPolicy`` here.
     """
+    # Lazy import to break the circular dependency:
+    # providers/vastai.py imports CredentialResolution etc. from
+    # this module; importing providers.vastai at module level would
+    # re-enter this module while it's still being constructed.
+    from vastai_gpu_runner.providers.vastai import (
+        verify_instance_ownership as _verify_instance_ownership_v4,
+    )
+
     if ownership is not None and allowed_images is not None:
         raise ValueError(
             "verify_instance_ownership: supply either ownership= or "

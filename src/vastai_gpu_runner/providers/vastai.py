@@ -29,14 +29,24 @@ from uuid import uuid4
 import requests
 
 from vastai_gpu_runner.cleanup_policy import (
+    CleanupRefusal,
+    CleanupResult,
+    CleanupVerdict,
     InstanceCandidate,
     OwnershipPolicy,
     OwnershipVerification,
+    ProviderCleanupPolicy,
     normalize_instance_id,
+)
+from vastai_gpu_runner.providers.destroy import (
+    DestroyRefusal,
+    DestroyResult,
+    DestroyVerdict,
 )
 from vastai_gpu_runner.providers.destroy_adapters.vastai import (
     CredentialResolution,
     CredentialState,
+    destroy_vastai_instance,
     read_vastai_api_key,
 )
 from vastai_gpu_runner.runner import CloudRunner
@@ -596,6 +606,252 @@ def verify_instance_ownership(
 
 
 # ---------------------------------------------------------------------------
+# _describe_destroy_result + build_vastai_cleanup_policy (v4 factory)
+# ---------------------------------------------------------------------------
+
+
+def _describe_destroy_result(result: DestroyResult) -> str:
+    """Build diagnostic text from v3 DestroyResult structured fields.
+
+    Single shared helper used by both ``VastaiRunner.destroy_instance``
+    and ``build_vastai_cleanup_policy._destroy``. Includes verdict +
+    refusal so the fallback "unrecognised result" log exposes the
+    actual typed outcome. Handles ``None`` fields gracefully (v3 uses
+    optional diagnostics). Always produces non-empty output.
+    """
+    return (
+        f"verdict={result.verdict!r}, refusal={result.refusal!r}, "
+        f"attempts={result.attempts}, "
+        f"last_status_code={result.last_status_code}, "
+        f"verify_error={result.verify_error!r}, "
+        f"stop_error={result.stop_error!r}"
+    )
+
+
+def _refusal_from_destroy(
+    candidate: InstanceCandidate,
+    result: DestroyResult,
+    refusal: CleanupRefusal,
+    error_prefix: str,
+) -> CleanupResult:
+    """Translate a v3 DestroyRefusal into a v4 CleanupResult.
+
+    Includes the structured destroy diagnostic in the error
+    message so the operator can see WHY the v3 adapter refused
+    (the v4 cleanup_policy doesn't suppress it).
+    """
+    return CleanupResult(
+        refusal=refusal,
+        error=(f"{error_prefix} {candidate.instance_id!r}; {_describe_destroy_result(result)}"),
+    )
+
+
+def _verdict_from_destroy(
+    candidate: InstanceCandidate,
+    result: DestroyResult,
+    verdict: CleanupVerdict,
+) -> CleanupResult:
+    """Translate a v3 DestroyVerdict into a v4 CleanupResult."""
+    return CleanupResult(
+        verdict=verdict,
+        error=_describe_destroy_result(result),
+    )
+
+
+def _cli_fallback(
+    candidate: InstanceCandidate,
+    ownership: OwnershipPolicy,
+) -> CleanupResult:
+    """CLI fallback path for ABSENT credentials.
+
+    The v3 adapter returns NO_CREDENTIALS when the API key is
+    not configured. We then verify ownership via the CLI auth
+    context (which uses the file-based key) and dispatch on
+    the verifier's tagged result:
+
+    - ``OWNED``    → run CLI destroy; report ``CLI_ATTEMPTED``
+                     (destruction unconfirmed — CLI exit is not
+                     a REST confirmation).
+    - ``DISABLED`` → ownership checking is off; proceed straight
+                     to CLI destroy (same ``CLI_ATTEMPTED``
+                     translation as ``OWNED``).
+    - ``ABSENT``   → the verifier proved the instance is already
+                     gone from a fully well-formed response.
+                     Short-circuit to ``ALREADY_GONE`` without
+                     invoking CLI destroy (a 'not found' CLI
+                     error would otherwise fabricate a spurious
+                     ``UNKNOWN``).
+    - ``REFUSED``  → the instance exists but is unowned, or the
+                     response is too malformed to prove absence.
+                     Refuse with ``OWNERSHIP`` and a diagnostic.
+
+    The function never raises: any unexpected exception in
+    CLI destroy becomes an ``UNKNOWN`` outcome with a
+    non-empty error string.
+    """
+    try:
+        verification = verify_instance_ownership(candidate.instance_id, ownership=ownership)
+    except Exception as exc:
+        return CleanupResult(
+            verdict=CleanupVerdict.UNKNOWN,
+            error=(f"CLI ownership verification raised {type(exc).__name__}: {exc}"),
+        )
+    if verification == OwnershipVerification.REFUSED:
+        return CleanupResult(
+            refusal=CleanupRefusal.OWNERSHIP,
+            error=(
+                f"CLI ownership check refused {candidate.instance_id!r} "
+                "(instance unowned or response malformed)"
+            ),
+        )
+    if verification == OwnershipVerification.ABSENT:
+        return CleanupResult(verdict=CleanupVerdict.ALREADY_GONE)
+    if verification not in (
+        OwnershipVerification.OWNED,
+        OwnershipVerification.DISABLED,
+    ):
+        # Defensive fail-closed: any unexpected verifier result
+        # (including the bool->OwnershipVerification conversion
+        # failing to migrate cleanly) refuses destruction.
+        return CleanupResult(
+            refusal=CleanupRefusal.OWNERSHIP,
+            error=(
+                "CLI ownership verifier returned unexpected result "
+                f"{verification!r}; refusing to destroy "
+                f"{candidate.instance_id!r}"
+            ),
+        )
+    # OWNED or DISABLED — proceed to CLI destroy.
+    try:
+        vastai_cmd(["destroy", "instance", candidate.instance_id], timeout=15)
+        return CleanupResult(
+            verdict=CleanupVerdict.CLI_ATTEMPTED,
+            error="CLI fallback ran; destruction not confirmed via REST",
+        )
+    except Exception as exc:
+        return CleanupResult(
+            verdict=CleanupVerdict.UNKNOWN,
+            error=f"CLI destroy raised {type(exc).__name__}: {exc}",
+        )
+
+
+def _check_eligibility(candidate: InstanceCandidate) -> CleanupResult | None:
+    """Eligibility check (negative allowlist: skip terminal states).
+
+    Returns a ``CleanupResult(INELIGIBLE_STATE)`` if the candidate
+    is not eligible, otherwise ``None`` to proceed.
+    """
+    if not candidate.state:
+        return CleanupResult(
+            refusal=CleanupRefusal.INELIGIBLE_STATE,
+            error="empty state",
+        )
+    if candidate.state in VASTAI_TERMINAL_STATES:
+        return CleanupResult(
+            refusal=CleanupRefusal.INELIGIBLE_STATE,
+            error=f"state {candidate.state!r} is terminal (already destroyed)",
+        )
+    return None
+
+
+def _destroy_one(
+    candidate: InstanceCandidate,
+    ownership: OwnershipPolicy,
+    credentials: CredentialResolution,
+) -> CleanupResult:
+    """Run the v3 adapter on one candidate; translate to v4 CleanupResult.
+
+    Steps:
+    1. Eligibility check (skip terminal states like ``destroyed``).
+    2. CREDENTIALS_DISABLED: refuse without provider calls.
+    3. Delegate to v3 adapter with the canonical ownership + credentials.
+    4. Translate the v3 ``DestroyResult`` into a v4 ``CleanupResult``:
+       - NO_CREDENTIALS → run the CLI fallback (the v4 factory owns
+         this dispatch).
+       - OWNERSHIP / CREDENTIALS_DISABLED → translate the refusal.
+       - DESTROYED → verdict=DESTROYED (empty error).
+       - LEAKED → verdict=LEAKED with structured diagnostic.
+       - UNKNOWN → verdict=UNKNOWN with structured diagnostic.
+    """
+    ineligible = _check_eligibility(candidate)
+    if ineligible is not None:
+        return ineligible
+
+    if credentials.state == CredentialState.EXPLICITLY_DISABLED:
+        return CleanupResult(
+            refusal=CleanupRefusal.CREDENTIALS_DISABLED,
+            error="VASTAI_API_KEY explicitly empty",
+        )
+
+    result = destroy_vastai_instance(
+        candidate.instance_id, ownership=ownership, credentials=credentials
+    )
+
+    if result.refusal == DestroyRefusal.NO_CREDENTIALS:
+        return _cli_fallback(candidate, ownership)
+    if result.refusal == DestroyRefusal.OWNERSHIP:
+        return _refusal_from_destroy(
+            candidate,
+            result,
+            CleanupRefusal.OWNERSHIP,
+            "v3 adapter refused: ownership check rejected",
+        )
+    if result.refusal == DestroyRefusal.CREDENTIALS_DISABLED:
+        return _refusal_from_destroy(
+            candidate,
+            result,
+            CleanupRefusal.CREDENTIALS_DISABLED,
+            "v3 adapter refused: VASTAI_API_KEY explicitly empty;",
+        )
+    if result.verdict == DestroyVerdict.DESTROYED:
+        return CleanupResult(verdict=CleanupVerdict.DESTROYED)
+    if result.verdict == DestroyVerdict.LEAKED:
+        return _verdict_from_destroy(candidate, result, CleanupVerdict.LEAKED)
+    return _verdict_from_destroy(candidate, result, CleanupVerdict.UNKNOWN)
+
+
+def build_vastai_cleanup_policy(
+    *,
+    ownership: OwnershipPolicy,
+    credentials: CredentialResolution,
+) -> ProviderCleanupPolicy:
+    """Build a Vast.ai cleanup policy from the canonical objects.
+
+    The two arguments are the same ``OwnershipPolicy`` and
+    ``CredentialResolution`` instances that the runner was
+    constructed with (the batch command extracts them from the
+    ``VastaiProviderConfig``; the cleanup command constructs them
+    directly from CLI args).
+
+    The wired ``list_instances_fn`` uses the canonical credential
+    snapshot: ``AVAILABLE`` enumerates through REST with the exact
+    API key, ``ABSENT`` uses the ambient CLI context, and
+    ``EXPLICITLY_DISABLED`` returns ``[]`` without any provider call.
+
+    The wired ``destroy_fn`` runs:
+        1. Eligibility check (skip terminal states like ``destroyed``).
+        2. ``destroy_vastai_instance`` with the canonical ownership + credentials.
+        3. If the adapter returns ``NO_CREDENTIALS``, run the CLI
+           fallback path: CLI ownership verification → CLI destroy →
+           ``CLI_ATTEMPTED`` (destruction unconfirmed) or ``UNKNOWN``.
+        4. Translate all three v3 verdicts and all three v3 refusals
+           into the v4 ``CleanupResult`` shape.
+    """
+
+    def _list_instances() -> list[InstanceCandidate]:
+        return list_vastai_instances(credentials=credentials)
+
+    def _destroy(candidate: InstanceCandidate) -> CleanupResult:
+        return _destroy_one(candidate, ownership, credentials)
+
+    return ProviderCleanupPolicy(
+        provider=Provider.VASTAI,
+        list_instances_fn=_list_instances,
+        destroy_fn=_destroy,
+    )
+
+
+# ---------------------------------------------------------------------------
 # VastaiProviderConfig
 # ---------------------------------------------------------------------------
 
@@ -1136,103 +1392,69 @@ class VastaiRunner(CloudRunner):
             )
 
     def destroy_instance(self, instance: CloudInstance) -> bool:
-        """Destroy a Vast.ai instance (with ownership safety guard).
+        """Destroy a Vast.ai instance — delegates to the v3 adapter + logs typed results.
 
-        Per the v3 doc: routes through ``destroy_vastai_instance``
-        from the destroy adapter, which wraps the belt-and-suspenders
-        protocol with pre-protocol refusals (OWNERSHIP /
-        CREDENTIALS_DISABLED) and the v3 CLI fallback for ABSENT
-        credentials. The ``allowed_images`` ownership guard is
-        preserved — the adapter runs the CLI-based ownership check
-        before any destroy attempt and refuses ownership mismatches.
+        Per the v4 doc:
+            The v2 implementation did inline ownership pre-check +
+            CLI destroy + belt-and-suspenders REST destroy + always
+            returned True. The v3 design moves all of that into
+            ``destroy_vastai_instance`` (the adapter); this method is
+            a single adapter call with no inline destroy logic.
+
+            Returns True iff the adapter reports ``verdict=DESTROYED``.
+            For every other outcome, the typed ``DestroyResult`` is
+            logged before returning False so operators can diagnose
+            why the destroy failed (LEAKED, UNKNOWN, or any refusal).
         """
-        from vastai_gpu_runner.providers.destroy import (
-            DestroyRefusal,
-            DestroyVerdict,
-        )
-        from vastai_gpu_runner.providers.destroy_adapters.vastai import (
-            destroy_vastai_instance,
-        )
-
         result = destroy_vastai_instance(
             instance.instance_id,
-            allowed_images=self.allowed_images,
+            ownership=self.ownership,
+            credentials=self.credentials,
         )
-
-        if result.refusal == DestroyRefusal.OWNERSHIP:
-            logger.error(
-                "REFUSED to destroy instance %s — ownership check failed.",
-                instance.instance_id,
-            )
-            return False
-        if result.refusal == DestroyRefusal.CREDENTIALS_DISABLED:
-            logger.error(
-                "REFUSED to destroy instance %s — credentials are explicitly disabled "
-                '(VASTAI_API_KEY="").',
-                instance.instance_id,
-            )
-            return False
-        if result.refusal == DestroyRefusal.NO_CREDENTIALS:
-            # v3 CLI fallback path: ownership was OK but no API key.
-            # The v3 adapter returns NO_CREDENTIALS to defer the CLI
-            # fallback to the caller. Here we attempt the CLI destroy
-            # directly (the v4 factory will own this dispatch).
-            return self._cli_destroy_instance(instance)
 
         if result.verdict == DestroyVerdict.DESTROYED:
             instance.status = InstanceStatus.DESTROYED
             logger.info("Destroyed instance %s (verified)", instance.instance_id)
             return True
 
-        # UNKNOWN or LEAKED: instance may or may not be gone; reflect
-        # the uncertainty in the status but still report success (the
-        # v3 contract returns True on best-effort destroy).
-        instance.status = InstanceStatus.DESTROYED
-        logger.warning(
-            "Destroyed instance %s (verdict=%s, last_status=%s, error=%s)",
-            instance.instance_id,
-            result.verdict.value if result.verdict else "n/a",
-            result.last_status_code,
-            result.verify_error or result.stop_error or "",
-        )
-        return True
-
-    def _cli_destroy_instance(self, instance: CloudInstance) -> bool:
-        """CLI fallback when no API key is available.
-
-        Per the v3 doc, the CLI fallback path uses the CLI-based
-        ``verify_instance_ownership`` (already run by the adapter)
-        and then invokes ``vastai destroy instance``. The v4
-        factory will own this dispatch; for v3 we keep the inline
-        call to preserve the v3 behaviour.
-        """
-        try:
-            vastai_cmd(["destroy", "instance", instance.instance_id], timeout=15)
-            instance.status = InstanceStatus.DESTROYED
-            logger.info("CLI-destroyed instance %s", instance.instance_id)
-            return True
-        except RuntimeError as exc:
-            logger.error("CLI destroy failed for %s: %s", instance.instance_id, exc)
-            instance.status = InstanceStatus.DESTROYED
-            return False
-
-    def _rest_destroy(self, instance: CloudInstance) -> None:
-        """Deprecated v2/v3 entrypoint; delegates to the adapter.
-
-        The v2 four-step flow (force-stop -> DELETE x retry -> verify ->
-        re-destroy) is replaced by ``destroy_vastai_instance`` in the
-        destroy adapter. Kept as a thin delegate so any external
-        callers (none in this repo) can migrate gradually; will be
-        removed in v3 step 8.
-        """
-        from vastai_gpu_runner.providers.destroy_adapters.vastai import (
-            destroy_vastai_instance,
-        )
-
-        destroy_vastai_instance(
-            instance.instance_id,
-            allowed_images=self.allowed_images,
-        )
+        # Non-DESTROYED: log the typed result before collapsing to False.
+        if result.verdict == DestroyVerdict.LEAKED:
+            logger.error(
+                "Destroy %s LEAKED — manual review required: %s",
+                instance.instance_id,
+                _describe_destroy_result(result),
+            )
+        elif result.verdict == DestroyVerdict.UNKNOWN:
+            logger.warning(
+                "Destroy %s outcome=UNKNOWN: %s",
+                instance.instance_id,
+                _describe_destroy_result(result),
+            )
+        elif result.refusal == DestroyRefusal.OWNERSHIP:
+            logger.error(
+                "Destroy %s refused (ownership check rejected): %s",
+                instance.instance_id,
+                _describe_destroy_result(result),
+            )
+        elif result.refusal == DestroyRefusal.NO_CREDENTIALS:
+            logger.error(
+                "Destroy %s refused (no credentials): %s",
+                instance.instance_id,
+                _describe_destroy_result(result),
+            )
+        elif result.refusal == DestroyRefusal.CREDENTIALS_DISABLED:
+            logger.error(
+                "Destroy %s refused (credentials disabled): %s",
+                instance.instance_id,
+                _describe_destroy_result(result),
+            )
+        else:
+            logger.error(
+                "Destroy %s returned unrecognised result: %s",
+                instance.instance_id,
+                _describe_destroy_result(result),
+            )
+        return False
 
 
 # The v2 module-level helpers (_read_vastai_api_key, _rest_stop,
