@@ -115,8 +115,7 @@ draft was rejected with 2 BLOCKERs, 1 CONCERN, and 1 NIT. The
 eleventh draft was rejected with 3 BLOCKERs and 2 CONCERNs. The twelfth
 draft was rejected with 2 BLOCKERs and 2 CONCERNs. The thirteenth
 draft was rejected with 3 BLOCKERs, 2 CONCERNs, and 1 NIT. The
-thirteenth draft was rejected with 3 BLOCKERs, 2 CONCERNs, and 1 NIT.
-The fourteenth draft was rejected with 2 BLOCKERs and 2 CONCERNs. The
+fourteenth draft was rejected with 2 BLOCKERs and 2 CONCERNs. The
 fifteenth draft was rejected with 2 BLOCKERs and 2 CONCERNs. The
 sixteenth draft was rejected with 3 BLOCKERs and 2 CONCERNs. The
 seventeenth draft was rejected with 3 BLOCKERs and 2 CONCERNs. The
@@ -2200,16 +2199,26 @@ def _migrate_pre_v4(data: dict, *, state_cls: type) -> tuple[dict, str | None]:
             for u in raw_units
         )
     )
-    nonterminal = has_units and not all_terminal
     if not isinstance(data.get("shards"), (list, type(None))):
         return data, "shards must be a list or null in schema_version 0"
     if not isinstance(data.get("jobs"), (list, type(None))):
         return data, "jobs must be a list or null in schema_version 0"
-    if nonterminal:
-        effective_scope = label_scope or legacy_label
-        if not effective_scope:
+    effective_scope = label_scope or legacy_label
+    if not effective_scope:
+        if has_units and not all_terminal:
             return data, "nonterminal state lacks a recoverable label scope"
-        if label_scope and legacy_label and label_scope != legacy_label:
+        if not has_units:
+            requested_label_prefix = ""
+            migrated_label_scope = ""
+        else:
+            requested_label_prefix = ""
+            migrated_label_scope = ""
+    else:
+        if (
+            label_scope
+            and legacy_label
+            and label_scope != legacy_label
+        ):
             return data, (
                 "pre-v4 state has both legacy label and label_scope; "
                 "they disagree"
@@ -2223,10 +2232,9 @@ def _migrate_pre_v4(data: dict, *, state_cls: type) -> tuple[dict, str | None]:
             requested_label_prefix = parts[0]
         else:
             requested_label_prefix = effective_scope
-    else:
-        requested_label_prefix = label_scope or legacy_label
+        migrated_label_scope = effective_scope
     migrated = dict(data)
-    migrated["label_scope"] = label_scope or legacy_label
+    migrated["label_scope"] = migrated_label_scope
     migrated["requested_label_prefix"] = requested_label_prefix
     migrated["schema_version"] = CURRENT_SCHEMA_VERSION
     migrated.pop("label", None)
