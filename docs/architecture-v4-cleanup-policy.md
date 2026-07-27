@@ -61,7 +61,7 @@ match is removed).
 Diff vs v3 once v3 is implemented:
 
 - **+** `src/vastai_gpu_runner/cleanup_policy.py` — `ProviderCleanupPolicy` (frozen, `kw_only`), `InstanceCandidate` (frozen, non-empty `instance_id` invariant), `CleanupVerdict` enum (`DESTROYED | ALREADY_GONE | CLI_ATTEMPTED | LEAKED | UNKNOWN`), `CleanupRefusal` enum (`OWNERSHIP | NO_CREDENTIALS | CREDENTIALS_DISABLED | INELIGIBLE_STATE | PROVIDER_MISMATCH`), `CleanupResult` (typed return with `__post_init__` invariants), `OwnershipPolicy` (frozen, `matches(image_ref)`, declared `_normalised` cache field, narrowed for strict type checking).
-- **+** `src/vastai_gpu_runner/providers/vastai.py:VastaiProviderConfig` (frozen, owns `ownership: OwnershipPolicy`, `credentials: CredentialResolution`, `docker_image`, etc.)
+- **+** `src/vastai_gpu_runner/providers/vastai.py:VastaiProviderConfig` (frozen, owns `ownership: OwnershipPolicy`, `credentials: CredentialResolution`, optional `label_prefix`, `docker_image`, etc.)
 - **+** `src/vastai_gpu_runner/providers/vastai.py:build_vastai_cleanup_policy(*, ownership, credentials)` — provider-owned factory that takes the two canonical objects directly (no config wrapper)
 - **+** `src/vastai_gpu_runner/providers/vastai.py:list_vastai_instances(*, credentials)` — credential-aware read-only enumeration returning `list[InstanceCandidate]`: explicit-key REST pagination for `AVAILABLE`, ambient CLI for `ABSENT`, and no provider call for `EXPLICITLY_DISABLED`.
 - **+** `src/vastai_gpu_runner/providers/vastai.py:_describe_destroy_result(result)` — single shared diagnostic helper, used by both the runner and the factory; includes `verdict` + `refusal` in the output
@@ -120,9 +120,11 @@ twelfth draft addresses every finding.
 - **Full image-reference grammar.** `_repository` validates tag
   grammar/length, repository components, registry hosts/ports, and
   digests before normalization. (BLOCKER 1)
-- **Non-empty label scope invariant.** `BatchOrchestrator.__init__`,
+- **Non-empty and unique label scope invariant.** `BatchOrchestrator.__init__`,
   `batch --label`, and `cleanup --label` reject empty, blank, or
-  padded prefixes before enumeration. (BLOCKER 2)
+  padded prefixes; batch composition derives one unique scope and
+  passes it to both the runner and orchestrator before enumeration.
+  (BLOCKER 2)
 - **Duplicate enumeration IDs fail closed.** Duplicate canonical IDs
   within or across REST pages discard the complete enumeration before
   label filtering or destruction. (BLOCKER 3)
@@ -419,6 +421,26 @@ logger = logging.getLogger(__name__)
 _DIGEST_RE = re.compile(
     r"[A-Za-z][A-Za-z0-9]*(?:[+._-][A-Za-z][A-Za-z0-9]*)*:[A-Za-z0-9=_-]+"
 )
+_REGISTERED_DIGEST_LENGTHS = {
+    "sha256": 64,
+    "sha512": 128,
+    "blake3": 64,
+}
+def _valid_digest(digest: str) -> bool:
+    match = _DIGEST_RE.fullmatch(digest)
+    if match is None:
+        return False
+    algorithm, encoded = digest.split(":", 1)
+    required_length = _REGISTERED_DIGEST_LENGTHS.get(algorithm)
+    if required_length is None:
+        return True
+    return (
+        len(encoded) == required_length
+        and encoded == encoded.lower()
+        and re.fullmatch(r"[0-9a-f]+", encoded) is not None
+    )
+
+
 _TAG_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}")
 _PATH_COMPONENT_RE = re.compile(
     r"[a-z0-9]+(?:(?:[._]|__|[-]+)[a-z0-9]+)*"
@@ -501,7 +523,7 @@ def _repository(ref: str) -> str:
 
     if "@" in ref:
         without_digest, digest = ref.split("@", 1)
-        if not without_digest or _DIGEST_RE.fullmatch(digest) is None:
+        if not without_digest or not _valid_digest(digest):
             return ""
     else:
         without_digest = ref
@@ -768,6 +790,16 @@ class CleanupResult:
     error: str = ""
 
     def __post_init__(self) -> None:
+        if self.verdict is not None and not isinstance(self.verdict, CleanupVerdict):
+            raise ValueError(
+                "CleanupResult.verdict must be a CleanupVerdict or None"
+            )
+        if self.refusal is not None and not isinstance(self.refusal, CleanupRefusal):
+            raise ValueError(
+                "CleanupResult.refusal must be a CleanupRefusal or None"
+            )
+        if not isinstance(self.error, str):
+            raise ValueError("CleanupResult.error must be a string")
         if (self.verdict is None) == (self.refusal is None):
             raise ValueError(
                 "CleanupResult: exactly one of verdict or refusal must be set"
@@ -1101,6 +1133,7 @@ import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import AbstractSet
+from uuid import uuid4
 
 import requests
 
@@ -1363,7 +1396,7 @@ class VastaiProviderConfig:
     """Canonical Vast.ai configuration shared by runner factory + cleanup policy.
 
     The runner factory (``VastaiRunner.from_config``) reads
-    ``ownership``, ``credentials``, ``docker_image``, and
+    ``ownership``, ``credentials``, ``label_prefix``, ``docker_image``, and
     ``setup_commands`` from this. The cleanup-policy factory
     (``build_vastai_cleanup_policy``) reads only ``ownership`` and
     ``credentials`` — the deployment-image invariant does not apply
@@ -1374,6 +1407,9 @@ class VastaiProviderConfig:
         - ``docker_image`` is in ``ownership.owned_images`` unless
           ``ownership.owned_images is None`` (ownership check disabled).
         - ``credentials`` is a v3 ``CredentialResolution`` (frozen).
+        - ``label_prefix`` is either ``None`` (non-batch runner) or
+          a non-empty, pre-stripped string; batch composition always
+          supplies a unique scope.
     """
 
     docker_image: str = DEFAULT_IMAGE
@@ -1381,10 +1417,20 @@ class VastaiProviderConfig:
     credentials: CredentialResolution = field(
         default_factory=lambda: CredentialResolution(state=CredentialState.ABSENT)
     )
+    label_prefix: str | None = None
     min_gpu_vram_mib: int = MIN_GPU_VRAM_MIB
     setup_commands: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        if self.label_prefix is not None and (
+            not isinstance(self.label_prefix, str)
+            or not self.label_prefix
+            or self.label_prefix != self.label_prefix.strip()
+        ):
+            raise ValueError(
+                "VastaiProviderConfig.label_prefix must be None or a "
+                "non-empty, pre-stripped string"
+            )
         if not self.docker_image or self.docker_image != self.docker_image.strip():
             raise ValueError(
                 "VastaiProviderConfig.docker_image must be a non-empty, pre-stripped reference"
@@ -1405,6 +1451,7 @@ class VastaiProviderConfig:
         *,
         docker_image: str | None = None,
         owned_images: AbstractSet[str] | None = None,
+        label_prefix: str | None = None,
     ) -> "VastaiProviderConfig":
         """Build from environment / config files.
 
@@ -1420,6 +1467,7 @@ class VastaiProviderConfig:
             docker_image=resolved_image,
             ownership=OwnershipPolicy(owned_images=owned_images),
             credentials=read_vastai_api_key(),
+            label_prefix=label_prefix,
         )
 
 
@@ -1438,6 +1486,9 @@ class VastaiRunner(CloudRunner):
         credentials: Pre-resolved credential state. When None,
             the runner passes ``None`` to the adapter, which
             calls ``read_vastai_api_key()`` (the v3 back-compat path).
+        label_prefix: Immutable batch label scope. Batch composition
+            always supplies a unique, validated scope; non-batch
+            callers may leave it None.
         docker_image: Docker image to use for new instances.
         min_gpu_vram_mib: Minimum GPU VRAM required (default 20 GB).
         setup_commands: Optional pre-instance setup commands.
@@ -1455,11 +1506,21 @@ class VastaiRunner(CloudRunner):
         *,
         ownership: OwnershipPolicy | None = None,
         credentials: CredentialResolution | None = None,
+        label_prefix: str | None = None,
         allowed_images: frozenset[str] | None = None,  # DEPRECATED
         docker_image: str = DEFAULT_IMAGE,
         min_gpu_vram_mib: int = MIN_GPU_VRAM_MIB,
         setup_commands: list[str] | None = None,
     ) -> None:
+        if label_prefix is not None and (
+            not isinstance(label_prefix, str)
+            or not label_prefix
+            or label_prefix != label_prefix.strip()
+        ):
+            raise ValueError(
+                "VastaiRunner.label_prefix must be None or a "
+                "non-empty, pre-stripped string"
+            )
         if ownership is not None and allowed_images is not None:
             raise ValueError(
                 "VastaiRunner: supply either ownership= or allowed_images= "
@@ -1477,6 +1538,7 @@ class VastaiRunner(CloudRunner):
         super().__init__(config)
         self.ownership = ownership
         self.credentials = credentials
+        self.label_prefix = label_prefix
         # Back-compat read access for existing callers.
         self._allowed_images_for_backcompat = (
             frozenset(ownership.owned_images)
@@ -1504,10 +1566,20 @@ class VastaiRunner(CloudRunner):
         return cls(
             ownership=canonical.ownership,
             credentials=canonical.credentials,
+            label_prefix=canonical.label_prefix,
             docker_image=canonical.docker_image,
             min_gpu_vram_mib=canonical.min_gpu_vram_mib,
             setup_commands=list(canonical.setup_commands),
         )
+
+    def _next_instance_label(self) -> str:
+        """Create a unique label inside this runner's immutable batch scope."""
+        prefix = self.label_prefix or "gpu-runner"
+        return f"{prefix}-{uuid4().hex[:12]}"
+
+    # ``create_instance`` passes ``self._next_instance_label()`` as the
+    # provider label for every new instance; it never invents a separate
+    # batch prefix.
 
     # ... wait_for_boot, verify_gpu, deploy_files, setup_environment,
     # launch_worker, check_progress, list_remote_files, download_file,
@@ -1641,6 +1713,11 @@ def _list_vastai_instances_cli() -> list[object]:
     return instances
 
 
+def _string_or_empty(value: object) -> str:
+    """Normalize nullable provider strings without creating literal ``"None"``."""
+    return value if isinstance(value, str) else ""
+
+
 def list_vastai_instances(
     *,
     credentials: CredentialResolution,
@@ -1666,6 +1743,10 @@ def list_vastai_instances(
         - Duplicate canonical IDs, whether within one page or across
           REST pages, discard the entire enumeration before any
           candidate can reach label filtering or destruction.
+        - Nullable or non-string ``image_uuid``, ``label``, and
+          ``actual_status`` values normalize to ``""``; an empty label
+          cannot match a non-empty scope and an empty state is refused
+          by the factory.
         - Other malformed fields are caught by the per-record
           ``try`` block.
 
@@ -1717,17 +1798,17 @@ def list_vastai_instances(
         seen_candidate_ids.add(canonical_id)
         instance_id = canonical_id
         try:
-            image_uuid = str(inst.get("image_uuid", ""))
+            image_uuid = _string_or_empty(inst.get("image_uuid"))
             candidates.append(
                 InstanceCandidate(
                     provider=Provider.VASTAI,
                     instance_id=instance_id,
                     image_uuid=image_uuid,
                     ownership_key=image_uuid,  # Vast.ai: image_uuid is the ownership key
-                    gpu_model=str(inst.get("gpu_name", "")),
+                    gpu_model=_string_or_empty(inst.get("gpu_name")),
                     cost_per_hour=float(inst.get("dph_total", 0.0) or 0.0),
-                    label=str(inst.get("label", "")),
-                    state=str(inst.get("actual_status", "")),
+                    label=_string_or_empty(inst.get("label")),
+                    state=_string_or_empty(inst.get("actual_status")),
                     started_at=float(inst.get("start_date", 0.0) or 0.0),
                 )
             )
@@ -2038,6 +2119,15 @@ def _sweep_zombies(self) -> int:
                 result.refusal.value,
                 result.error,
             )
+        else:
+            logger.error(
+                "Zombie sweep: %s returned unrecognized cleanup outcome: "
+                "verdict=%r refusal=%r error=%s",
+                candidate.instance_id,
+                result.verdict,
+                result.refusal,
+                result.error,
+            )
     if killed:
         logger.info("Zombie sweep: destroyed %d instance(s)", killed)
     return killed
@@ -2069,6 +2159,7 @@ def batch(
 ) -> None:
     """Run a batch of cloud GPU units under the user's project image."""
     from dataclasses import replace
+    from uuid import uuid4
     from vastai_gpu_runner.batch import validate_label_prefix
     from vastai_gpu_runner.cleanup_policy import OwnershipPolicy
     from vastai_gpu_runner.providers.vastai import (
@@ -2082,11 +2173,13 @@ def batch(
     except ValueError as exc:
         raise typer.BadParameter(str(exc), param_hint="--label") from exc
 
+    label_scope = f"{label}-{uuid4().hex[:12]}"
     base = VastaiProviderConfig.from_env()
     config = replace(
         base,
         docker_image=image,
         ownership=OwnershipPolicy(owned_images=frozenset({image})),
+        label_prefix=label_scope,
     )
 
     runner_factory = lambda: VastaiRunner.from_config(config)  # noqa: E731
@@ -2099,7 +2192,7 @@ def batch(
     orch = MyOrchestrator(
         runner_factory=runner_factory,
         cleanup_policy=cleanup_policy,
-        label_prefix=label,
+        label_prefix=label_scope,
     )
     orch.run()
 ```
@@ -2198,13 +2291,19 @@ def cleanup(
         elif result.verdict == CleanupVerdict.ALREADY_GONE:
             console.print(f"  [green]Already gone[/green] {c.instance_id}")
             already_gone += 1
-        else:
+        elif result.verdict is not None or result.refusal is not None:
             kind = (
                 result.verdict.value
                 if result.verdict is not None
                 else result.refusal.value
             )
             console.print(f"  [red]{kind}[/red] {c.instance_id}: {result.error}")
+            unresolved += 1
+        else:
+            console.print(
+                f"  [red]unknown_cleanup_outcome[/red] {c.instance_id}: "
+                "cleanup returned no verdict or refusal"
+            )
             unresolved += 1
     console.print(
         f"\nDestroyed: {destroyed}; already gone: {already_gone}; "
@@ -2310,12 +2409,12 @@ steps then build on v3's `providers/destroy.py` module
 2. **Add canonical ownership-policy type + invariant tests.**
    - `cleanup_policy.py:OwnershipPolicy` (frozen, `matches(image_ref)` with `_repository`; declared `_normalised` cache field, narrowed for strict type checking).
    - `cleanup_policy.py:ProviderCleanupPolicy` stores only provider identity and generic callbacks; provider-specific ownership is captured by provider factories, not exposed on the generic contract.
-   - Property tests: `OwnershipPolicy.matches` is reflexive, tag-insensitive, digest-by-repository, registry-port-aware, narrow type-checked, and fail-closed on empty sets or malformed full references (invalid/overlong tags, invalid digests, registry hosts/ports, and repository path components).
+   - Property tests: `OwnershipPolicy.matches` is reflexive, tag-insensitive, digest-by-repository, registry-port-aware, narrow type-checked, and fail-closed on empty sets or malformed full references (invalid/overlong tags, short/uppercase/non-hex registered digests, invalid generic digests, registry hosts/ports, and repository path components).
    - The `_normalised` is precomputed in `__post_init__`; `matches` is O(1) per call.
 
 3. **Add Vast.ai runner + cleanup adapter.**
-   - `providers/vastai.py:VastaiProviderConfig` (frozen, with `__post_init__` invariants).
-   - `providers/vastai.py:VastaiRunner.from_config(canonical)` — preserves `ownership` and `credentials`.
+   - `providers/vastai.py:VastaiProviderConfig` (frozen, with `ownership`, `credentials`, and an optional validated `label_prefix`; batch composition always supplies a unique scope).
+   - `providers/vastai.py:VastaiRunner.from_config(canonical)` — preserves `ownership`, `credentials`, and `label_prefix`; every created instance uses that scope plus a unique suffix.
    - `VastaiRunner.__init__` adds `ownership: OwnershipPolicy | None` + `credentials: CredentialResolution | None` parameters; rejects simultaneous `ownership=` + `allowed_images=` with `ValueError`; `allowed_images` becomes a deprecated alias.
    - `VastaiRunner.destroy_instance` is a single `destroy_vastai_instance(...)` adapter call; logs the typed `DestroyResult` for non-`DESTROYED` outcomes.
    - `verify_instance_ownership(instance_id, *, ownership: OwnershipPolicy)` — local to `providers/vastai.py`, replaces `_image_is_allowed`; returns `OwnershipVerification` and catches unexpected verifier failures as `REFUSED`.
@@ -2345,7 +2444,7 @@ steps then build on v3's `providers/destroy.py` module
      - `_sweep_zombies` does NOT import provider modules (verified by `inspect.getsource`).
 
 5. **Update every composition root, subclass, and existing CLI command.**
-   - `cli.py:batch`: validate `--label` with `validate_label_prefix`, then build `VastaiProviderConfig` via `from_env()` + `replace()`, pass to `VastaiRunner.from_config` and `build_vastai_cleanup_policy(ownership, credentials)`.
+   - `cli.py:batch`: validate `--label`, derive one unique `label_scope` from it, place that scope in `VastaiProviderConfig`, pass the same scope to `VastaiRunner.from_config` and `BatchOrchestrator`, then build `build_vastai_cleanup_policy(ownership, credentials)`.
    - `cli.py:cleanup`: validate `--label` before enumeration, then build `OwnershipPolicy` and `CredentialResolution` directly (no `VastaiProviderConfig`); distinguish `None` (opt-out) from `""` (fail-closed).
    - `cli.py:instances`: resolve `CredentialResolution` with `read_vastai_api_key()` and pass it to `list_vastai_instances(credentials=...)`; construct `OwnershipPolicy` (with comma trimming like `cleanup`); call `ownership.matches(candidate.ownership_key)` for the "Owned" column. The v2 unsafe substring/prefix match (`any(img.split(":")[0] in image for img in images_set)`) is **removed**.
    - `BatchOrchestrator` subclasses: update composition to supply `cleanup_policy`.
@@ -2363,14 +2462,14 @@ steps then build on v3's `providers/destroy.py` module
      - **ineligible state**: candidate `state="destroyed"` → `INELIGIBLE_STATE`.
      - **severity logging**: orchestrator logs `LEAKED` at `ERROR`, `UNKNOWN` at `WARNING`, unexpected `NO_CREDENTIALS` at `WARNING`, refusals at `INFO`.
      - **non-empty error from empty exception**: `raise RuntimeError()` → orchestrator logs with non-empty error.
-     - **null instance_id in enumeration**: JSON `{id: null, ...}` skipped, not passed to destroy.
-     - **label-prefix safety**: `BatchOrchestrator`, `batch --label`, and `cleanup --label` reject `""`, `" "`, and `" padded "` before enumeration; no implicit account-wide wildcard exists.
+     - **null instance_id / nullable safety fields in enumeration**: JSON `{id: null, label: null, actual_status: null, image_uuid: null, ...}` is skipped for invalid ID; valid IDs normalize null fields to empty strings, cannot match a non-empty label scope, and are refused as ineligible on empty state rather than receiving literal `"None"` values.
+     - **label-prefix safety**: `BatchOrchestrator`, `batch --label`, and `cleanup --label` reject `""`, `" "`, and `" padded "` before enumeration; no implicit account-wide wildcard exists. A created orphan is labeled with its unique canonical batch scope, selected by its own batch, and not selected by a concurrent batch scope.
      - **CLI --allowed-images empty string**: fail-closed (empty set, refuses every candidate).
      - **CLI --allowed-images None**: opt-out (every image considered owned).
      - **destroy_fn returns None**: orchestrator receives `CleanupResult(verdict=UNKNOWN, error="...invalid result type NoneType")`.
      - **VastaiRunner logs typed result**: LEAKED outcome produces an `ERROR`-level log line with the structured diagnostic context.
      - **cleanup command outcome totals**: `ALREADY_GONE` renders as a neutral/green "Already gone" result, is not counted as destroyed, and the final output reports separate destroyed, already-gone, and unresolved totals.
-     - **instances command ownership column**: malicious prefix `myorg/app-malicious:latest` shown as `no` when `--allowed-images myorg/app:1.0`; tag-insensitive `myorg/app:latest` shown as `yes`; digest `myorg/app@sha256:deadbeef` shown as `yes` when `--allowed-images myorg/app:1.0` (tag-insensitive repository match); registry-port `registry:5000/myorg/app:1.0` shown as `no` when `--allowed-images myorg/app`; positive registry-port `registry:5000/myorg/app:1.0` shown as `yes` when `--allowed-images registry:5000/myorg/app:1.0`; empty set `--allowed-images ""` shows every instance as `no`.
+     - **instances command ownership column**: malicious prefix `myorg/app-malicious:latest` shown as `no` when `--allowed-images myorg/app:1.0`; tag-insensitive `myorg/app:latest` shown as `yes`; digest `myorg/app@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef` shown as `yes` when `--allowed-images myorg/app:1.0` (tag-insensitive repository match); registry-port `registry:5000/myorg/app:1.0` shown as `no` when `--allowed-images myorg/app`; positive registry-port `registry:5000/myorg/app:1.0` shown as `yes` when `--allowed-images registry:5000/myorg/app:1.0`; empty set `--allowed-images ""` shows every instance as `no`.
 
 7. **Delete legacy sweep + duplicated helpers after a repository-wide caller audit.**
 
@@ -2385,19 +2484,22 @@ steps then build on v3's `providers/destroy.py` module
 ## Test plan
 
 - `tests/test_cleanup_policy.py`:
-  - `_repository`: valid tags/digests, registry ports, DNS/IPv6 registries, and repository paths; rejects whitespace, empty/invalid digests, empty tags, invalid tag characters (`bad!tag`), tags over 128 characters, malformed/out-of-range registry ports, invalid registry labels, upper-case or malformed repository components, multiple `@`, and multiple tags.
+  - `_repository`: valid full-length lower-case `sha256`/`sha512`/`blake3` digests, generic digests, tags, registry ports, DNS/IPv6 registries, and repository paths; rejects whitespace, empty digests, short/uppercase/non-hex registered digests, empty tags, invalid tag characters (`bad!tag`), tags over 128 characters, malformed/out-of-range registry ports, invalid registry labels, upper-case or malformed repository components, multiple `@`, and multiple tags.
   - `OwnershipPolicy.matches`: reflexive, tag-insensitive, sha256-by-repo, registry-port-aware, fail-closed on empty sets, malformed reference rejection, narrow type-checked.
   - `OwnershipPolicy._normalised`: declared field; precomputed in `__post_init__`; `matches` is O(1) per call.
   - `ProviderCleanupPolicy` construction requires only `provider`, `list_instances_fn`, and `destroy_fn`; no Docker/Vast.ai-specific ownership field leaks into the generic contract.
   - `ProviderCleanupPolicy.list_instances`: returns a valid wired `list[InstanceCandidate]`; logs and returns `[]` on callback exception, `None`, any non-list result, or any non-`InstanceCandidate` element.
   - `ProviderCleanupPolicy.destroy`: the outer boundary contains candidate-type/provider validation, callback execution, and result validation; malformed candidate/provider values never raise; provider mismatch returns `PROVIDER_MISMATCH` without `.value` access; callback exceptions or `None`/non-`CleanupResult` returns become `CleanupResult(verdict=UNKNOWN, ...)` with non-empty diagnostics.
-  - `CleanupResult` invariants: verdict/refusal exclusivity, empty `error` on both successful end-states (`DESTROYED` and `ALREADY_GONE`), and non-empty `error` on unresolved verdicts/refusals.
+  - `CleanupResult` invariants: verdict/refusal enum types and `error: str`, verdict/refusal exclusivity, empty `error` on both successful end-states (`DESTROYED` and `ALREADY_GONE`), and non-empty `error` on unresolved verdicts/refusals; string verdicts/refusals and `error=None` raise.
+  - CLI cleanup and orchestrator reporting include a final defensive unknown-outcome branch rather than silently omitting an invalid `CleanupResult`.
   - `InstanceCandidate.__post_init__`: empty `instance_id` raises; whitespace-only `instance_id` raises.
 - `tests/test_providers_vastai.py`:
   - `read_vastai_api_key` env-first: `VASTAI_API_KEY=""` → `EXPLICITLY_DISABLED`; `VASTAI_API_KEY="key"` → `AVAILABLE`; no env + file → `AVAILABLE`; no env + blank file → `ABSENT` (with warning); `OSError` → `ABSENT` (with warning).
   - Canonical destructive-key identity: pass `CredentialResolution(AVAILABLE, "canonical-key")`, make `read_vastai_api_key()` fail if called, and assert `Authorization: Bearer canonical-key` reaches the ownership GET, stop PUT, every DELETE retry, and every verification GET/redestroy callback.
   - `VastaiRunner.from_config` round-trips with `VastaiProviderConfig`.
-  - `VastaiRunner(allowed_images=frozenset({img}))` (deprecated) emits `DeprecationWarning` + builds equivalent `OwnershipPolicy`.
+   - `VastaiRunner(allowed_images=frozenset({img}))` (deprecated) emits `DeprecationWarning` + builds equivalent `OwnershipPolicy`.
+   - `VastaiProviderConfig` / `VastaiRunner.from_config` preserve one unique batch `label_prefix`; `create_instance` labels use that prefix plus a unique suffix; `None`, empty, blank, and padded config/runner prefixes are rejected.
+
   - Simultaneous `ownership=` and `allowed_images=` raises `ValueError`.
   - `verify_instance_ownership` returns `OwnershipVerification`
     (tagged enum; **not** ``bool``). Test the four-way contract:
@@ -2447,7 +2549,7 @@ steps then build on v3's `providers/destroy.py` module
       `ERROR`-level (also does not escape the outermost boundary).
   - `_list_vastai_instances_rest` pagination sends the exact Bearer key on every request, collects all pages, and fails closed on non-object payloads, non-list `instances`, empty/repeated cursors, or the page safety limit.
   - `list_vastai_instances` rejects the entire enumeration on duplicate canonical IDs within one page or across pages; conflicting label/image records are tested in both page orders.
-  - `list_vastai_instances(*, credentials)` returns `list[InstanceCandidate]` with `gpu_model` + `cost_per_hour` populated; `AVAILABLE` uses explicit-key REST pagination, `ABSENT` uses ambient CLI, `EXPLICITLY_DISABLED` returns `[]` without either provider call; shared `normalize_instance_id` skips records where it returns `None` (including `None`, `True`, `False`, empty/blank strings, lists, and dictionaries); canonicalises padded strings and integers; returns `[]` on API error.
+  - `list_vastai_instances(*, credentials)` returns `list[InstanceCandidate]` with `gpu_model` + `cost_per_hour` populated; `AVAILABLE` uses explicit-key REST pagination, `ABSENT` uses ambient CLI, `EXPLICITLY_DISABLED` returns `[]` without either provider call; shared `normalize_instance_id` skips records where it returns `None` (including `None`, `True`, `False`, empty/blank strings, lists, and dictionaries); nullable/non-string `image_uuid`, `label`, and `actual_status` normalize to `""` (so null labels cannot match and null state is ineligible); canonicalises padded strings and integers; returns `[]` on API error.
   - `build_vastai_cleanup_policy(*, ownership, credentials)`:
     - EXPLICITLY_DISABLED list: returns `[]` without REST or `vastai_cmd`.
     - AVAILABLE list: REST uses exactly `credentials.key` for every page and never calls ambient CLI; ABSENT list uses ambient CLI and never calls REST.
