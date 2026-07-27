@@ -26,7 +26,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import uuid4
 
-from vastai_gpu_runner.cleanup_policy import OwnershipPolicy
+import requests
+
+from vastai_gpu_runner.cleanup_policy import (
+    InstanceCandidate,
+    OwnershipPolicy,
+    normalize_instance_id,
+)
 from vastai_gpu_runner.providers.destroy_adapters.vastai import (
     CredentialResolution,
     CredentialState,
@@ -137,6 +143,236 @@ def vastai_cmd(args: list[str], *, timeout: int = 30) -> str:
 # + tag-insensitive ``_is_image_allowed`` replace both. External
 # callers (none in this repo) must migrate from ``bool`` to the
 # ``OwnershipVerification`` enum.
+
+
+# ---------------------------------------------------------------------------
+# list_vastai_instances — credential-aware enumeration (v4)
+# ---------------------------------------------------------------------------
+
+# States that are already-destroyed or otherwise terminal. Anything
+# not in this set is processed by the cleanup policy. Using a negative
+# allowlist (terminal-skip) is conservative: new Vast.ai states that
+# are not yet terminal are processed, not silently skipped.
+VASTAI_TERMINAL_STATES: frozenset[str] = frozenset({"destroyed"})
+
+# Official `vastai show instances` REST endpoint; keyset pages are
+# capped at 25.
+VASTAI_INSTANCES_URL = "https://console.vast.ai/api/v1/instances"
+VASTAI_INSTANCES_PAGE_SIZE = 25
+VASTAI_MAX_INSTANCE_PAGES = 1_000
+
+
+def _validate_rest_page(payload: object, seen_tokens: set[str]) -> str | None:
+    """Validate one page of REST instances; return next_token or None."""
+    if not isinstance(payload, dict):
+        raise ValueError(
+            f"Vast.ai REST instances response must be an object, got {type(payload).__name__}"
+        )
+    page = payload.get("instances")
+    if not isinstance(page, list):
+        raise ValueError("Vast.ai REST instances response has no list-valued 'instances'")
+
+    raw_next_token = payload.get("next_token")
+    if raw_next_token is None:
+        return None
+    if not isinstance(raw_next_token, str) or not raw_next_token or raw_next_token in seen_tokens:
+        raise ValueError("Vast.ai REST instances response has an invalid pagination token")
+    return raw_next_token
+
+
+def _list_vastai_instances_rest(api_key: str) -> list[object]:
+    """Enumerate all instances through REST using one explicit API key."""
+    records: list[object] = []
+    after_token: str | None = None
+    seen_tokens: set[str] = set()
+
+    for _page_number in range(VASTAI_MAX_INSTANCE_PAGES):
+        params: dict[str, int | str] = {"limit": VASTAI_INSTANCES_PAGE_SIZE}
+        if after_token is not None:
+            params["after_token"] = after_token
+        response = requests.get(
+            VASTAI_INSTANCES_URL,
+            headers={"Authorization": f"Bearer {api_key}"},
+            params=params,
+            timeout=15,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        next_token = _validate_rest_page(payload, seen_tokens)
+        page = payload.get("instances", [])  # type: ignore[union-attr]
+        records.extend(page)
+        if next_token is None:
+            return records
+        seen_tokens.add(next_token)
+        after_token = next_token
+
+    raise ValueError(
+        f"Vast.ai REST instances pagination exceeded {VASTAI_MAX_INSTANCE_PAGES} pages"
+    )
+
+
+def _list_vastai_instances_cli() -> list[object]:
+    """Enumerate instances through the ambient Vast.ai CLI context."""
+    raw = vastai_cmd(["show", "instances", "--raw"], timeout=15)
+    instances: object = json.loads(raw)
+    if not isinstance(instances, list):
+        raise ValueError(
+            f"Vast.ai CLI instances response must be a list, got {type(instances).__name__}"
+        )
+    return instances
+
+
+def _string_or_empty(value: object) -> str:
+    """Normalize nullable provider strings without creating literal ``"None"``."""
+    return value if isinstance(value, str) else ""
+
+
+def _float_or_zero(value: object) -> float:
+    """Normalize nullable provider numerics to ``0.0`` (non-negative finite).
+
+    Booleans are explicitly rejected (per the InstanceCandidate
+    invariant): ``True`` would otherwise coerce to ``1.0`` and
+    silently shadow a real numeric value. Other non-numeric values
+    return ``0.0`` rather than raising; the InstanceCandidate
+    invariant then enforces the non-negative finite contract.
+    """
+    if isinstance(value, bool):
+        return 0.0
+    if isinstance(value, (int, float)) and value == value:  # not NaN
+        return float(value)
+    return 0.0
+
+
+def _build_vastai_candidate(
+    inst: dict[str, object],
+    canonical_id: str,
+) -> InstanceCandidate:
+    """Build one InstanceCandidate from a validated raw record.
+
+    Centralised here so the per-record try/except block in
+    ``list_vastai_instances`` stays short and the
+    InstanceCandidate invariant is enforced in one place.
+    """
+    image_uuid = _string_or_empty(inst.get("image_uuid"))
+    return InstanceCandidate(
+        provider=Provider.VASTAI,
+        instance_id=canonical_id,
+        image_uuid=image_uuid,
+        ownership_key=image_uuid,  # Vast.ai: image_uuid is the ownership key
+        gpu_model=_string_or_empty(inst.get("gpu_name")),
+        cost_per_hour=_float_or_zero(inst.get("dph_total")),
+        label=_string_or_empty(inst.get("label")),
+        state=_string_or_empty(inst.get("actual_status")),
+        started_at=_float_or_zero(inst.get("start_date")),
+    )
+
+
+def _append_record(
+    candidates: list[InstanceCandidate],
+    seen_candidate_ids: set[str],
+    inst: object,
+) -> bool:
+    """Append one record as an InstanceCandidate if valid.
+
+    Returns False if the caller should abort the enumeration
+    (duplicate canonical IDs discard everything). Logs warnings
+    for skipped records. Other malformed-field errors are caught
+    by the per-record ``try`` block in the caller.
+    """
+    if not isinstance(inst, dict):
+        logger.warning("Skipping non-object instance record: %r", inst)
+        return True
+    canonical_id = normalize_instance_id(inst.get("id"))
+    if canonical_id is None:
+        logger.warning(
+            "Skipping instance with invalid ID: %r",
+            {k: inst.get(k) for k in ("label", "image_uuid", "actual_status")},
+        )
+        return True
+    if canonical_id in seen_candidate_ids:
+        logger.error(
+            "list_vastai_instances: duplicate canonical instance ID %s; "
+            "discarding the entire enumeration",
+            canonical_id,
+        )
+        return False
+    seen_candidate_ids.add(canonical_id)
+    try:
+        candidates.append(_build_vastai_candidate(inst, canonical_id))
+    except (TypeError, ValueError) as exc:
+        logger.warning("Skipping malformed instance: %s", exc)
+    return True
+
+
+def _enumerate_provider_instances(
+    credentials: CredentialResolution,
+) -> list[object]:
+    """Pick REST or CLI enumeration based on the credential snapshot."""
+    if credentials.state == CredentialState.AVAILABLE:
+        return _list_vastai_instances_rest(credentials.key)
+    return _list_vastai_instances_cli()
+
+
+def list_vastai_instances(
+    *,
+    credentials: CredentialResolution,
+) -> list[InstanceCandidate]:
+    """Enumerate Vast.ai instances using the canonical credential snapshot.
+
+    ``AVAILABLE`` credentials use the paginated REST endpoint with
+    exactly ``credentials.key``. ``ABSENT`` credentials use the
+    ambient CLI context because the CLI ownership verifier and CLI
+    destroy fallback use that same context. ``EXPLICITLY_DISABLED``
+    returns ``[]`` without contacting either provider interface.
+
+    Records whose shared ID normalizer returns ``None`` are skipped
+    (logged). A failure to enumerate returns an empty list.
+
+    Validation guards:
+        - ``inst`` must be a dict (otherwise skip).
+        - ``normalize_instance_id(inst.get("id"))`` must return a
+          canonical ID; this rejects ``None``, ``bool``, non-``str`` /
+          non-``int`` values, empty strings, and blank strings.
+        - Valid IDs are canonicalised by the shared normalizer, so
+          padded strings and integers match verifier semantics.
+        - Duplicate canonical IDs, whether within one page or across
+          REST pages, discard the entire enumeration before any
+          candidate can reach label filtering or destruction.
+        - Nullable or non-string ``image_uuid``, ``label``, and
+          ``actual_status`` values normalize to ``""``; an empty label
+          cannot match a non-empty scope and an empty state is refused
+          by the factory.
+        - Other malformed fields are caught by the per-record
+          ``try`` block.
+
+    The factory passes the same immutable ``CredentialResolution``
+    snapshot later to the destroy adapter, so enumeration and REST
+    destruction cannot silently use different accounts.
+    """
+    if credentials.state == CredentialState.EXPLICITLY_DISABLED:
+        logger.warning(
+            "Zombie sweep disabled: VASTAI_API_KEY is explicitly empty; "
+            "provider enumeration was not attempted."
+        )
+        return []
+
+    try:
+        instances = _enumerate_provider_instances(credentials)
+    except Exception as exc:
+        source = "REST" if credentials.state == CredentialState.AVAILABLE else "CLI"
+        logger.error(
+            "list_vastai_instances: %s enumeration failed: %s",
+            source,
+            exc,
+        )
+        return []
+
+    candidates: list[InstanceCandidate] = []
+    seen_candidate_ids: set[str] = set()
+    for inst in instances:
+        if not _append_record(candidates, seen_candidate_ids, inst):
+            return []
+    return candidates
 
 
 # ---------------------------------------------------------------------------
