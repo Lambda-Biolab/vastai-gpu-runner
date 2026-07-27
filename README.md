@@ -4,7 +4,6 @@
 [![License](https://img.shields.io/badge/license-Apache_2.0-blue)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11%2B-58f4c2.svg)](https://www.python.org/)
 [![CI](https://github.com/Lambda-Biolab/vastai-gpu-runner/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Lambda-Biolab/vastai-gpu-runner/actions/workflows/ci.yml)
-[![Codecov](https://codecov.io/gh/Lambda-Biolab/vastai-gpu-runner/graph/badge.svg?branch=main)](https://codecov.io/gh/Lambda-Biolab/vastai-gpu-runner)
 [![Dependabot Updates](https://github.com/Lambda-Biolab/vastai-gpu-runner/actions/workflows/dependabot/dependabot-updates/badge.svg?branch=main)](https://github.com/Lambda-Biolab/vastai-gpu-runner/actions/workflows/dependabot/dependabot-updates)
 [![CodeQL](https://github.com/Lambda-Biolab/vastai-gpu-runner/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/Lambda-Biolab/vastai-gpu-runner/actions/workflows/codeql.yml)
 [![CodeFactor](https://www.codefactor.io/repository/github/lambda-biolab/vastai-gpu-runner/badge/main)](https://www.codefactor.io/repository/github/lambda-biolab/vastai-gpu-runner)
@@ -99,29 +98,6 @@ uv run pytest          # 68 tests
 uv run ruff check src/ # linting
 uv run pyright src/    # type checking
 ```
-
-### CI / Codecov setup (one-time, repo admin)
-
-The CI workflow uploads coverage to Codecov and the codecov badge
-is rendered in the README. Two admin actions are required after
-the first merge to `main` to make the badge transition from
-"unknown" to a real percentage:
-
-1. **Activate Codecov** at <https://codecov.io/gh/Lambda-Biolab/vastai-gpu-runner>
-   (click "Activate"). The project configuration in
-   [`codecov.yml`](codecov.yml) is picked up automatically.
-2. **Add the Codecov upload token** as a repository secret named
-   `CODECOV_TOKEN`. Codecov's documented tokenless-upload flow
-   uses OIDC for *PRs from forks* to public repos, but direct
-   pushes to the protected `main` branch always require a token
-   unless the Codecov org setting "Global Upload Token" is
-   enabled (which grants tokenless uploads for *all* branches).
-   The per-repository upload token is printed on the Codecov
-   project page under "Settings → Tokens".
-
-Without these two steps the Codecov badge will stay at "unknown"
-and the `Upload coverage to Codecov` step in `ci.yml` will fail
-with `"Token required because branch is protected"`.
 
 ## License
 
