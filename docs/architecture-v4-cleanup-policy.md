@@ -124,13 +124,38 @@ nineteenth draft was rejected with 3 BLOCKERs and 3 CONCERNs. The
 twentieth draft was rejected with 3 BLOCKERs, 2 CONCERNs, and 1 NIT.
 The twenty-first draft was rejected with 1 BLOCKER and 1 NIT. The
 twenty-second draft was rejected with 1 BLOCKER. The twenty-third
-draft was rejected with 2 BLOCKERs and 1 NIT. This twenty-fourth
-draft addresses every finding.
+draft was rejected with 2 BLOCKERs and 1 NIT. The twenty-fourth draft
+was rejected with 2 BLOCKERs and 1 NIT. The twenty-fifth draft was
+rejected with 1 CONCERN and 1 NIT (the 29th-pass review was attempted
+via the chatgpt.com-with-GitHub backend but the submitter registered a
+new user turn while chatgpt.com's UI still rendered the prior turn text
+— the 10-second wait was insufficient on the chatgpt.com side, so the
+assistant reply never manifested; the build agent fell back to a local
+review). This twenty-sixth draft addresses every finding.
 
-### Applied from the 28th-pass review (this pass)
+### Applied from the 29th-pass review / local fallback (this pass)
+
+- **`_migrate_pre_v4` validates collection types before iterating.** The `shards`/`jobs` list-shape guards now run before `raw_units` is computed, so a non-list `shards`/`jobs` (e.g. a dict) cannot produce an early truthy `raw_units` that would later be discarded by the late type guard. The behaviour is unchanged; the control flow is now ordered for readability. (CONCERN 1)
+- **Pre-v4 JSON fixture test is enumerated in the test catalogue.** The migration checklist (step 4) requires "a real pre-v4 JSON fixture test asserting the migration path is taken and legacy state is not silently re-scoped"; the test catalogue (`tests/test_state.py`) now lists the assertion explicitly, plus schema-0 malformed-input coverage (non-list `shards`/`jobs`, `bool` `schema_version`, non-dict root, out-of-range `schema_version`). (NIT 1)
+- **The "Review process" section is in sync with the inline summary.** The bottom "Review process" section previously referenced the 27th-pass review (pass 24) while the inline summary at the top of the doc was updated to the 28th-pass review (pass 25). Both ledgers are now aligned to the 29th-pass / local fallback review (this pass). (NIT 2)
+- **NIT 3 (false positive, no change applied).** A reviewer noted that `legacy_label and not isinstance(legacy_label, str)` would skip the guard for falsy non-string values (`0`/`False`). The `or ""` normalization on the line above already converts any falsy non-string to `""`, so the gap does not exist.
+
+### Applied from the 28th-pass review (prior pass)
 
 - **Terminal scope-less legacy state is archived via direct file rename and verified; `OSError` is wrapped in `StateMigrationError`.** (BLOCKER 1, BLOCKER 2)
 - **Restored the 26th-pass applied-findings summary so the review history is complete.** (NIT 1)
+
+### Applied from the 27th-pass review (prior pass)
+
+- **Verified-terminal scope-less legacy state is archived on disk and the loader returns `None`, so composition does not try to resolve a fresh identity for a retired batch.** (BLOCKER 1)
+
+### Applied from the 26th-pass review (prior pass)
+
+- **Terminal schema-0 states without a recoverable scope are accepted after the loader verifies terminal status.** (BLOCKER 1)
+- **Migration validates `label`, `label_scope`, and unit status as strings before any `rsplit` or set-membership operation; unexpected migration exceptions become `StateMigrationError`.** (BLOCKER 2)
+- **Review metadata advanced to the twenty-second draft and the 26th-pass prompt.** (NIT 1)
+
+### Applied from the 25th-pass review (prior pass)
 
 - **`normalize_instance_id` lives only where the call sites need it.** (BLOCKER 1)
 - **Schema-0 terminal states recover the correct identity pair and respect `state_cls.TERMINAL_STATUSES`.** (BLOCKER 2)
@@ -2198,6 +2223,19 @@ def _migrate_pre_v4(data: dict, *, state_cls: type) -> tuple[dict, str | None]:
         legacy_label and not isinstance(legacy_label, str)
     ) or (label_scope and not isinstance(label_scope, str)):
         return data, "legacy label and label_scope must be strings when present"
+    # Validate collection shapes BEFORE iterating: a non-list
+    # ``shards``/``jobs`` (e.g. a dict) would coerce to a list of
+    # keys under ``list(data.get("shards") or [])`` and silently
+    # produce a truthy ``raw_units`` even though every entry is a
+    # string, not a unit dict. The subsequent ``_unit_status``
+    # pass would mark every entry ``None`` and the late type guard
+    # at the bottom would discard the enumeration; the data flow
+    # is sound but misleading. The shape guards now run first so
+    # the failure mode is immediate and obvious.
+    if not isinstance(data.get("shards"), (list, type(None))):
+        return data, "shards must be a list or null in schema_version 0"
+    if not isinstance(data.get("jobs"), (list, type(None))):
+        return data, "jobs must be a list or null in schema_version 0"
     raw_units = list(data.get("shards") or []) + list(data.get("jobs") or [])
     has_units = bool(raw_units)
     terminal_statuses = getattr(
@@ -2213,10 +2251,6 @@ def _migrate_pre_v4(data: dict, *, state_cls: type) -> tuple[dict, str | None]:
     all_terminal = has_units and all(
         _unit_status(u) in terminal_statuses for u in raw_units
     )
-    if not isinstance(data.get("shards"), (list, type(None))):
-        return data, "shards must be a list or null in schema_version 0"
-    if not isinstance(data.get("jobs"), (list, type(None))):
-        return data, "jobs must be a list or null in schema_version 0"
     effective_scope = label_scope or legacy_label
     if not effective_scope:
         if has_units and not all_terminal:
@@ -3063,6 +3097,16 @@ steps then build on v3's `providers/destroy.py` module
     `WARNING`, refusals at `INFO` (`caplog`).
   - `_sweep_zombies` continues on `destroy_fn` exceptions.
   - `_sweep_zombies` does NOT import provider modules (`inspect.getsource`).
+- `tests/test_state.py`:
+  - **Pre-v4 JSON fixture test.** A real pre-v4 JSON fixture with a canonical legacy `label` (``prod-3f9a1b2c4d5e``), no `label_scope`, and a nonterminal `JobState` shard is migrated through `_migrate_pre_v4` and `load_batch_state`. The test asserts:
+    - `requested_label_prefix` is recovered as ``"prod"`` (the 12-lowercase-hex suffix is stripped).
+    - `migrated_label_scope` is preserved as the canonical ``prod-3f9a1b2c4d5e``.
+    - `schema_version` is bumped to `CURRENT_SCHEMA_VERSION`.
+    - The legacy `label` field is dropped from the migrated dict.
+    - `load_batch_state` reconstructs proper `BatchState` / `JobBatchState` / nested `ShardState` / nested `JobState` objects (not raw dicts).
+    - Calling `load_batch_state` on the same fixture a second time returns the same migrated objects (no double-archive side-effect).
+  - **Pre-v4 terminal scope-less legacy archive.** A real pre-v4 JSON fixture with no `label`/`label_scope`, no units, and a non-terminal schema is rejected with `StateMigrationError`. A second fixture with no `label`/`label_scope` and a verified-terminal schema is renamed on disk and `load_batch_state` returns `None`; the original file is gone and an `<stem>_archived_<ms>.json` sibling exists.
+  - **Schema-0 malformed-input coverage.** A `shards`/`jobs` value that is a dict (not a list) raises `StateMigrationError` before any unit iteration. A `schema_version` value that is a `bool` (`True`/`False`) raises `StateMigrationError`. A non-dict root (`[]`, `42`, `"string"`) raises `StateMigrationError`. A `schema_version` outside `_VALID_SCHEMA_VERSIONS` raises `StateMigrationError`.
 - `tests/integration/test_cleanup_policy_integration.py` — 17 scenarios from step 6 (the original 14 prerequisite scenarios plus cleanup outcome totals, credential-aligned enumeration, and label-prefix safety).
 
 ## Backwards compatibility
@@ -3097,12 +3141,29 @@ match in `cli.py:instances` is removed.
 
 ## Review process
 
-This is the twenty-third design draft of the v4 architecture. Each prior
-draft was rejected and addressed. The twenty-second draft was rejected
-with 1 BLOCKER. This draft addresses every
-finding from the 27th-pass review:
+This is the twenty-sixth design draft of the v4 architecture. Each prior
+draft was rejected and addressed. The twenty-fifth draft was rejected
+with 1 CONCERN and 1 NIT (the 29th-pass review was attempted via the
+chatgpt.com-with-GitHub backend but the submitter registered a new user
+turn while chatgpt.com's UI still rendered the prior turn text — the
+10-second wait was insufficient on the chatgpt.com side, so the
+assistant reply never manifested; the build agent fell back to a local
+review). This draft addresses every finding from the 29th-pass review
+(local fallback):
 
-### Applied from the 27th-pass review (this pass)
+### Applied from the 29th-pass review / local fallback (this pass)
+
+- **`_migrate_pre_v4` validates collection types before iterating.** The `shards`/`jobs` list-shape guards now run before `raw_units` is computed, so a non-list ``shards``/``jobs`` (e.g. a dict) cannot produce an early truthy ``raw_units`` that would later be discarded by the late type guard. The behaviour is unchanged; the control flow is now ordered for readability. (CONCERN 1)
+- **Pre-v4 JSON fixture test is enumerated in the test catalogue.** The migration checklist (step 4) requires "a real pre-v4 JSON fixture test asserting the migration path is taken and legacy state is not silently re-scoped"; the test catalogue (`tests/test_state.py`) now lists the assertion explicitly, plus schema-0 malformed-input coverage (non-list ``shards``/``jobs``, ``bool`` ``schema_version``, non-dict root, out-of-range ``schema_version``). (NIT 1)
+- **The "Review process" section is in sync with the inline summary.** The bottom "Review process" section previously referenced the 27th-pass review (pass 24) while the inline summary at the top of the doc was updated to the 28th-pass review (pass 25). Both ledgers are now aligned to the 29th-pass / local fallback review (this pass). (NIT 2)
+- **NIT 3 (false positive, no change applied).** A reviewer noted that ``legacy_label and not isinstance(legacy_label, str)`` would skip the guard for falsy non-string values (``0``/``False``). The ``or ""`` normalization on the line above already converts any falsy non-string to ``""``, so the gap does not exist.
+
+### Applied from the 28th-pass review (prior pass)
+
+- **Terminal scope-less legacy state is archived via direct file rename and verified; `OSError` is wrapped in `StateMigrationError`.** (BLOCKER 1, BLOCKER 2)
+- **Restored the 26th-pass applied-findings summary so the review history is complete.** (NIT 1)
+
+### Applied from the 27th-pass review (prior pass)
 
 - **Verified-terminal scope-less legacy state is archived on disk and the loader returns `None`, so composition does not try to resolve a fresh identity for a retired batch.** (BLOCKER 1)
 
@@ -3213,7 +3274,9 @@ finding from the 27th-pass review:
 - NIT 1: `ABSENT` means the requested instance is absent from the
   fully validated API response.
 
-The 28th-pass review prompt for ChatGPT-with-GitHub-plugin:
+The 29th-pass review prompt for ChatGPT-with-GitHub-plugin (NOT sent —
+chatgpt.com UI rendered the prior turn text on submit; the build agent
+fell back to a local review via `@review-quick`):
 
 > Review the v4 architecture design at PR #22 (file:
 > docs/architecture-v4-cleanup-policy.md) against the v3 design at
@@ -3222,9 +3285,10 @@ The 28th-pass review prompt for ChatGPT-with-GitHub-plugin:
 > src/vastai_gpu_runner/providers/vastai.py. The v4 design
 > resolves issue #19.
 >
-> The twenty-third draft (applied to 27th-pass findings) introduced:
+> The twenty-fifth draft (applied to 28th-pass findings) introduced:
 >
-> 1. **Verified-terminal scope-less legacy state is archived on disk and the loader returns `None`, so composition does not try to resolve a fresh identity for a retired batch.** (BLOCKER 1)
+> 1. **Terminal scope-less legacy state is archived via direct file rename and verified; `OSError` is wrapped in `StateMigrationError`.** (BLOCKER 1, BLOCKER 2)
+> 2. **Restored the 26th-pass applied-findings summary so the review history is complete.** (NIT 1)
 >
 > Additionally, identify any new BLOCKERs or CONCERNs. Focus on:
 >
