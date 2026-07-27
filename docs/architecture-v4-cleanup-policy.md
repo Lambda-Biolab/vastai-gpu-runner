@@ -2115,6 +2115,7 @@ from vastai_gpu_runner.cleanup_policy import (
     CleanupResult,
     CleanupVerdict,
     InstanceCandidate,
+    normalize_instance_id,
     OwnershipPolicy,
     OwnershipVerification,
     ProviderCleanupPolicy,
@@ -2128,6 +2129,9 @@ class StateMigrationError(RuntimeError):
 CURRENT_SCHEMA_VERSION = 1
 _VALID_SCHEMA_VERSIONS = frozenset({0, CURRENT_SCHEMA_VERSION})
 _LABEL_SUFFIX_LEN = 12
+TERMINAL_UNIT_STATUSES = frozenset(
+    {"completed", "downloaded", "failed", "archived"}
+)
 
 
 def _validate_label_scope_shape(scope: str, requested: str) -> str:
@@ -2151,16 +2155,26 @@ def _validate_label_scope_shape(scope: str, requested: str) -> str:
 def _migrate_pre_v4(data: dict, *, state_cls: type) -> tuple[dict, str | None]:
     """Migrate a pre-v4 (schema_version 0) state file to v4 in place.
 
-    Recovers ``requested_label_prefix`` from the legacy ``label``
-    field. A nonterminal state without a recoverable scope, or with
-    conflicting ``label``/``label_scope``, returns the data unchanged
-    plus an error string so the caller can raise
-    :class:`StateMigrationError`.
+    Recovers ``requested_label_prefix`` by removing the trailing
+    12-lowercase-hex suffix from a canonical legacy ``label`` (e.g.
+    ``prod-3f9a1b2c4d5e`` -> ``prod``). A nonterminal state without
+    a recoverable scope, or with conflicting ``label``/``label_scope``,
+    returns the data unchanged plus an error string so the caller
+    can raise :class:`StateMigrationError`.
     """
     legacy_label = data.get("label", "") or ""
     label_scope = data.get("label_scope", "") or ""
-    has_units = bool(data.get("shards")) or bool(data.get("jobs"))
-    if has_units:
+    raw_units = list(data.get("shards") or []) + list(data.get("jobs") or [])
+    has_units = bool(raw_units)
+    all_terminal = (
+        has_units
+        and all(
+            isinstance(u, dict) and u.get("status") in TERMINAL_UNIT_STATUSES
+            for u in raw_units
+        )
+    )
+    nonterminal = has_units and not all_terminal
+    if nonterminal:
         effective_scope = label_scope or legacy_label
         if not effective_scope:
             return data, "nonterminal state lacks a recoverable label scope"
@@ -2169,7 +2183,15 @@ def _migrate_pre_v4(data: dict, *, state_cls: type) -> tuple[dict, str | None]:
                 "pre-v4 state has both legacy label and label_scope; "
                 "they disagree"
             )
-        requested_label_prefix = effective_scope
+        parts = effective_scope.rsplit("-", 1)
+        if (
+            len(parts) == 2
+            and len(parts[1]) == _LABEL_SUFFIX_LEN
+            and all(c in "0123456789abcdef" for c in parts[1])
+        ):
+            requested_label_prefix = parts[0]
+        else:
+            requested_label_prefix = effective_scope
     else:
         requested_label_prefix = label_scope or legacy_label
     migrated = dict(data)
@@ -2197,12 +2219,20 @@ def load_batch_state(
     if not state_path.exists():
         return None
     try:
-        data = json.loads(state_path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
+        raw = state_path.read_text()
+    except (OSError, UnicodeDecodeError) as exc:
         raise StateMigrationError(f"could not read state: {exc}") from exc
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise StateMigrationError(f"state JSON is invalid: {exc}") from exc
     if not isinstance(data, dict):
         raise StateMigrationError("state JSON root must be an object")
     schema_version = data.get("schema_version", 0)
+    if not isinstance(schema_version, int) or isinstance(schema_version, bool):
+        raise StateMigrationError(
+            f"schema_version must be an integer, got {schema_version!r}"
+        )
     if schema_version not in _VALID_SCHEMA_VERSIONS:
         raise StateMigrationError(
             f"unsupported schema_version {schema_version}; "
@@ -2219,11 +2249,28 @@ def load_batch_state(
             "nonterminal state lacks a recoverable label scope"
         )
     try:
-        return state_cls(**data)
+        state = state_cls(**data)
     except (TypeError, ValueError) as exc:
         raise StateMigrationError(
             f"could not deserialize {state_cls.__name__}: {exc}"
         ) from exc
+    if hasattr(state, "shards") and isinstance(data.get("shards"), list):
+        try:
+            from vastai_gpu_runner.state import ShardState
+            state.shards = [ShardState(**s) for s in data["shards"]]
+        except (TypeError, ValueError) as exc:
+            raise StateMigrationError(
+                f"could not deserialize {state_cls.__name__}.shards: {exc}"
+            ) from exc
+    if hasattr(state, "jobs") and isinstance(data.get("jobs"), list):
+        try:
+            from vastai_gpu_runner.state import JobState
+            state.jobs = [JobState(**j) for j in data["jobs"]]
+        except (TypeError, ValueError) as exc:
+            raise StateMigrationError(
+                f"could not deserialize {state_cls.__name__}.jobs: {exc}"
+            ) from exc
+    return state
 
 
 def resolve_label_scope(
@@ -2525,8 +2572,9 @@ def cleanup(
             help=(
                 "Match every label that starts with the requested scope "
                 "without the `-` delimiter (e.g. a candidate labelled "
-                "`prod-evil123...` would still match `prod-3f9a1b2c4d5e`). "
-                "DANGEROUS; only enable for intentional broad cleanup."
+                "`prod-3f9a1b2c4d5eevil-...` would still match canonical "
+                "scope `prod-3f9a1b2c4d5e`). DANGEROUS; only enable for "
+                "intentional broad cleanup."
             ),
         ),
     ] = False,
