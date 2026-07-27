@@ -171,17 +171,15 @@ Status flow: `pending` -> `deploying` -> `running` -> `completed` -> `downloaded
 | `_collect_phase()` | R2 recovery for failed-but-uploaded units |
 | `_cleanup_phase()` | Destroy leftover instances + final zombie sweep |
 | `_handle_instance_loss(unit, key, reason)` | Mark preempted; enforces `max_retries` cap |
-| `_sweep_zombies()` | Delegates to `orchestrator.sweep_zombie_instances` |
+| `_sweep_zombies()` | Policy-driven: enumerates `cleanup_policy.list_instances()`, filters by `f"{label_prefix}-"`, dispatches `policy.destroy(candidate)` per candidate |
 
 ## Orchestrator utils (`vastai_gpu_runner.orchestrator`)
 
 | Function | Returns | Description |
 |----------|---------|-------------|
-| `sweep_zombie_instances(live_runners, label_prefix, r2_sink, r2_batch_id)` | `int` | Destroy orphaned instances, returns count |
-| `ensure_detached(log_path, pid_path, detach_env_var)` | `None` | Fork + setsid for SSH disconnect survival |
 | `check_budget(spent, ceiling)` | `bool` | True if within budget, warns at 80% |
-| `poll_instance_progress(instance, workspace)` | `dict` | 3-layer check: DONE file -> PID liveness -> log tail |
-| `load_vastai_api_key()` | `str` | Read from `~/.config/vastai/vast_api_key` or `~/.vast_api_key` |
+
+The v3 `sweep_zombie_instances`, `load_vastai_api_key`, `ensure_detached`, and `poll_instance_progress` are deleted (v4 step 7). Zombie sweep is policy-driven from `batch._sweep_zombies`; ownership keys are read via the v3 destroy adapter's `read_vastai_api_key`; long-running shell detachment and progress polling live in the consumer's worker module.
 
 ## Estimator (`vastai_gpu_runner.estimator`)
 

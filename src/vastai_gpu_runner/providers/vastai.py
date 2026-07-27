@@ -148,12 +148,15 @@ def vastai_cmd(args: list[str], *, timeout: int = 30) -> str:
         raise RuntimeError(msg) from exc
 
 
-# The v2 ``verify_instance_ownership`` (returns bool) and the
-# v2 ``_image_is_allowed`` (v2 substring/prefix match) are DELETED.
-# The v3 destroy adapter's tagged-enum ``verify_instance_ownership``
-# + tag-insensitive ``_is_image_allowed`` replace both. External
-# callers (none in this repo) must migrate from ``bool`` to the
-# ``OwnershipVerification`` enum.
+# v4 migration notes (deleted):
+# - v2 ``verify_instance_ownership`` (returns bool) → tagged
+#   ``OwnershipVerification`` enum (in providers/vastai.py).
+# - v2 ``_image_is_allowed`` (substring/prefix match) →
+#   ``cleanup_policy.OwnershipPolicy.matches()``.
+# - v2 ``sweep_zombie_instances`` (in orchestrator.py) →
+#   ``ProviderCleanupPolicy`` driven from batch._sweep_zombies.
+# - v3 destroy adapter's local ``_image_is_allowed`` / ``_repository``
+#   deleted in v4 step 3c.
 
 
 # ---------------------------------------------------------------------------

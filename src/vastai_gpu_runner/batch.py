@@ -60,8 +60,7 @@ lifecycle loop.
 
 The v4 architecture delegates zombie cleanup to a
 :class:`vastai_gpu_runner.cleanup_policy.ProviderCleanupPolicy`. The
-policy is required; legacy direct ``sweep_zombie_instances`` calls were
-removed in v4 step 7. ``_sweep_zombies`` is policy-driven: enumerate via
+policy is required; ``_sweep_zombies`` is policy-driven: enumerate via
 ``policy.list_instances()``, filter by the exact delimited scope
 ``f"{label_prefix}-"`` so adjacent scopes like ``f"{label_prefix}evil"``
 cannot match, exclude tracked IDs, call ``policy.destroy(candidate)`` per
@@ -162,8 +161,7 @@ class BatchOrchestrator(ABC, Generic[UnitT]):
         """Initialise orchestrator state. See class docstring for argument meanings.
 
         ``cleanup_policy`` is required (v4): ``_sweep_zombies`` delegates
-        enumeration + destruction to a ``ProviderCleanupPolicy`` rather
-        than calling a legacy ``sweep_zombie_instances`` helper.
+        enumeration + destruction to a ``ProviderCleanupPolicy``.
 
         ``label_prefix`` is validated against ``validate_label_prefix``
         before any provider call: empty, whitespace-only, or padded

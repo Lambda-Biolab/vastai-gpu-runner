@@ -78,18 +78,32 @@ def check(
 
 
 def _check_vastai(console: object) -> bool:
-    """Run the Vast.ai API key check. Returns True on success."""
-    from vastai_gpu_runner.providers.vastai import vastai_cmd
+    """Run the Vast.ai API key check via ``list_vastai_instances``.
+
+    v4 composition: ``read_vastai_api_key()`` resolves the credential
+    state, then ``list_vastai_instances(credentials=...)`` is the
+    canonical enumeration. ``EXPLICITLY_DISABLED`` is reported as a
+    valid (opt-out) state; ``ABSENT`` returns ``[]`` because ambient
+    CLI fallback requires interactive shell context the check command
+    does not have.
+    """
+    from vastai_gpu_runner.providers.destroy_adapters.vastai import (
+        CredentialState,
+        read_vastai_api_key,
+    )
+    from vastai_gpu_runner.providers.vastai import list_vastai_instances
 
     console.print("[bold]Vast.ai CLI[/bold]")  # type: ignore[attr-defined]
+    credentials = read_vastai_api_key()
+    if credentials.state == CredentialState.EXPLICITLY_DISABLED:
+        console.print(  # type: ignore[attr-defined]
+            "  [yellow]OK[/yellow] — credentials explicitly disabled",
+        )
+        return True
     try:
-        raw = vastai_cmd(["show", "instances", "--raw"], timeout=15)
-        instances = json.loads(raw)
+        instances = list_vastai_instances(credentials=credentials)
     except RuntimeError as exc:
         console.print(f"  [red]FAIL[/red] — {exc}")  # type: ignore[attr-defined]
-        return False
-    except json.JSONDecodeError:
-        console.print("  [red]FAIL[/red] — API returned invalid JSON")  # type: ignore[attr-defined]
         return False
     console.print(  # type: ignore[attr-defined]
         f"  [green]OK[/green] — API key valid, {len(instances)} instance(s)",
