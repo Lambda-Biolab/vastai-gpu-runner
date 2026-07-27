@@ -1206,7 +1206,6 @@ from vastai_gpu_runner.cleanup_policy import (
     CleanupResult,
     CleanupVerdict,
     InstanceCandidate,
-    normalize_instance_id,
     OwnershipPolicy,
     OwnershipVerification,
     ProviderCleanupPolicy,
@@ -2104,15 +2103,30 @@ def validate_label_prefix(label_prefix: str) -> str:
 
 from uuid import uuid4
 
+import json
+import logging
+from pathlib import Path
+
+from dataclasses import dataclass, field
+from typing import AbstractSet
+
+from vastai_gpu_runner.cleanup_policy import (
+    CleanupRefusal,
+    CleanupResult,
+    CleanupVerdict,
+    InstanceCandidate,
+    OwnershipPolicy,
+    OwnershipVerification,
+    ProviderCleanupPolicy,
+)
+
 
 class StateMigrationError(RuntimeError):
     """Raised when persisted batch state cannot be migrated to v4."""
 
 
 CURRENT_SCHEMA_VERSION = 1
-_VALID_SCHEMA_VERSIONS = frozenset({CURRENT_SCHEMA_VERSION})
-
-
+_VALID_SCHEMA_VERSIONS = frozenset({0, CURRENT_SCHEMA_VERSION})
 _LABEL_SUFFIX_LEN = 12
 
 
@@ -2132,6 +2146,84 @@ def _validate_label_scope_shape(scope: str, requested: str) -> str:
             f"persisted label scope {scope!r} has malformed suffix"
         )
     return scope
+
+
+def _migrate_pre_v4(data: dict, *, state_cls: type) -> tuple[dict, str | None]:
+    """Migrate a pre-v4 (schema_version 0) state file to v4 in place.
+
+    Recovers ``requested_label_prefix`` from the legacy ``label``
+    field. A nonterminal state without a recoverable scope, or with
+    conflicting ``label``/``label_scope``, returns the data unchanged
+    plus an error string so the caller can raise
+    :class:`StateMigrationError`.
+    """
+    legacy_label = data.get("label", "") or ""
+    label_scope = data.get("label_scope", "") or ""
+    has_units = bool(data.get("shards")) or bool(data.get("jobs"))
+    if has_units:
+        effective_scope = label_scope or legacy_label
+        if not effective_scope:
+            return data, "nonterminal state lacks a recoverable label scope"
+        if label_scope and legacy_label and label_scope != legacy_label:
+            return data, (
+                "pre-v4 state has both legacy label and label_scope; "
+                "they disagree"
+            )
+        requested_label_prefix = effective_scope
+    else:
+        requested_label_prefix = label_scope or legacy_label
+    migrated = dict(data)
+    migrated["label_scope"] = label_scope or legacy_label
+    migrated["requested_label_prefix"] = requested_label_prefix
+    migrated["schema_version"] = CURRENT_SCHEMA_VERSION
+    migrated.pop("label", None)
+    return migrated, None
+
+
+def load_batch_state(
+    state_path: Path,
+    *,
+    state_cls: type,
+) -> state_cls | None:
+    """Load a v4 BatchState/JobBatchState or raise ``StateMigrationError``.
+
+    The legacy ``load_or_none`` helper always returns ``None`` on any
+    parse error, which silently re-scopes existing batches. This loader
+    raises :class:`StateMigrationError` instead whenever the persisted
+    state cannot be migrated into a v4 identity. JSON decoding, schema
+    mismatches, the pre-v4 migration, and dataclass construction all
+    funnel through this boundary.
+    """
+    if not state_path.exists():
+        return None
+    try:
+        data = json.loads(state_path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise StateMigrationError(f"could not read state: {exc}") from exc
+    if not isinstance(data, dict):
+        raise StateMigrationError("state JSON root must be an object")
+    schema_version = data.get("schema_version", 0)
+    if schema_version not in _VALID_SCHEMA_VERSIONS:
+        raise StateMigrationError(
+            f"unsupported schema_version {schema_version}; "
+            f"expected one of {sorted(_VALID_SCHEMA_VERSIONS)}"
+        )
+    if schema_version == 0:
+        data, migration_error = _migrate_pre_v4(data, state_cls=state_cls)
+        if migration_error:
+            raise StateMigrationError(migration_error)
+    if (
+        data.get("shards") or data.get("jobs")
+    ) and not data.get("label_scope"):
+        raise StateMigrationError(
+            "nonterminal state lacks a recoverable label scope"
+        )
+    try:
+        return state_cls(**data)
+    except (TypeError, ValueError) as exc:
+        raise StateMigrationError(
+            f"could not deserialize {state_cls.__name__}: {exc}"
+        ) from exc
 
 
 def resolve_label_scope(
@@ -2172,37 +2264,6 @@ def resolve_label_scope(
             "persisted batch prefix does not match the requested label"
         )
     return _validate_label_scope_shape(persisted_scope, stored_request)
-
-
-def load_batch_state(
-    state_path: Path,
-    *,
-    state_cls: type,
-) -> state_cls | None:
-    """Load a v4 BatchState/JobBatchState or raise ``StateMigrationError``.
-
-    The legacy ``load_or_none`` helper always returns ``None`` on any
-    parse error, which silently re-scopes existing batches. This loader
-    raises :class:`StateMigrationError` instead whenever the persisted
-    state cannot be migrated into a v4 identity.
-    """
-    if not state_path.exists():
-        return None
-    data = json.loads(state_path.read_text())
-    schema_version = data.get("schema_version", 0)
-    if schema_version not in _VALID_SCHEMA_VERSIONS:
-        raise StateMigrationError(
-            f"unsupported schema_version {schema_version}; "
-            f"expected one of {sorted(_VALID_SCHEMA_VERSIONS)}"
-        )
-    label_scope = data.get("label_scope", "") or data.get("label", "")
-    if data.get("shards") or data.get("jobs"):
-        # Non-terminal state must have a recoverable scope.
-        if not label_scope or not _validate_label_scope_shape(label_scope, data.get("requested_label_prefix", "")):
-            raise StateMigrationError(
-                "nonterminal state lacks a recoverable label scope"
-            )
-    return state_cls(**{**data, "schema_version": schema_version})
 
 
 def validate_label_scope_for_cleanup(scope_arg: str) -> str:
@@ -2428,6 +2489,7 @@ def batch(
     )
 
     orch = MyOrchestrator(
+        state=state,
         runner_factory=runner_factory,
         cleanup_policy=cleanup_policy,
         label_prefix=label_scope,
@@ -2449,9 +2511,10 @@ def cleanup(
             "-l",
             help=(
                 "Full canonical batch scope, e.g. prod-3f9a1b2c4d5e. "
-                "Matches only labels starting with `<scope>-`. Use "
-                "--allow-adjacent-scopes to match any label that "
-                "starts with the requested prefix (DANGEROUS)."
+                "By default matches only labels starting with `<scope>-`. "
+                "With --allow-adjacent-scopes, matches any label that "
+                "starts with the requested prefix (still requires the "
+                "canonical 12-hex suffix in the scope argument)."
             ),
         ),
     ] = ...,
@@ -2460,8 +2523,9 @@ def cleanup(
         typer.Option(
             "--allow-adjacent-scopes",
             help=(
-                "Match labels that start with --label but are not delimited "
-                "by '-' (e.g. `--label prod` matches `production-...`). "
+                "Match every label that starts with the requested scope "
+                "without the `-` delimiter (e.g. a candidate labelled "
+                "`prod-evil123...` would still match `prod-3f9a1b2c4d5e`). "
                 "DANGEROUS; only enable for intentional broad cleanup."
             ),
         ),
@@ -2503,14 +2567,6 @@ def cleanup(
     except ValueError as exc:
         raise typer.BadParameter(str(exc), param_hint="--label") from exc
 
-    # Manual cleanup defaults to one exact batch scope (`<scope>-`).
-    # A broad requested-prefix match requires the dangerous opt-in.
-    scope_prefix = canonical_scope + ("-" if not adjacent_scopes else "")
-    candidates = cleanup_policy.list_instances()
-    matches = [c for c in candidates if c.label.startswith(scope_prefix)]
-    if not matches:
-        console.print(f"No instances matching label scope '{canonical_scope}'.")
-        return
     if allowed_images is None:
         ownership = OwnershipPolicy()
     else:
@@ -2526,18 +2582,16 @@ def cleanup(
         credentials=read_vastai_api_key(),
     )
 
-    # Manual cleanup defaults to exact scope match (`<prefix>-`) and
-    # only matches adjacent identities if `--allow-adjacent-scopes` is
-    # passed, since unintentional broad cleanup is dangerous.
-    adjacent = adjacent_scopes
-    scope_prefix = f"{label_prefix}-" if not adjacent else label_prefix
+    # Manual cleanup defaults to one exact batch scope (`<scope>-`).
+    # A broad requested-prefix match requires the dangerous opt-in.
+    scope_prefix = canonical_scope + ("-" if not adjacent_scopes else "")
     candidates = cleanup_policy.list_instances()
     matches = [c for c in candidates if c.label.startswith(scope_prefix)]
     if not matches:
-        console.print(f"No instances matching label scope '{label_prefix}'.")
+        console.print(f"No instances matching label scope '{canonical_scope}'.")
         return
 
-    console.print(f"Found {len(matches)} instance(s) matching '{label_prefix}':")
+    console.print(f"Found {len(matches)} instance(s) matching '{canonical_scope}':")
     for c in matches:
         console.print(
             f"  {c.instance_id}: {c.gpu_model or '?'} "
