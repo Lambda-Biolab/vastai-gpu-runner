@@ -123,12 +123,14 @@ eighteenth draft was rejected with 3 BLOCKERs and 2 CONCERNs. The
 nineteenth draft was rejected with 3 BLOCKERs and 3 CONCERNs. The
 twentieth draft was rejected with 3 BLOCKERs, 2 CONCERNs, and 1 NIT.
 The twenty-first draft was rejected with 1 BLOCKER and 1 NIT. The
-twenty-second draft was rejected with 1 BLOCKER. This twenty-third
+twenty-second draft was rejected with 1 BLOCKER. The twenty-third
+draft was rejected with 2 BLOCKERs and 1 NIT. This twenty-fourth
 draft addresses every finding.
 
-### Applied from the 27th-pass review (this pass)
+### Applied from the 28th-pass review (this pass)
 
-- **Verified-terminal scope-less legacy state is archived on disk and the loader returns `None`, so composition does not try to resolve a fresh identity for a retired batch.** (BLOCKER 1)
+- **Terminal scope-less legacy state is archived via direct file rename and verified; `OSError` is wrapped in `StateMigrationError`.** (BLOCKER 1, BLOCKER 2)
+- **Restored the 26th-pass applied-findings summary so the review history is complete.** (NIT 1)
 
 - **`normalize_instance_id` lives only where the call sites need it.** (BLOCKER 1)
 - **Schema-0 terminal states recover the correct identity pair and respect `state_cls.TERMINAL_STATUSES`.** (BLOCKER 2)
@@ -2133,6 +2135,7 @@ from uuid import uuid4
 
 import json
 import logging
+import time
 from pathlib import Path
 
 from dataclasses import dataclass, field
@@ -2316,15 +2319,26 @@ def load_batch_state(
                 "nonterminal state lacks a recoverable label scope"
             )
         # Verified-terminal scope-less legacy state is safe to retire.
-        # Archive it on disk before returning so subsequent composition
-        # does not try to resolve a fresh identity for an already-finished
-        # batch.
+        # Archive the raw data on disk before returning so subsequent
+        # composition does not try to resolve a fresh identity for an
+        # already-finished batch. The helper returns ``None`` on a
+        # non-archiveable file; we must move the file ourselves and
+        # verify success so a failed archive cannot silently leave the
+        # original state in place.
+        archive_path = state_path.with_name(
+            f"{state_path.stem}_archived_{int(time.time() * 1000)}{state_path.suffix}"
+        )
         try:
-            state_cls.archive_if_all_terminal(state_path)
-        except (AttributeError, TypeError, ValueError) as exc:
+            state_path.rename(archive_path)
+        except (OSError, AttributeError, TypeError, ValueError) as exc:
             raise StateMigrationError(
                 f"could not archive terminal scope-less legacy state: {exc}"
             ) from exc
+        if state_path.exists():
+            raise StateMigrationError(
+                "failed to archive terminal scope-less legacy state; "
+                "original file is still present"
+            )
         return None
     try:
         state = state_cls(**data)
@@ -3093,6 +3107,10 @@ finding from the 27th-pass review:
 - **Verified-terminal scope-less legacy state is archived on disk and the loader returns `None`, so composition does not try to resolve a fresh identity for a retired batch.** (BLOCKER 1)
 
 ### Applied from the 26th-pass review (prior pass)
+
+- **Terminal schema-0 states without a recoverable scope are accepted after the loader verifies terminal status.** (BLOCKER 1)
+- **Migration validates `label`, `label_scope`, and unit status as strings before any `rsplit` or set-membership operation; unexpected migration exceptions become `StateMigrationError`.** (BLOCKER 2)
+- **Review metadata advanced to the twenty-second draft and the 26th-pass prompt.** (NIT 1)
 
 ### Applied from the 25th-pass review (prior pass)
 
