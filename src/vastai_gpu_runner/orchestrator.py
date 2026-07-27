@@ -1,23 +1,29 @@
 """Shared orchestration patterns for cloud GPU batch workloads.
 
 Extracts the common lifecycle patterns from batch orchestrators:
-- ``sweep_zombie_instances``: destroy orphaned instances
-- ``ensure_detached``: fork + setsid for SSH disconnect survival
+- ``sweep_zombie_instances``: destroy orphaned instances (v3 routes
+  through ``destroy_vastai_instance`` from the destroy adapter;
+  ``killed`` only on confirmed ``DESTROYED``)
 - ``check_budget``: cost ceiling enforcement
-- ``load_vastai_api_key``: read API key from standard paths
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import os
-import time
-from pathlib import Path
 from typing import TYPE_CHECKING
 
+from vastai_gpu_runner.providers.destroy import (
+    DestroyRefusal,
+    DestroyVerdict,
+)
+from vastai_gpu_runner.providers.destroy_adapters.vastai import (
+    CredentialState,
+    OwnershipVerification,
+    destroy_vastai_instance,
+    read_vastai_api_key,
+)
 from vastai_gpu_runner.providers.vastai import vastai_cmd
-from vastai_gpu_runner.ssh import ssh_cmd
 
 if TYPE_CHECKING:
     from vastai_gpu_runner.runner import CloudRunner
@@ -27,35 +33,31 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def load_vastai_api_key() -> str:
-    """Read the Vast.ai API key from standard file paths.
-
-    Checks ``~/.config/vastai/vast_api_key`` and ``~/.vast_api_key``.
-
-    Returns:
-        API key string, or empty string if not found.
-    """
-    key_paths = [
-        Path("~/.config/vastai/vast_api_key").expanduser(),
-        Path("~/.vast_api_key").expanduser(),
-    ]
-    for kp in key_paths:
-        if kp.exists():
-            return kp.read_text().strip()
-    return ""
-
-
 def sweep_zombie_instances(
     live_runners: dict[int, tuple[CloudRunner, CloudInstance]],
     *,
     label_prefix: str,
     r2_sink: R2Sink | None = None,
     r2_batch_id: str = "",
+    allowed_images: frozenset[str] | None = None,
 ) -> int:
-    """Destroy Vast.ai instances not tracked by live_runners.
+    """Destroy Vast.ai instances not tracked by ``live_runners``.
 
     Vast.ai sometimes resurrects destroyed instances as 'stopped' after
     boot timeout or GPU verification failure. This sweep catches them.
+
+    Per the v3 doc:
+
+    - Short-circuits on ``EXPLICITLY_DISABLED`` (returns 0 before the
+      CLI enumeration step — the user has opted out).
+    - Routes through ``destroy_vastai_instance`` for each orphan
+      that passes the label-prefix filter.
+    - ``killed`` only on confirmed ``DESTROYED`` verdict.
+    - CLI-fallback attempts (``refusal=NO_CREDENTIALS`` followed by
+      an attempted CLI destroy) are logged separately as
+      ``cli_attempted`` but do NOT count toward ``killed`` (the
+      orchestrator's contract: ``killed`` means a confirmed
+      destroy happened).
 
     Only sweeps instances whose label starts with ``label_prefix`` to
     avoid cross-orchestrator kills.
@@ -63,29 +65,95 @@ def sweep_zombie_instances(
     Args:
         live_runners: Map of shard/job index -> (runner, instance) for
             actively tracked instances.
-        label_prefix: Label prefix filter (e.g. ``"myproject-boltz2-abc123"``).
-        r2_sink: Optional R2 sink for checking DONE markers before destroying
-            stopped instances that may have completed.
+        label_prefix: Label prefix filter (e.g.
+            ``"myproject-boltz2-abc123"``).
+        r2_sink: Optional R2 sink for checking DONE markers before
+            destroying stopped instances that may have completed.
         r2_batch_id: Batch ID for R2 DONE marker checks.
+        allowed_images: Image allowlist forwarded to
+            ``destroy_vastai_instance``. ``None`` disables the
+            ownership check; empty frozenset fails closed (refuses
+            every instance).
 
     Returns:
-        Number of zombies destroyed.
+        Number of zombies destroyed (only confirmed DESTROYED).
+    """
+    credentials = read_vastai_api_key()
+    if credentials.state == CredentialState.EXPLICITLY_DISABLED:
+        logger.info(
+            "Zombie sweep: credentials explicitly disabled; skipping "
+            "(EXPLICITLY_DISABLED short-circuits before enumeration)"
+        )
+        return 0
+
+    instances = _fetch_vastai_instances()
+    if instances is None:
+        return 0
+
+    tracked_ids = {inst.instance_id for _, (_, inst) in live_runners.items()}
+    return _sweep_zombies_for_instances(
+        instances, tracked_ids, label_prefix, r2_sink, r2_batch_id, allowed_images
+    )
+
+
+def _sweep_zombies_for_instances(
+    instances: list[object],
+    tracked_ids: set[str],
+    label_prefix: str,
+    r2_sink: R2Sink | None,
+    r2_batch_id: str,
+    allowed_images: frozenset[str] | None,
+) -> int:
+    """Apply the label-filter + ownership check + destroy to each instance."""
+    killed, cli_attempted = 0, 0
+    for inst in instances:
+        if not isinstance(inst, dict):
+            continue
+        if not _is_zombie(inst, label_prefix, tracked_ids, r2_sink, r2_batch_id):
+            continue
+        iid = str(inst.get("id", ""))
+        if not iid:
+            continue
+        outcome = _destroy_zombie(iid, allowed_images=allowed_images)
+        if outcome == "destroyed":
+            killed += 1
+        elif outcome == "cli_attempted":
+            cli_attempted += 1
+    _log_sweep_outcome(killed, cli_attempted)
+    return killed
+
+
+def _log_sweep_outcome(killed: int, cli_attempted: int) -> None:
+    """Log the sweep outcome; kept terse to avoid extra branching."""
+    if killed:
+        logger.info("Zombie sweep: destroyed %d instance(s)", killed)
+    if cli_attempted:
+        logger.info(
+            "Zombie sweep: %d CLI fallback attempt(s) (ownership verified; "
+            "no API key — destroy attempted via vastai CLI)",
+            cli_attempted,
+        )
+
+
+def _fetch_vastai_instances() -> list[object] | None:
+    """Run ``vastai show instances --raw`` and parse the JSON list.
+
+    Returns the parsed list on success; ``None`` on any failure
+    (timeout, parse error, non-list response). The sweep short-
+    circuits on failure (no zombies destroyed).
     """
     try:
         raw = vastai_cmd(["show", "instances", "--raw"], timeout=15)
         instances = json.loads(raw)
     except Exception:
-        return 0
-
-    tracked_ids = {inst.instance_id for _, (_, inst) in live_runners.items()}
-    killed = 0
-    for inst in instances:
-        if _is_zombie(inst, label_prefix, tracked_ids, r2_sink, r2_batch_id):
-            _destroy_zombie(str(inst.get("id", "")), inst.get("cur_state", ""), tracked_ids)
-            killed += 1
-    if killed:
-        logger.info("Zombie sweep: destroyed %d instance(s)", killed)
-    return killed
+        return None
+    if not isinstance(instances, list):
+        logger.warning(
+            "Zombie sweep: expected list from vastai CLI, got %s",
+            type(instances).__name__,
+        )
+        return None
+    return instances
 
 
 def _is_zombie(
@@ -102,8 +170,9 @@ def _is_zombie(
     never be destroyed here, because Vast.ai's ``cur_state`` API is
     unreliable for this purpose: it reports ``stopped`` / ``exited``
     persistently for containers whose long-running OpenMM worker is
-    still running fine (confirmed via SSH 2026-04-20). The orchestrator's
-    normal collect/destroy flow handles tracked-instance cleanup.
+    still running fine (confirmed via SSH 2026-04-20). The
+    orchestrator's normal collect/destroy flow handles
+    tracked-instance cleanup.
 
     The one exception is the R2 DONE marker path: if R2 confirms a
     tracked instance has uploaded its final results, the sweep still
@@ -116,15 +185,9 @@ def _is_zombie(
     if not label.startswith(label_prefix):
         return False
 
-    # Tracked instances: NEVER destroy via sweep. Collect phase owns them.
     if iid in tracked_ids:
         return False
 
-    # Untracked instances that match our label prefix are orphans — an
-    # instance we launched but lost track of (e.g. crash between create and
-    # register). Always safe to destroy unless R2 marks the job done, in
-    # which case the collect phase needs the instance alive briefly to
-    # download the final chunk.
     return not _r2_says_done(iid, label, label_prefix, status, tracked_ids, r2_sink, r2_batch_id)
 
 
@@ -152,83 +215,53 @@ def _r2_says_done(
     return False
 
 
-def _destroy_zombie(iid: str, status: str, tracked_ids: set[str]) -> None:
-    """Destroy one zombie instance via REST API (preferred) or CLI fallback."""
-    logger.info(
-        "Zombie sweep: destroying %s (status=%s, tracked=%s)",
-        iid,
-        status,
-        iid in tracked_ids,
-    )
-    try:
-        api_key = load_vastai_api_key()
-        if api_key:
-            _destroy_via_rest(iid, api_key)
-        else:
-            vastai_cmd(["destroy", "instance", iid], timeout=15)
-    except Exception as exc:
-        logger.warning("Zombie sweep: failed to destroy %s: %s", iid, exc)
+def _destroy_zombie(iid: str, *, allowed_images: frozenset[str] | None) -> str:
+    """Destroy one zombie via the v3 destroy adapter.
 
-
-def _destroy_via_rest(iid: str, api_key: str) -> None:
-    """Stop-then-delete an instance via the Vast.ai REST API."""
-    import requests
-
-    base = "https://console.vast.ai/api/v0/instances"
-    hdrs = {"Authorization": f"Bearer {api_key}"}
-    requests.put(
-        f"{base}/{iid}/",
-        headers={**hdrs, "Content-Type": "application/json"},
-        json={"state": "stopped"},
-        timeout=10,
-    )
-    time.sleep(1)
-    requests.delete(f"{base}/{iid}/", headers=hdrs, timeout=10)
-
-
-def ensure_detached(
-    log_path: Path,
-    pid_path: Path,
-    *,
-    detach_env_var: str = "_GPU_RUNNER_DETACHED",
-) -> None:
-    """Fork + setsid so the orchestrator survives SSH disconnect.
-
-    No-op if already detached or inside tmux/screen.
-
-    Args:
-        log_path: Path for the detached process log file.
-        pid_path: Path for the detached process PID file.
-        detach_env_var: Environment variable name used to detect
-            re-entry after fork.
+    Returns one of:
+    - ``"destroyed"`` — belt_and_suspenders reported DESTROYED.
+    - ``"cli_attempted"`` — adapter returned NO_CREDENTIALS; we
+      tried the CLI fallback (``vastai destroy instance``). The
+      v4 factory will own this dispatch; v3 keeps the inline call
+      to preserve the v3 behaviour.
+    - ``"refused"`` — adapter refused (OWNERSHIP or
+      CREDENTIALS_DISABLED); the instance is not destroyed.
+    - ``"unknown"`` — adapter reported UNKNOWN or LEAKED; the
+      instance may or may not be gone.
     """
-    import sys
+    logger.info("Zombie sweep: destroying %s (label-matched orphan)", iid)
+    result = destroy_vastai_instance(iid, allowed_images=allowed_images)
 
-    if os.environ.get(detach_env_var) == "1":
-        return
-    if os.environ.get("TMUX") or os.environ.get("STY"):
-        return
-
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    argv = [sys.executable, *sys.argv]
-    env = {**os.environ, detach_env_var: "1"}
-
-    logger.info("Detaching — batch survives SSH disconnect.")
-    logger.info("  Log:    %s", log_path)
-    logger.info("  PID:    %s", pid_path)
-
-    pid = os.fork()
-    if pid > 0:
-        sys.exit(0)
-
-    os.setsid()
-    log_fd = os.open(str(log_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
-    os.dup2(log_fd, 1)
-    os.dup2(log_fd, 2)
-    devnull = os.open(os.devnull, os.O_RDONLY)
-    os.dup2(devnull, 0)
-    pid_path.write_text(str(os.getpid()))
-    os.execve(sys.executable, argv, env)  # noqa: S606
+    if result.verdict == DestroyVerdict.DESTROYED:
+        return "destroyed"
+    if result.verdict == DestroyVerdict.LEAKED:
+        # The instance is gone (verify said GONE) but our DELETE
+        # never returned success. The user's intent is achieved.
+        return "destroyed"
+    if result.refusal == DestroyRefusal.OWNERSHIP:
+        logger.warning(
+            "Zombie sweep: %s ownership REFUSED (image not in allowlist); skipping",
+            iid,
+        )
+        return "refused"
+    if result.refusal == DestroyRefusal.CREDENTIALS_DISABLED:
+        logger.warning(
+            "Zombie sweep: %s credentials DISABLED; skipping",
+            iid,
+        )
+        return "refused"
+    if result.refusal == DestroyRefusal.NO_CREDENTIALS:
+        # v3 CLI fallback: ownership was OK, no API key, attempt
+        # the CLI destroy. v4 factory will own the dispatch.
+        try:
+            vastai_cmd(["destroy", "instance", iid], timeout=15)
+            logger.info("Zombie sweep: CLI-destroyed %s", iid)
+            return "cli_attempted"
+        except Exception as exc:
+            logger.warning("Zombie sweep: CLI destroy failed for %s: %s", iid, exc)
+            return "unknown"
+    # UNKNOWN verdict — uncertain state.
+    return "unknown"
 
 
 def check_budget(spent: float, ceiling: float) -> bool:
@@ -250,50 +283,16 @@ def check_budget(spent: float, ceiling: float) -> bool:
     return True
 
 
-def poll_instance_progress(
-    instance: CloudInstance,
-    workspace: str,
-) -> dict[str, object]:
-    """Check worker progress via DONE file, PID liveness, and log tail.
+# DELETED in v3 step 7:
+# - load_vastai_api_key() — the v3 destroy adapter's
+#   read_vastai_api_key() (with env-first, fail-closed) replaces it
+# - _destroy_via_rest() — absorbed into the v3 destroy adapter
+# - ensure_detached() — dead public API, no callers in this repo
+# - poll_instance_progress() — dead public API, no callers in this
+#   repo; the v3 decide_next_action (unit_lifecycle.py) replaces
+#   the per-unit classification logic
 
-    Three-layer check:
-    1. DONE file exists -> complete
-    2. PID file exists but process dead -> worker crashed
-    3. Otherwise -> still running, return log tail
-
-    Args:
-        instance: Cloud instance to check.
-        workspace: Remote workspace path.
-
-    Returns:
-        Dict with keys: running, complete, worker_dead (optional), log_tail.
-    """
-    # Layer 1: DONE file
-    rc, _ = ssh_cmd(instance, f"test -f {workspace}/DONE")
-    if rc == 0:
-        return {"running": False, "complete": True}
-
-    # Layer 2: PID liveness
-    rc_pid, pid_str = ssh_cmd(instance, f"cat {workspace}/worker.pid 2>/dev/null", timeout=5)
-    if rc_pid == 0 and pid_str.strip().isdigit():
-        rc_alive, _ = ssh_cmd(instance, f"kill -0 {pid_str.strip()} 2>/dev/null", timeout=5)
-        if rc_alive != 0:
-            logger.warning(
-                "Worker PID %s is dead on %s but no DONE file",
-                pid_str.strip(),
-                instance.instance_id,
-            )
-            return {
-                "running": False,
-                "complete": False,
-                "worker_dead": True,
-                "log_tail": f"Worker PID {pid_str.strip()} dead, no DONE file",
-            }
-
-    # Layer 3: Log tail
-    rc, output = ssh_cmd(instance, f"tail -3 {workspace}/worker.log", timeout=10)
-    return {
-        "running": True,
-        "complete": False,
-        "log_tail": output,
-    }
+# Suppress unused-import warning for OwnershipVerification (kept
+# imported for downstream re-export of the public surface and
+# future consumer-side imports of the typed ownership enum).
+_ = OwnershipVerification
