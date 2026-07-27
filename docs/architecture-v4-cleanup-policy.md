@@ -70,7 +70,7 @@ Diff vs v3 once v3 is implemented:
 - **~** `VastaiRunner.__init__` accepts `ownership: OwnershipPolicy | None` and `credentials: CredentialResolution | None`; rejects simultaneous `ownership=` and deprecated `allowed_images=` with `ValueError`.
 - **~** `VastaiRunner.from_config(config)` preserves both `canonical.ownership` and `canonical.credentials`.
 - **~** `VastaiRunner.destroy_instance` delegates entirely to `destroy_vastai_instance(...)` — no v2-style inline ownership pre-check, no inline REST stop/delete/verify. Returns `bool` from the typed adapter result, logging the typed `DestroyResult` for non-`DESTROYED` outcomes.
-- **~** `BatchOrchestrator.__init__` accepts `cleanup_policy: ProviderCleanupPolicy` (required). The orchestrator calls `policy.list_instances()` and `policy.destroy(candidate)` — never branches on `Provider`, never imports provider modules.
+- **~** `BatchOrchestrator.__init__` accepts `cleanup_policy: ProviderCleanupPolicy` (required) and validates a non-empty, pre-stripped `label_prefix`. The orchestrator calls `policy.list_instances()` and `policy.destroy(candidate)` — never branches on `Provider`, never imports provider modules.
 - **~** `BatchOrchestrator._sweep_zombies` is policy-driven end-to-end. The label-prefix filter and tracked-id exclusion stay on the orchestrator. Every other decision is delegated to `policy.destroy()`. The orchestrator logs every non-`DESTROYED` outcome at severity matching operational impact.
 - **~** `cli.py:cleanup` and `cli.py:instances` — refactored to use the new API. The `--allowed-images` flag is the canonical primary; `--owned-images` is an alias. Empty `--allowed-images ""` is **fail-closed** (empty set rejects every image), not opt-out. The `instances` command's "Owned" column uses `OwnershipPolicy.matches()` (the v2 unsafe substring/prefix match is removed).
 - **—** `orchestrator.py:sweep_zombie_instances` (v3 deletion) — reaffirmed.
@@ -100,7 +100,7 @@ in `VastaiProviderConfig` (because the runner also needs
 `docker_image`, `setup_commands`, etc.); the cleanup-policy factory
 takes them directly.
 
-## What changes vs the v4 first + second + third + fourth + fifth + sixth + seventh + eighth + ninth + tenth drafts
+## What changes vs the v4 first + second + third + fourth + fifth + sixth + seventh + eighth + ninth + tenth + eleventh drafts
 
 The first draft was rejected with 5 BLOCKERs and 7 CONCERNs. The
 second draft was rejected with 7 BLOCKERs, 2 CONCERNs, and 3 NITs.
@@ -111,10 +111,31 @@ sixth draft was rejected with 1 BLOCKER, 4 CONCERNs, and 2 NITs. The
 seventh draft was rejected with 1 BLOCKER and 1 NIT. The eighth
 draft was rejected with 3 BLOCKERs, 2 CONCERNs, and 1 NIT. The ninth
 draft was rejected with 4 BLOCKERs, 2 CONCERNs, and 1 NIT. The tenth
-draft was rejected with 2 BLOCKERs, 1 CONCERN, and 1 NIT. This
-eleventh draft addresses every finding.
+draft was rejected with 2 BLOCKERs, 1 CONCERN, and 1 NIT. The
+eleventh draft was rejected with 3 BLOCKERs and 2 CONCERNs. This
+twelfth draft addresses every finding.
 
-### Applied from the 14th-pass review (this pass)
+### Applied from the 15th-pass review (this pass)
+
+- **Full image-reference grammar.** `_repository` validates tag
+  grammar/length, repository components, registry hosts/ports, and
+  digests before normalization. (BLOCKER 1)
+- **Non-empty label scope invariant.** `BatchOrchestrator.__init__`,
+  `batch --label`, and `cleanup --label` reject empty, blank, or
+  padded prefixes before enumeration. (BLOCKER 2)
+- **Duplicate enumeration IDs fail closed.** Duplicate canonical IDs
+  within or across REST pages discard the complete enumeration before
+  label filtering or destruction. (BLOCKER 3)
+- **Generic callback containment.** `ProviderCleanupPolicy` validates
+  list callback shape/elements and keeps candidate/provider validation
+  inside its exception boundary without unsafe `.value` access.
+  (CONCERN 1)
+- **Destructive key identity is tested.** The adapter test catalogue
+  asserts one canonical Bearer key across ownership, stop, delete,
+  verification, and redestroy callbacks without credential re-reads.
+  (CONCERN 2)
+
+### Applied from the 14th-pass review (prior pass)
 
 - **Credential-aligned enumeration.** `AVAILABLE` uses paginated REST
   requests with the exact canonical key; `ABSENT` uses the ambient
@@ -294,7 +315,7 @@ ABC are referenced unchanged. `BatchOrchestrator` is **modified**
 | `providers/destroy.py` (v3 prerequisite) | `DestroyVerdict`, `DestroyRefusal`, `DestroyResult`, `VerifyVerdict`, `VerifyResult`, `DestroyPolicy`, callback protocols, `belt_and_suspenders` | None — referenced verbatim |
 | `providers/destroy_adapters/vastai.py` (v3 + v4) | `CredentialState`, `CredentialResolution`, `read_vastai_api_key()` (env-first), `destroy_vastai_instance()` (amended signature) | Env-first credentials; amended adapter signature |
 | `providers/vastai.py` (v4) | `VastaiProviderConfig`, `VastaiRunner`, `vastai_cmd`, `verify_instance_ownership`, `list_vastai_instances(*, credentials)`, `build_vastai_cleanup_policy()`, `_describe_destroy_result`, `VASTAI_TERMINAL_STATES` | Many (see diff) |
-| `batch.py` (v4) | `BatchOrchestrator` (modified) | Adds required `cleanup_policy: ProviderCleanupPolicy` parameter; replaces `_sweep_zombies` (policy-driven); removes `sweep_zombie_instances` import |
+| `batch.py` (v4) | `BatchOrchestrator` (modified), `validate_label_prefix` | Adds required `cleanup_policy: ProviderCleanupPolicy` parameter and label-prefix invariant; replaces `_sweep_zombies` (policy-driven); removes `sweep_zombie_instances` import |
 | `cli.py` (v4) | CLI commands | Refactored `batch` / `cleanup` / `instances` commands; `cli.py:instances` "Owned" column uses `OwnershipPolicy.matches()` (v2 substring match removed) |
 | `orchestrator.py` (v4 deletion) | — | Delete `sweep_zombie_instances`, `load_vastai_api_key` |
 | `cleanup_policy.py` (v4) | `OwnershipPolicy`, `InstanceCandidate`, `CleanupVerdict`, `CleanupRefusal`, `CleanupResult`, `ProviderCleanupPolicy` | New module |
@@ -377,6 +398,7 @@ imports and references resolve within one block.
 # src/vastai_gpu_runner/cleanup_policy.py
 from __future__ import annotations
 
+import ipaddress
 import logging
 import re
 from dataclasses import dataclass, field
@@ -397,26 +419,84 @@ logger = logging.getLogger(__name__)
 _DIGEST_RE = re.compile(
     r"[A-Za-z][A-Za-z0-9]*(?:[+._-][A-Za-z][A-Za-z0-9]*)*:[A-Za-z0-9=_-]+"
 )
+_TAG_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}")
+_PATH_COMPONENT_RE = re.compile(
+    r"[a-z0-9]+(?:(?:[._]|__|[-]+)[a-z0-9]+)*"
+)
+_REGISTRY_LABEL_RE = re.compile(
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+)
+
+
+def _valid_registry_port(raw_port: str) -> bool:
+    return raw_port.isdigit() and 1 <= int(raw_port) <= 65_535
+
+
+def _valid_registry(registry: str) -> bool:
+    """Validate a DNS/IPv4/IPv6 registry host and optional port."""
+    if registry.startswith("["):
+        closing = registry.find("]")
+        if closing < 0:
+            return False
+        try:
+            ipaddress.IPv6Address(registry[1:closing])
+        except ValueError:
+            return False
+        suffix = registry[closing + 1:]
+        return not suffix or (
+            suffix.startswith(":") and _valid_registry_port(suffix[1:])
+        )
+
+    if registry.count(":") > 1:
+        return False
+    if ":" in registry:
+        host, port = registry.rsplit(":", 1)
+        if not _valid_registry_port(port):
+            return False
+    else:
+        host = registry
+    if host == "localhost":
+        return True
+    if not host or len(host) > 253:
+        return False
+    return all(
+        _REGISTRY_LABEL_RE.fullmatch(label) is not None
+        for label in host.split(".")
+    )
+
+
+def _valid_repository(repository: str) -> bool:
+    """Validate registry and lower-case repository path components."""
+    parts = repository.split("/")
+    if any(not part for part in parts):
+        return False
+    first = parts[0]
+    has_registry = len(parts) > 1 and (
+        first == "localhost"
+        or first.startswith("[")
+        or "." in first
+        or ":" in first
+    )
+    path_parts = parts
+    if has_registry:
+        if not _valid_registry(first):
+            return False
+        path_parts = parts[1:]
+    return bool(path_parts) and all(
+        _PATH_COMPONENT_RE.fullmatch(part) is not None
+        for part in path_parts
+    )
 
 
 def _repository(ref: str) -> str:
-    """Return the tag-insensitive repository name from an image reference.
+    """Return the tag-insensitive repository from a valid image reference.
 
-    Strips the digest (`repo@sha256:...` → `repo`), strips only the
-    final tag separator (after the last `/`), and preserves the
-    registry and port. This prevents the v3 failure modes
-    ("myorg/app:1.0" matching "myorg/app-malicious:latest";
-    "registry:5000/myorg/app" matching "registry-malicious/myorg/app").
-
-    Returns the empty string for malformed references: whitespace,
-    empty repository/tag/digest components, multiple `@` characters,
-    invalid digests, multiple `:` characters in the final segment,
-    or multiple-tag references.
+    Validates the complete Docker/OCI name before stripping its tag or
+    digest. Returns ``""`` for malformed references, including invalid
+    registry hosts/ports, repository components, tags, or digests.
     """
     ref = ref.strip()
-    if not ref or any(char.isspace() for char in ref):
-        return ""
-    if ref.count("@") > 1:
+    if not ref or any(char.isspace() for char in ref) or ref.count("@") > 1:
         return ""
 
     if "@" in ref:
@@ -426,22 +506,19 @@ def _repository(ref: str) -> str:
     else:
         without_digest = ref
 
-    parts = without_digest.split("/")
-    if any(not part for part in parts):
-        return ""
-    final_segment = parts[-1]
-    if final_segment.count(":") > 1:
-        return ""
-
     last_slash = without_digest.rfind("/")
     last_colon = without_digest.rfind(":")
     if last_colon > last_slash:
         repository = without_digest[:last_colon]
         tag = without_digest[last_colon + 1:]
-        if not repository or not tag:
+        if _TAG_RE.fullmatch(tag) is None:
             return ""
-        return repository
-    return without_digest
+    else:
+        repository = without_digest
+
+    if not _valid_repository(repository):
+        return ""
+    return repository
 
 
 # ---------------------------------------------------------------------------
@@ -734,69 +811,78 @@ class ProviderCleanupPolicy:
     destroy_fn: Callable[[InstanceCandidate], CleanupResult] = field(repr=False)
 
     def list_instances(self) -> list[InstanceCandidate]:
-        """Read-only enumeration of provider instances."""
+        """Read-only enumeration of provider instances; never raises."""
         try:
-            return self.list_instances_fn()
+            result = self.list_instances_fn()
         except Exception as exc:
-            logger.warning("Cleanup policy: list_instances raised: %s", exc)
+            logger.error("Cleanup policy: list_instances raised: %s", exc)
             return []
+        if not isinstance(result, list):
+            logger.error(
+                "Cleanup policy: list_instances returned invalid type %s",
+                type(result).__name__,
+            )
+            return []
+        if any(not isinstance(candidate, InstanceCandidate) for candidate in result):
+            logger.error(
+                "Cleanup policy: list_instances returned a non-InstanceCandidate element"
+            )
+            return []
+        return result
 
     def destroy(self, candidate: InstanceCandidate) -> CleanupResult:
-        """Run the per-provider destroy on one candidate.
+        """Run the per-provider destroy on one candidate; never raises.
 
-        Authoritative gate: this method re-validates the
-        candidate's provider identity (PROVIDER_MISMATCH refusal)
-        on every call, then delegates to ``destroy_fn`` which
-        applies eligibility / ownership / credential checks.
-
-        Never raises. Two safety guarantees:
-
-        1. The catch-all uses ``f"{type(exc).__name__}: {exc}"``
-           so the error string is always non-empty (preserves
-           the ``CleanupResult`` invariant even for
-           ``raise RuntimeError()`` with no message).
-        2. The ``destroy_fn`` callback's return value is type-
-           checked: if the callback returns ``None`` or any non-
-           ``CleanupResult``, the policy substitutes a
-           ``CleanupResult(verdict=UNKNOWN, error=...)`` so the
-           orchestrator never sees an invalid result.
+        The protected boundary validates the candidate and its provider,
+        delegates to ``destroy_fn``, and validates the callback result.
+        Invalid inputs or callback failures become typed outcomes rather
+        than escaping into the orchestrator.
         """
-        if candidate.provider != self.provider:
-            return CleanupResult(
-                refusal=CleanupRefusal.PROVIDER_MISMATCH,
-                error=(
-                    f"candidate {candidate.instance_id!r} belongs to "
-                    f"provider {candidate.provider.value!r}; cleanup "
-                    f"policy expects {self.provider.value!r}"
-                ),
-            )
+        candidate_id = "<invalid>"
         try:
+            if not isinstance(candidate, InstanceCandidate):
+                return CleanupResult(
+                    verdict=CleanupVerdict.UNKNOWN,
+                    error=(
+                        "cleanup policy received invalid candidate type "
+                        f"{type(candidate).__name__}"
+                    ),
+                )
+            candidate_id = candidate.instance_id
+            if candidate.provider != self.provider:
+                return CleanupResult(
+                    refusal=CleanupRefusal.PROVIDER_MISMATCH,
+                    error=(
+                        f"candidate {candidate.instance_id!r} belongs to provider "
+                        f"{candidate.provider!r}; cleanup policy expects {self.provider!r}"
+                    ),
+                )
             result = self.destroy_fn(candidate)
+            if not isinstance(result, CleanupResult):
+                logger.error(
+                    "Cleanup: destroy_fn for %s returned invalid result "
+                    "type %s — substituting UNKNOWN",
+                    candidate_id,
+                    type(result).__name__,
+                )
+                return CleanupResult(
+                    verdict=CleanupVerdict.UNKNOWN,
+                    error=(
+                        f"destroy_fn returned invalid result type "
+                        f"{type(result).__name__}"
+                    ),
+                )
+            return result
         except Exception as exc:
-            logger.warning(
-                "Cleanup: destroy_fn raised for %s: %s",
-                candidate.instance_id,
+            logger.error(
+                "Cleanup: destroy_fn boundary failed for %s: %s",
+                candidate_id,
                 exc,
             )
             return CleanupResult(
                 verdict=CleanupVerdict.UNKNOWN,
                 error=f"{type(exc).__name__}: {exc}",
             )
-        if not isinstance(result, CleanupResult):
-            logger.warning(
-                "Cleanup: destroy_fn for %s returned invalid result "
-                "type %s — substituting UNKNOWN",
-                candidate.instance_id,
-                type(result).__name__,
-            )
-            return CleanupResult(
-                verdict=CleanupVerdict.UNKNOWN,
-                error=(
-                    f"destroy_fn returned invalid result type "
-                    f"{type(result).__name__}"
-                ),
-            )
-        return result
 ```
 
 ## `providers/destroy_adapters/vastai.py` — v4 amendments (patch-style excerpt)
@@ -1577,6 +1663,9 @@ def list_vastai_instances(
           non-``int`` values, empty strings, and blank strings.
         - Valid IDs are canonicalised by the shared normalizer, so
           padded strings and integers match verifier semantics.
+        - Duplicate canonical IDs, whether within one page or across
+          REST pages, discard the entire enumeration before any
+          candidate can reach label filtering or destruction.
         - Other malformed fields are caught by the per-record
           ``try`` block.
 
@@ -1606,6 +1695,7 @@ def list_vastai_instances(
         )
         return candidates
 
+    seen_candidate_ids: set[str] = set()
     for inst in instances:
         if not isinstance(inst, dict):
             logger.warning("Skipping non-object instance record: %r", inst)
@@ -1617,6 +1707,14 @@ def list_vastai_instances(
                 {k: inst.get(k) for k in ("label", "image_uuid", "actual_status")},
             )
             continue
+        if canonical_id in seen_candidate_ids:
+            logger.error(
+                "list_vastai_instances: duplicate canonical instance ID %s; "
+                "discarding the entire enumeration",
+                canonical_id,
+            )
+            return []
+        seen_candidate_ids.add(canonical_id)
         instance_id = canonical_id
         try:
             image_uuid = str(inst.get("image_uuid", ""))
@@ -1824,6 +1922,11 @@ def build_vastai_cleanup_policy(
 ## Orchestrator wiring
 
 The orchestrator's `_sweep_zombies` is policy-driven end-to-end.
+`BatchOrchestrator.__init__` validates `label_prefix` before storing it:
+it must be non-empty, non-blank, and already stripped. Account-wide
+cleanup is not expressible through an empty prefix. The CLI calls the
+same validator before composition, so invalid input fails before any
+enumeration or confirmation prompt.
 The orchestrator logs every non-`DESTROYED` outcome at severity
 matching operational impact. Unexpected `NO_CREDENTIALS` is
 `WARNING` (it means the factory's CLI fallback was bypassed and the
@@ -1833,6 +1936,24 @@ orphan wasn't cleaned up).
 # src/vastai_gpu_runner/batch.py (changes to _sweep_zombies)
 # NB: `logger` is the module-level logger already defined at the
 # top of batch.py (`logger = logging.getLogger(__name__)`).
+
+
+def validate_label_prefix(label_prefix: str) -> str:
+    """Return a safe label prefix or raise before provider enumeration."""
+    if (
+        not isinstance(label_prefix, str)
+        or not label_prefix
+        or label_prefix != label_prefix.strip()
+    ):
+        raise ValueError(
+            "label_prefix must be non-empty, non-blank, and pre-stripped"
+        )
+    return label_prefix
+
+
+# BatchOrchestrator.__init__ replaces its direct assignment with:
+# self._label_prefix = validate_label_prefix(label_prefix)
+
 
 def _sweep_zombies(self) -> int:
     """Destroy orphaned instances not tracked by live_runners.
@@ -1948,12 +2069,18 @@ def batch(
 ) -> None:
     """Run a batch of cloud GPU units under the user's project image."""
     from dataclasses import replace
+    from vastai_gpu_runner.batch import validate_label_prefix
     from vastai_gpu_runner.cleanup_policy import OwnershipPolicy
     from vastai_gpu_runner.providers.vastai import (
         VastaiProviderConfig,
         VastaiRunner,
         build_vastai_cleanup_policy,
     )
+
+    try:
+        label = validate_label_prefix(label)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--label") from exc
 
     base = VastaiProviderConfig.from_env()
     config = replace(
@@ -2005,6 +2132,7 @@ def cleanup(
     """Destroy orphaned Vast.ai instances matching a label prefix."""
     _setup_logging(verbose)
     from rich.console import Console
+    from vastai_gpu_runner.batch import validate_label_prefix
     from vastai_gpu_runner.cleanup_policy import (
         CleanupVerdict,
         OwnershipPolicy,
@@ -2015,6 +2143,10 @@ def cleanup(
     from vastai_gpu_runner.providers.vastai import build_vastai_cleanup_policy
 
     console = Console()
+    try:
+        label_prefix = validate_label_prefix(label_prefix)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--label") from exc
 
     # Distinguish None (flag omitted → opt-out) from "" (explicit empty →
     # fail-closed). Whitespace-only entries in comma-separated input are
@@ -2178,7 +2310,7 @@ steps then build on v3's `providers/destroy.py` module
 2. **Add canonical ownership-policy type + invariant tests.**
    - `cleanup_policy.py:OwnershipPolicy` (frozen, `matches(image_ref)` with `_repository`; declared `_normalised` cache field, narrowed for strict type checking).
    - `cleanup_policy.py:ProviderCleanupPolicy` stores only provider identity and generic callbacks; provider-specific ownership is captured by provider factories, not exposed on the generic contract.
-   - Property tests: `OwnershipPolicy.matches` is reflexive, tag-insensitive, sha256-by-repo, registry-port-aware, fail-closed on empty sets, malformed reference rejection (including `myorg/app@`, `myorg/app@garbage`, `myorg/app@sha256:`, and `myorg/app:`), narrow type-checked.
+   - Property tests: `OwnershipPolicy.matches` is reflexive, tag-insensitive, digest-by-repository, registry-port-aware, narrow type-checked, and fail-closed on empty sets or malformed full references (invalid/overlong tags, invalid digests, registry hosts/ports, and repository path components).
    - The `_normalised` is precomputed in `__post_init__`; `matches` is O(1) per call.
 
 3. **Add Vast.ai runner + cleanup adapter.**
@@ -2199,13 +2331,13 @@ steps then build on v3's `providers/destroy.py` module
      - `verdict=LEAKED` / `verdict=UNKNOWN` translate correctly with diagnostic.
      - `refusal=OWNERSHIP` / `NO_CREDENTIALS` / `CREDENTIALS_DISABLED` translate correctly.
      - INELIGIBLE_STATE for terminal or empty state.
-     - `list_vastai_instances(*, credentials)` skips non-dict records and every ID rejected by `normalize_instance_id`; canonicalises padded strings and integers.
+     - `list_vastai_instances(*, credentials)` skips invalid records but rejects the entire enumeration on duplicate canonical IDs within or across pages; conflicting labels/images are tested in both page orders.
      - `ProviderCleanupPolicy.destroy()` returns `CleanupResult(verdict=UNKNOWN, error="...invalid result type...")` when `destroy_fn` returns `None` or non-`CleanupResult`.
      - `VastaiRunner.destroy_instance` logs the typed `DestroyResult` for non-`DESTROYED` outcomes.
 
 4. **Add orchestrator support behind a fail-closed compatibility path.**
 
-   - `BatchOrchestrator.__init__` accepts `cleanup_policy: ProviderCleanupPolicy` (required).
+   - `BatchOrchestrator.__init__` accepts `cleanup_policy: ProviderCleanupPolicy` (required) and stores `validate_label_prefix(label_prefix)`; empty, whitespace-only, or padded prefixes raise `ValueError` before enumeration.
    - `_sweep_zombies` is policy-driven; logs every non-`DESTROYED` outcome at severity matching operational impact.
    - Orchestrator tests:
      - Severity logging: `LEAKED` = `ERROR`, `UNKNOWN` / `CLI_ATTEMPTED` / `CREDENTIALS_DISABLED` = `WARNING`, unexpected `NO_CREDENTIALS` = `WARNING`, refusals = `INFO` (verified with `caplog`).
@@ -2213,10 +2345,11 @@ steps then build on v3's `providers/destroy.py` module
      - `_sweep_zombies` does NOT import provider modules (verified by `inspect.getsource`).
 
 5. **Update every composition root, subclass, and existing CLI command.**
-   - `cli.py:batch`: build `VastaiProviderConfig` via `from_env()` + `replace()`, pass to `VastaiRunner.from_config` and `build_vastai_cleanup_policy(ownership, credentials)`.
-   - `cli.py:cleanup`: build `OwnershipPolicy` and `CredentialResolution` directly (no `VastaiProviderConfig`); distinguish `None` (opt-out) from `""` (fail-closed).
+   - `cli.py:batch`: validate `--label` with `validate_label_prefix`, then build `VastaiProviderConfig` via `from_env()` + `replace()`, pass to `VastaiRunner.from_config` and `build_vastai_cleanup_policy(ownership, credentials)`.
+   - `cli.py:cleanup`: validate `--label` before enumeration, then build `OwnershipPolicy` and `CredentialResolution` directly (no `VastaiProviderConfig`); distinguish `None` (opt-out) from `""` (fail-closed).
    - `cli.py:instances`: resolve `CredentialResolution` with `read_vastai_api_key()` and pass it to `list_vastai_instances(credentials=...)`; construct `OwnershipPolicy` (with comma trimming like `cleanup`); call `ownership.matches(candidate.ownership_key)` for the "Owned" column. The v2 unsafe substring/prefix match (`any(img.split(":")[0] in image for img in images_set)`) is **removed**.
    - `BatchOrchestrator` subclasses: update composition to supply `cleanup_policy`.
+   - CLI tests: `batch --label` and `cleanup --label` reject `""`, `" "`, and padded values before provider calls.
    - Test fixtures: `VastaiProviderConfig` + `OwnershipPolicy` + `CredentialResolution` factory fixtures.
 
 6. **Add integration tests.**
@@ -2231,6 +2364,7 @@ steps then build on v3's `providers/destroy.py` module
      - **severity logging**: orchestrator logs `LEAKED` at `ERROR`, `UNKNOWN` at `WARNING`, unexpected `NO_CREDENTIALS` at `WARNING`, refusals at `INFO`.
      - **non-empty error from empty exception**: `raise RuntimeError()` → orchestrator logs with non-empty error.
      - **null instance_id in enumeration**: JSON `{id: null, ...}` skipped, not passed to destroy.
+     - **label-prefix safety**: `BatchOrchestrator`, `batch --label`, and `cleanup --label` reject `""`, `" "`, and `" padded "` before enumeration; no implicit account-wide wildcard exists.
      - **CLI --allowed-images empty string**: fail-closed (empty set, refuses every candidate).
      - **CLI --allowed-images None**: opt-out (every image considered owned).
      - **destroy_fn returns None**: orchestrator receives `CleanupResult(verdict=UNKNOWN, error="...invalid result type NoneType")`.
@@ -2251,16 +2385,17 @@ steps then build on v3's `providers/destroy.py` module
 ## Test plan
 
 - `tests/test_cleanup_policy.py`:
-  - `_repository`: 13+ cases (valid tags/digests, registry ports, whitespace anywhere, empty/invalid digest, empty tag, multiple `@`, multiple `:` in the final segment, empty, malformed).
+  - `_repository`: valid tags/digests, registry ports, DNS/IPv6 registries, and repository paths; rejects whitespace, empty/invalid digests, empty tags, invalid tag characters (`bad!tag`), tags over 128 characters, malformed/out-of-range registry ports, invalid registry labels, upper-case or malformed repository components, multiple `@`, and multiple tags.
   - `OwnershipPolicy.matches`: reflexive, tag-insensitive, sha256-by-repo, registry-port-aware, fail-closed on empty sets, malformed reference rejection, narrow type-checked.
   - `OwnershipPolicy._normalised`: declared field; precomputed in `__post_init__`; `matches` is O(1) per call.
   - `ProviderCleanupPolicy` construction requires only `provider`, `list_instances_fn`, and `destroy_fn`; no Docker/Vast.ai-specific ownership field leaks into the generic contract.
-  - `ProviderCleanupPolicy.list_instances`: returns wired list; catches and returns `[]` on exception.
-  - `ProviderCleanupPolicy.destroy`: provider mismatch returns `PROVIDER_MISMATCH`; catches `destroy_fn` exceptions with `f"{type(exc).__name__}: {exc}"` (non-empty even for `RuntimeError()` with no message); validates `destroy_fn` return is `CleanupResult` (returns `CleanupResult(verdict=UNKNOWN, ...)` on `None` or non-`CleanupResult`).
+  - `ProviderCleanupPolicy.list_instances`: returns a valid wired `list[InstanceCandidate]`; logs and returns `[]` on callback exception, `None`, any non-list result, or any non-`InstanceCandidate` element.
+  - `ProviderCleanupPolicy.destroy`: the outer boundary contains candidate-type/provider validation, callback execution, and result validation; malformed candidate/provider values never raise; provider mismatch returns `PROVIDER_MISMATCH` without `.value` access; callback exceptions or `None`/non-`CleanupResult` returns become `CleanupResult(verdict=UNKNOWN, ...)` with non-empty diagnostics.
   - `CleanupResult` invariants: verdict/refusal exclusivity, empty `error` on both successful end-states (`DESTROYED` and `ALREADY_GONE`), and non-empty `error` on unresolved verdicts/refusals.
   - `InstanceCandidate.__post_init__`: empty `instance_id` raises; whitespace-only `instance_id` raises.
 - `tests/test_providers_vastai.py`:
   - `read_vastai_api_key` env-first: `VASTAI_API_KEY=""` → `EXPLICITLY_DISABLED`; `VASTAI_API_KEY="key"` → `AVAILABLE`; no env + file → `AVAILABLE`; no env + blank file → `ABSENT` (with warning); `OSError` → `ABSENT` (with warning).
+  - Canonical destructive-key identity: pass `CredentialResolution(AVAILABLE, "canonical-key")`, make `read_vastai_api_key()` fail if called, and assert `Authorization: Bearer canonical-key` reaches the ownership GET, stop PUT, every DELETE retry, and every verification GET/redestroy callback.
   - `VastaiRunner.from_config` round-trips with `VastaiProviderConfig`.
   - `VastaiRunner(allowed_images=frozenset({img}))` (deprecated) emits `DeprecationWarning` + builds equivalent `OwnershipPolicy`.
   - Simultaneous `ownership=` and `allowed_images=` raises `ValueError`.
@@ -2311,6 +2446,7 @@ steps then build on v3's `providers/destroy.py` module
     - Unexpected exception from `ownership.matches()` → `REFUSED` +
       `ERROR`-level (also does not escape the outermost boundary).
   - `_list_vastai_instances_rest` pagination sends the exact Bearer key on every request, collects all pages, and fails closed on non-object payloads, non-list `instances`, empty/repeated cursors, or the page safety limit.
+  - `list_vastai_instances` rejects the entire enumeration on duplicate canonical IDs within one page or across pages; conflicting label/image records are tested in both page orders.
   - `list_vastai_instances(*, credentials)` returns `list[InstanceCandidate]` with `gpu_model` + `cost_per_hour` populated; `AVAILABLE` uses explicit-key REST pagination, `ABSENT` uses ambient CLI, `EXPLICITLY_DISABLED` returns `[]` without either provider call; shared `normalize_instance_id` skips records where it returns `None` (including `None`, `True`, `False`, empty/blank strings, lists, and dictionaries); canonicalises padded strings and integers; returns `[]` on API error.
   - `build_vastai_cleanup_policy(*, ownership, credentials)`:
     - EXPLICITLY_DISABLED list: returns `[]` without REST or `vastai_cmd`.
@@ -2340,6 +2476,7 @@ steps then build on v3's `providers/destroy.py` module
       empty state.
   - `VastaiRunner.destroy_instance` logs typed result: LEAKED → `ERROR`, UNKNOWN → `WARNING`, refusals → `ERROR`; returns `False`.
 - `tests/test_batch.py`:
+  - `validate_label_prefix` and `BatchOrchestrator.__init__` accept a non-empty pre-stripped string and reject `None`, non-strings, `""`, `" "`, and padded values before `cleanup_policy.list_instances()` can run.
   - `_sweep_zombies` calls `cleanup_policy.list_instances()` exactly once.
   - `_sweep_zombies` calls `cleanup_policy.destroy(candidate)` for every label-matching, untracked candidate.
   - `_sweep_zombies` counts only `verdict=DESTROYED` outcomes (an
@@ -2351,7 +2488,7 @@ steps then build on v3's `providers/destroy.py` module
     `WARNING`, refusals at `INFO` (`caplog`).
   - `_sweep_zombies` continues on `destroy_fn` exceptions.
   - `_sweep_zombies` does NOT import provider modules (`inspect.getsource`).
-- `tests/integration/test_cleanup_policy_integration.py` — 16 scenarios from step 6 (the original 14 prerequisite scenarios plus cleanup outcome totals and credential-aligned enumeration).
+- `tests/integration/test_cleanup_policy_integration.py` — 17 scenarios from step 6 (the original 14 prerequisite scenarios plus cleanup outcome totals, credential-aligned enumeration, and label-prefix safety).
 
 ## Backwards compatibility
 
@@ -2385,12 +2522,30 @@ match in `cli.py:instances` is removed.
 
 ## Review process
 
-This is the eleventh design draft of the v4 architecture. Each prior
-draft was rejected and addressed. The tenth draft was rejected with
-2 BLOCKERs, 1 CONCERN, and 1 NIT. This draft addresses every finding
-from the 14th-pass review:
+This is the twelfth design draft of the v4 architecture. Each prior
+draft was rejected and addressed. The eleventh draft was rejected
+with 3 BLOCKERs and 2 CONCERNs. This draft addresses every finding
+from the 15th-pass review:
 
-### Applied from the 14th-pass review (this pass)
+### Applied from the 15th-pass review (this pass)
+
+- **Full Docker/OCI reference validation.** Tag grammar/length,
+  repository path components, registry hosts/ports, and digest syntax
+  are validated before repository normalization. (BLOCKER 1)
+- **Safe label-prefix invariant.** One shared validator is enforced by
+  `BatchOrchestrator.__init__`, `batch`, and `cleanup`; empty, blank,
+  or padded values fail before enumeration. (BLOCKER 2)
+- **Duplicate IDs invalidate enumeration.** Canonical duplicate IDs
+  within or across pages return no candidates, preventing conflicting
+  label/image data, repeat destroys, and incorrect counts. (BLOCKER 3)
+- **Malformed callbacks are contained.** `ProviderCleanupPolicy`
+  validates list shape/elements and keeps candidate/provider checks
+  inside the `destroy` exception boundary. (CONCERN 1)
+- **Canonical destructive credentials are asserted.** Adapter tests
+  prove no credential re-read and one Bearer key across all ownership,
+  stop, delete, verification, and redestroy requests. (CONCERN 2)
+
+### Applied from the 14th-pass review (prior pass)
 
 - **Credential-aligned enumeration.** `AVAILABLE` uses paginated REST
   requests with the exact `CredentialResolution.key`; `ABSENT` uses
@@ -2434,7 +2589,7 @@ from the 14th-pass review:
 - NIT 1: `ABSENT` means the requested instance is absent from the
   fully validated API response.
 
-The 15th-pass review prompt for ChatGPT-with-GitHub-plugin:
+The 16th-pass review prompt for ChatGPT-with-GitHub-plugin:
 
 > Review the v4 architecture design at PR #22 (file:
 > docs/architecture-v4-cleanup-policy.md) against the v3 design at
@@ -2443,44 +2598,46 @@ The 15th-pass review prompt for ChatGPT-with-GitHub-plugin:
 > src/vastai_gpu_runner/providers/vastai.py. The v4 design
 > resolves issue #19.
 >
-> The eleventh draft (applied to 14th-pass findings) introduced:
+> The twelfth draft (applied to 15th-pass findings) introduced:
 >
-> 1. **Credential-aligned enumeration.** `list_vastai_instances` uses
->    `CredentialResolution.AVAILABLE` to call the paginated REST
->    `GET /api/v1/instances` endpoint with the exact key in the
->    `Authorization: Bearer` header. `ABSENT` uses ambient CLI
->    enumeration; `EXPLICITLY_DISABLED` returns no candidates without
->    invoking REST or CLI. Add tests for pagination, explicit headers,
->    conflicting CLI-file credentials, and all three states.
-> 2. **Strict image-reference validation.** `_repository` rejects
->    whitespace anywhere, empty tags, empty/invalid digests, and
->    malformed repository components before stripping a tag or digest.
->    Add tests for `myorg/app@`, `myorg/app@garbage`,
->    `myorg/app@sha256:`, and `myorg/app:`.
-> 3. **Provider-agnostic cleanup policy.** `ProviderCleanupPolicy`
->    stores no `OwnershipPolicy`; provider factories capture provider-
->    specific ownership data inside generic callbacks. Check all
->    construction sites, tests, and orchestrator callers.
-> 4. **Successful cleanup end-states.** `DESTROYED` is confirmed
->    destruction; `ALREADY_GONE` is confirmed absence. Both require
->    empty `CleanupResult.error`, while unresolved outcomes and
->    refusals require non-empty diagnostics. Check CLI and orchestrator
->    reporting/counting and future verdict translations.
+> 1. **Complete image-reference grammar.** `_repository` validates
+>    Docker/OCI tags (characters and 128-character limit), lower-case
+>    repository path components, registry DNS/IPv6 hosts and ports,
+>    and digest syntax before normalizing. Tests include invalid tag
+>    characters, overlong tags, malformed ports, and invalid paths.
+> 2. **Non-empty label scope.** `validate_label_prefix` rejects empty,
+>    blank, or non-pre-stripped prefixes. `BatchOrchestrator.__init__`,
+>    `batch --label`, and `cleanup --label` enforce it before any
+>    provider call; account-wide cleanup has no implicit empty-prefix
+>    route.
+> 3. **Duplicate enumeration rejection.** Canonical duplicate instance
+>    IDs within one page or across pages discard the full enumeration.
+>    Tests cover conflicting label/image fields in both page orders.
+> 4. **Callback boundary hardening.** `ProviderCleanupPolicy` validates
+>    `list_instances_fn` result type/elements and places candidate type,
+>    provider mismatch, callback execution, and return validation
+>    inside one exception boundary without unsafe `.value` access.
+> 5. **Destructive credential identity test.** An AVAILABLE canonical
+>    key is asserted on ownership GET, stop PUT, DELETE retries,
+>    verification GETs, and redestroy; `read_vastai_api_key()` must not
+>    be called by the destructive path.
 >
 > Additionally, identify any new BLOCKERs or CONCERNs. Focus on:
 >
-> - Can `AVAILABLE` enumeration and REST destruction ever use
->   different API keys or accounts? Is pagination bounded and
->   fail-closed on malformed cursors/responses?
-> - Does `_repository` reject every malformed tag/digest case while
->   preserving valid registry ports, tags, and digests?
-> - Is `ProviderCleanupPolicy` truly provider-agnostic after removing
->   its Docker-specific ownership field?
-> - Are `DESTROYED` and `ALREADY_GONE` both represented as successful
->   end-states without being conflated in errors, counts, or logs?
+> - Can any malformed Docker/OCI reference still normalize to a valid
+>   owned repository? Are valid registry-port, IPv6, tag, and digest
+>   forms preserved?
+> - Can an empty, blank, padded, or malformed label prefix reach
+>   `startswith` in either CLI or programmatic composition?
+> - Can duplicate IDs or malformed enumeration callbacks yield any
+>   candidates, repeated destroys, or wrong label/image scope?
+> - Does `ProviderCleanupPolicy` truly uphold its never-raises contract
+>   for invalid callback results, candidate types, and provider values?
+> - Does one canonical AVAILABLE key reach every destructive REST
+>   callback without environment/file re-resolution?
 > - Does the test plan still cover all 14 v3 prerequisite integration
->   scenarios plus the added credential-alignment and cleanup-result
->   cases from migration step 6?
+>   scenarios plus the added cleanup-result, credential-alignment, and
+>   label-prefix cases from migration step 6?
 >
 > Return a labeled list of findings. Each finding is one of:
 > BLOCKER (must fix before merge), CONCERN (should fix, but not
