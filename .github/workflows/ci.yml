@@ -47,47 +47,11 @@ jobs:
         run: uv run complexipy src/ --max-complexity-allowed 10
 
       - name: Run tests with coverage
-        run: uv run pytest -q --cov --cov-branch --cov-report=term-missing --cov-report=xml --cov-report=lcov
-
-      - name: Upload coverage to Codecov
-        if: matrix.python-version == '3.12'
-        # ``continue-on-error: true`` so the PR check doesn't fail
-        # on a missing/invalid Codecov token. Once the maintainer
-        # configures the CODECOV_TOKEN secret (see the README's
-        # 'CI / Codecov setup' section), this step will succeed and
-        # the badge will light up. Without continue-on-error, every
-        # PR before the secret is configured would fail CI.
-        continue-on-error: true
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
-        with:
-          files: ./coverage.xml
-          flags: unittests
-          # ``fail_ci_if_error: false`` (explicit) — combined with
-          # the ``continue-on-error: true`` above, makes Codecov
-          # upload failures non-blocking on the PR check. The
-          # codecov-action still emits a non-zero exit code on
-          # failure (visible in the workflow log), but the PR
-          # check still passes. This is the canonical pattern for
-          # repos that haven't set up Codecov yet — once the
-          # ``CODECOV_TOKEN`` secret is configured, the upload
-          # succeeds and the badge transitions from "unknown" to a
-          # real percentage.
-          fail_ci_if_error: false
-          # ``verbose: true`` writes the Codecov upload details to
-          # the GitHub Actions log so future upload failures are
-          # debuggable in the workflow logs.
-          verbose: true
-          # ``token:`` is required for uploads to protected
-          # branches (main, master, release/*) until the Codecov
-          # organisation's "Global Upload Token" setting is enabled
-          # at https://codecov.io/settings/<org>/global-upload-token.
-          # Codecov's documented tokenless upload flow (via OIDC)
-          # only works for PRs from forks to public repos — direct
-          # pushes to ``main`` always need a token. The CODECOV_TOKEN
-          # is the per-repository upload token (NOT the codecov.io
-          # API token); it's printed on the Codecov project page
-          # under "Settings → Tokens".
-          token: ${{ secrets.CODECOV_TOKEN }}
+        # Coverage is generated locally (term-missing report) so
+        # contributors can spot uncovered lines on their own
+        # machines. We do not upload to any external service —
+        # coverage stays a local-machine signal.
+        run: uv run pytest -q --cov --cov-branch --cov-report=term-missing
 
   stress-real-vastai:
     # Opt-in real-Vast.ai smoke test. Skipped unless the repository
