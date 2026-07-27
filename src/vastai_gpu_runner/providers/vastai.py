@@ -31,6 +31,7 @@ import requests
 from vastai_gpu_runner.cleanup_policy import (
     InstanceCandidate,
     OwnershipPolicy,
+    OwnershipVerification,
     normalize_instance_id,
 )
 from vastai_gpu_runner.providers.destroy_adapters.vastai import (
@@ -373,6 +374,225 @@ def list_vastai_instances(
         if not _append_record(candidates, seen_candidate_ids, inst):
             return []
     return candidates
+
+
+# ---------------------------------------------------------------------------
+# verify_instance_ownership — CLI-side ownership check (v4)
+# ---------------------------------------------------------------------------
+
+
+def _validate_verifier_record(
+    raw_record: object,
+    instance_id: str,
+    seen_ids: set[str],
+) -> tuple[str, str] | None:
+    """Validate one record from the verifier CLI response.
+
+    Returns ``(canonical_id, image_uuid)`` on success or ``None``
+    on any failure (the caller should ``REFUSED`` and abort).
+    Defensive: malformed record → None.
+    """
+    if not isinstance(raw_record, dict):
+        logger.error(
+            "REFUSING: instance %s cannot be verified — "
+            "response contains a non-object record: %r. "
+            "Destroy refused.",
+            instance_id,
+            raw_record,
+        )
+        return None
+    canonical_id = normalize_instance_id(raw_record.get("id"))
+    if canonical_id is None:
+        logger.error(
+            "REFUSING: instance %s cannot be verified — "
+            "record has missing/null/invalid id: %r. Destroy refused.",
+            instance_id,
+            raw_record,
+        )
+        return None
+    if canonical_id in seen_ids:
+        logger.error(
+            "REFUSING: instance %s cannot be verified — "
+            "response contains duplicate canonical ID %s. Destroy refused.",
+            instance_id,
+            canonical_id,
+        )
+        return None
+    seen_ids.add(canonical_id)
+    image_uuid = raw_record.get("image_uuid")
+    if not isinstance(image_uuid, str):
+        logger.error(
+            "REFUSING: instance %s cannot be verified — "
+            "record has non-string/null image_uuid: %r. Destroy refused.",
+            instance_id,
+            raw_record,
+        )
+        return None
+    return canonical_id, image_uuid
+
+
+def _eval_ownership_match(
+    normalised_records: list[tuple[str, str]],
+    instance_id: str,
+    canonical_target: str,
+    ownership: OwnershipPolicy,
+) -> OwnershipVerification:
+    """Locate the target record in the validated list and evaluate."""
+    for record_id, image_uuid in normalised_records:
+        if record_id == canonical_target:
+            if ownership.matches(image_uuid):
+                return OwnershipVerification.OWNED
+            logger.error(
+                "BLOCKED: instance %s belongs to another project (image=%s). Will NOT destroy.",
+                instance_id,
+                image_uuid,
+            )
+            return OwnershipVerification.REFUSED
+    logger.info(
+        "Instance %s not found in account (already destroyed?)",
+        instance_id,
+    )
+    return OwnershipVerification.ABSENT
+
+
+def _fetch_instances_for_verification(
+    instance_id: str,
+) -> list[object] | None:
+    """Fetch + parse the CLI instances response for verification.
+
+    Returns the parsed list on success, ``None`` on any
+    subprocess / JSON / type-shape failure (the caller
+    translates ``None`` to ``REFUSED``).
+    """
+    try:
+        raw = vastai_cmd(["show", "instances", "--raw"], timeout=15)
+        instances = json.loads(raw)
+    except (RuntimeError, json.JSONDecodeError) as exc:
+        logger.error(
+            "REFUSING: cannot verify ownership of instance %s "
+            "(API error: %s) — destroy refused. Resolve the API "
+            "response and retry.",
+            instance_id,
+            exc,
+        )
+        return None
+    if not isinstance(instances, list):
+        logger.error(
+            "REFUSING: cannot verify ownership of instance %s — "
+            "response is not a list (got %s). Destroy refused.",
+            instance_id,
+            type(instances).__name__,
+        )
+        return None
+    return instances
+
+
+def _normalise_response(
+    instances: list[object],
+    instance_id: str,
+) -> list[tuple[str, str]] | None:
+    """Validate and normalise every record in the response.
+
+    Returns the list of (canonical_id, image_uuid) tuples on
+    success, ``None`` on any malformed-record / duplicate-id
+    failure (the caller translates ``None`` to ``REFUSED``).
+    """
+    normalised: list[tuple[str, str]] = []
+    seen_ids: set[str] = set()
+    for raw_record in instances:
+        validated = _validate_verifier_record(raw_record, instance_id, seen_ids)
+        if validated is None:
+            return None
+        normalised.append(validated)
+    return normalised
+
+
+def verify_instance_ownership(
+    instance_id: str,
+    *,
+    ownership: OwnershipPolicy,
+) -> OwnershipVerification:
+    """CLI-side ownership check for a single instance (v4 factory).
+
+    This is the CLI-auth verification used by the v4 factory's
+    CLI fallback path (separate auth context from the REST path).
+    Returns a tagged ``OwnershipVerification`` so the caller can
+    distinguish four operationally different outcomes that v2
+    conflated into ``bool``:
+
+    - ``OWNED``    → instance exists and is owned; CLI destroy may
+                     proceed.
+    - ``ABSENT``   → instance is not in the API response (already
+                     destroyed). The verifier has proved absence
+                     from a fully well-formed response and the
+                     caller can choose the desired verdict for
+                     "already gone" without invoking destruction.
+    - ``REFUSED``  → instance exists but is unowned, OR the API
+                     response was so malformed that absence cannot
+                     be proved, OR any other verifier-level failure.
+                     Refusal means "do not destroy". Failure is
+                     fail-closed.
+    - ``DISABLED`` → ownership checking is disabled (no policy).
+                     This is a short-circuit that bypasses the API
+                     call entirely.
+
+    Implementation notes (carefully ordered):
+
+    1. **One short-circuit up front** (DISABLED): skip the API call
+       entirely when ``owned_images is None``.
+    2. **One canonical form for the requested ID**: ``normalize_instance_id``.
+       Padded, numeric, and string IDs reduce to the same canonical
+       form before comparison.
+    3. **One outermost ``except Exception`` boundary**: subprocess
+       failures, JSON parsing, response-shape problems, or even
+       downstream ``ownership.matches`` failures cannot escape the
+       function. (They're translated to ``REFUSED``.)
+    4. **Validate-and-normalize the entire response first**, then
+       locate and evaluate the requested record. A single malformed
+       entry anywhere in the list fails the whole check
+       (conservatively — we cannot prove absence of one ID when
+       another entry is unreadable). Duplicate canonical IDs are
+       also refused because conflicting records cannot prove
+       ownership deterministically. We do NOT short-circuit on
+       the first match, because a malformed record *after* a match
+       would otherwise be ignored.
+    5. **Failures are logged at ERROR** level so the operator sees
+       the destroy has been refused (not "ambiguous state").
+
+    The function never returns ``True`` / ``False`` — the contract
+    is encoded in the enum so callers must explicitly handle each
+    case. v2's conflated bool cannot represent "instance is owned
+    AND present" separately from "instance is already absent".
+    """
+    if ownership.owned_images is None:
+        return OwnershipVerification.DISABLED
+
+    try:
+        canonical_target = normalize_instance_id(instance_id)
+        if canonical_target is None:
+            logger.error(
+                "REFUSING: requested instance_id %r is not a valid ID — refusing to destroy",
+                instance_id,
+            )
+            return OwnershipVerification.REFUSED
+
+        instances = _fetch_instances_for_verification(instance_id)
+        if instances is None:
+            return OwnershipVerification.REFUSED
+
+        normalised = _normalise_response(instances, instance_id)
+        if normalised is None:
+            return OwnershipVerification.REFUSED
+
+        return _eval_ownership_match(normalised, instance_id, canonical_target, ownership)
+    except Exception as exc:
+        logger.error(
+            "REFUSING: cannot verify ownership of instance %s — "
+            "unexpected error: %s. Destroy refused.",
+            instance_id,
+            exc,
+        )
+        return OwnershipVerification.REFUSED
 
 
 # ---------------------------------------------------------------------------
