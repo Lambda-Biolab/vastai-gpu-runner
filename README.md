@@ -1,5 +1,14 @@
 # vastai-gpu-runner
 
+[![Version](https://img.shields.io/badge/version-0.4.0-8A2BE2)](pyproject.toml)
+[![License](https://img.shields.io/badge/license-Apache_2.0-blue)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.11%2B-58f4c2.svg)](https://www.python.org/)
+[![CI](https://github.com/Lambda-Biolab/vastai-gpu-runner/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Lambda-Biolab/vastai-gpu-runner/actions/workflows/ci.yml)
+[![Codecov](https://codecov.io/gh/Lambda-Biolab/vastai-gpu-runner/graph/badge.svg)](https://codecov.io/gh/Lambda-Biolab/vastai-gpu-runner)
+[![Dependabot Updates](https://github.com/Lambda-Biolab/vastai-gpu-runner/actions/workflows/dependabot/dependabot-updates/badge.svg?branch=main)](https://github.com/Lambda-Biolab/vastai-gpu-runner/actions/workflows/dependabot/dependabot-updates)
+[![CodeQL](https://github.com/Lambda-Biolab/vastai-gpu-runner/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/Lambda-Biolab/vastai-gpu-runner/actions/workflows/codeql.yml)
+[![CodeFactor](https://www.codefactor.io/repository/github/lambda-biolab/vastai-gpu-runner/badge/main)](https://www.codefactor.io/repository/github/lambda-biolab/vastai-gpu-runner)
+
 ![vastai-gpu-runner — Cloud GPU batches for Vast.ai.](.github/social-preview.png)
 
 Cloud GPU orchestration framework for [Vast.ai](https://vast.ai) — batch deployment, R2 storage, worker lifecycle, crash recovery.

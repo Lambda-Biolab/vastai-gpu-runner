@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d269b9917d8e33f7165632f15cc38a13726f64b5 # v9.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install dependencies
+        run: uv sync --frozen --dev
+
+      - name: Lint with ruff
+        run: |
+          uv run ruff format --check src/ tests/
+          uv run ruff check src/ tests/
+
+      - name: Type check with pyright
+        run: uv run pyright src/
+
+      - name: Check complexity
+        run: uv run complexipy src/ --max-complexity-allowed 10
+
+      - name: Run tests with coverage
+        run: uv run pytest -q --cov --cov-branch --cov-report=term-missing --cov-report=xml --cov-report=lcov
+
+      - name: Upload coverage to Codecov
+        if: matrix.python-version == '3.12'
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          files: ./coverage.xml
+          flags: unittests
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  stress-real-vastai:
+    # Opt-in real-Vast.ai smoke test. Skipped unless the repository
+    # has VASTAI_API_KEY configured. The ``tests/stress/test_real_vastai_stress.py``
+    # module is gated on the env var (pytest.skipif) so it auto-skips
+    # when the key is missing. Uses the cheapest RTX 3060 offers on
+    # Vast.ai ($0.0321-$0.05/hr) and a $0.30 budget ceiling.
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    env:
+      VASTAI_API_KEY: ${{ secrets.VASTAI_API_KEY }}
+      STRESS_BUDGET_USD: "0.30"
+      STRESS_DEADLINE_SECONDS: "600"
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d269b9917d8e33f7165632f15cc38a13726f64b5 # v9.0.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install dependencies
+        run: uv sync --frozen --dev
+
+      - name: Real-Vast.ai smoke test (opt-in via VASTAI_API_KEY secret)
+        run: |
+          if [ -n "$VASTAI_API_KEY" ]; then
+            echo "VASTAI_API_KEY set — running real-Vast.ai smoke test"
+            uv run pytest tests/stress/test_real_vastai_stress.py -v
+          else
+            echo "VASTAI_API_KEY not set — skipping (test suite auto-skips without it)"
+            uv run pytest tests/stress/test_real_vastai_stress.py -v --collect-only
+          fi
