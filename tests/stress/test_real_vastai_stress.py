@@ -179,6 +179,12 @@ def test_real_rtx_3060_deploy_ssh_destroy(
         #   worker.sh on the CUDA image). The cleanup path is
         #   what we actually want to exercise — deploy-only
         #   without cleanup would leak instances.
+        #
+        # max_retries=1 (in the DeploymentConfig) so the runner
+        # does NOT spin up multiple instances on a single deploy
+        # call. Without this, a host that doesn't boot cleanly
+        # would create N instances, exceed the budget, and may
+        # leak instances between attempts.
         if _deadline_exceeded(start):
             pytest.fail("deadline exceeded before deploy")
         deploy_result: DeploymentResult = runner.run_full_cycle(
@@ -187,6 +193,7 @@ def test_real_rtx_3060_deploy_ssh_destroy(
             offers=[offer],
             used_machine_ids=set(),
             machine_lock=None,
+            max_retries=1,  # single offer → single attempt
         )
         if deploy_result.success and deploy_result.instance is not None:
             instance = deploy_result.instance
@@ -266,12 +273,37 @@ def test_real_rtx_3060_deploy_ssh_destroy(
     )
 
     final_candidates = list_vastai_instances(credentials=credentials)
+    # Belt-and-suspenders: if anything leaked, destroy every
+    # gpu-runner-labelled instance. The end-of-test invariant
+    # is "zero leaked instances" — we both assert + remediate
+    # so a flaky run never burns cloud spend on a future CI.
+    leaked_runner_instances = [c for c in final_candidates if "gpu-runner" in (c.label or "")]
+    for c in leaked_runner_instances:
+        try:
+            _teardown_destroy(c.instance_id)
+        except Exception as exc:
+            print(f"\n[real-stress] FAILED to cleanup leaked instance {c.instance_id}: {exc}")
+    # Re-check after cleanup.
+    final_candidates = list_vastai_instances(credentials=credentials)
     final_ids = {c.instance_id for c in final_candidates}
     assert len(final_ids) == 0, (
         f"stress test leaked instances: {final_ids} "
         f"(deploy may have succeeded but cleanup did not run)"
     )
     print("[real-stress] cleanup invariant: zero active instances remain")
+
+
+def _teardown_destroy(instance_id: str) -> None:
+    """Standalone destroy helper for the leaked-instance sweep."""
+    from vastai_gpu_runner.providers.vastai import destroy_vastai_instance
+
+    result = destroy_vastai_instance(
+        instance_id,
+        ownership=OwnershipPolicy(owned_images=None),
+    )
+    if result.verdict is None:
+        # CLI fallback (NO_CREDENTIALS or other refusal).
+        vastai_cmd(["destroy", "instance", instance_id], timeout=30)
 
 
 # ---------------------------------------------------------------------------
@@ -327,6 +359,10 @@ def make_deployment_config() -> object:
     the disk value as a parse error. A real ``DeploymentConfig``
     with disk=40GB + image ``nvidia/cuda`` (Vast.ai's smallest
     public image) lets us deploy without spinning up a worker.
+
+    ``max_retries=1`` because the test only has one offer to try;
+    a higher retry count would spin up multiple instances and
+    exceed the budget on a host that doesn't boot cleanly.
     """
     from vastai_gpu_runner.types import DeploymentConfig
 
