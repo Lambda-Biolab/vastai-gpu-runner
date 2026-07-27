@@ -20,8 +20,18 @@ import logging
 import re
 import subprocess
 import time
+import warnings
+from collections.abc import Set as AbstractSet
+from dataclasses import dataclass, field
 from pathlib import Path
+from uuid import uuid4
 
+from vastai_gpu_runner.cleanup_policy import OwnershipPolicy
+from vastai_gpu_runner.providers.destroy_adapters.vastai import (
+    CredentialResolution,
+    CredentialState,
+    read_vastai_api_key,
+)
 from vastai_gpu_runner.runner import CloudRunner
 from vastai_gpu_runner.ssh import scp_download, scp_upload, ssh_cmd
 from vastai_gpu_runner.types import (
@@ -129,33 +139,191 @@ def vastai_cmd(args: list[str], *, timeout: int = 30) -> str:
 # ``OwnershipVerification`` enum.
 
 
+# ---------------------------------------------------------------------------
+# VastaiProviderConfig
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class VastaiProviderConfig:
+    """Canonical Vast.ai configuration shared by runner factory + cleanup policy.
+
+    The runner factory (``VastaiRunner.from_config``) reads
+    ``ownership``, ``credentials``, ``label_prefix``, ``docker_image``, and
+    ``setup_commands`` from this. The cleanup-policy factory
+    (``build_vastai_cleanup_policy``) reads only ``ownership`` and
+    ``credentials`` — the deployment-image invariant does not apply
+    to listing/cleanup-only commands.
+
+    Invariants:
+        - ``docker_image`` is non-empty and pre-stripped.
+        - ``docker_image`` is in ``ownership.owned_images`` unless
+          ``ownership.owned_images is None`` (ownership check disabled).
+        - ``credentials`` is a v3 ``CredentialResolution`` (frozen).
+        - ``label_prefix`` is either ``None`` (non-batch runner) or
+          a non-empty, pre-stripped string; batch composition always
+          supplies a unique scope.
+    """
+
+    docker_image: str = DEFAULT_IMAGE
+    ownership: OwnershipPolicy = field(default_factory=OwnershipPolicy)
+    credentials: CredentialResolution = field(
+        default_factory=lambda: CredentialResolution(state=CredentialState.ABSENT)
+    )
+    label_prefix: str | None = None
+    min_gpu_vram_mib: int = MIN_GPU_VRAM_MIB
+    setup_commands: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        """Validate label_prefix, docker_image, and docker_image ownership invariant."""
+        if self.label_prefix is not None and (
+            not isinstance(self.label_prefix, str)  # pyright: ignore[reportUnnecessaryIsInstance]
+            or not self.label_prefix
+            or self.label_prefix != self.label_prefix.strip()
+        ):
+            raise ValueError(
+                "VastaiProviderConfig.label_prefix must be None or a non-empty, pre-stripped string"
+            )
+        if not self.docker_image or self.docker_image != self.docker_image.strip():
+            raise ValueError(
+                "VastaiProviderConfig.docker_image must be a non-empty, pre-stripped reference"
+            )
+        if self.ownership.owned_images is not None and not self.ownership.matches(
+            self.docker_image
+        ):
+            raise ValueError(
+                f"VastaiProviderConfig invariant violated: docker_image="
+                f"{self.docker_image!r} is not owned by "
+                f"ownership.owned_images="
+                f"{set(self.ownership.owned_images)!r}"
+            )
+
+    @classmethod
+    def from_env(
+        cls,
+        *,
+        docker_image: str | None = None,
+        owned_images: AbstractSet[str] | None = None,
+        label_prefix: str | None = None,
+    ) -> VastaiProviderConfig:
+        """Build from environment / config files.
+
+        Reads the v3 ``read_vastai_api_key()`` into ``credentials``.
+        The CLI uses ``dataclasses.replace`` to overlay the
+        project-specific values on top of this base.
+
+        Note: explicit empty ``docker_image`` is rejected by
+        ``__post_init__``; only ``None`` triggers the default.
+        """
+        resolved_image = DEFAULT_IMAGE if docker_image is None else docker_image
+        return cls(
+            docker_image=resolved_image,
+            ownership=OwnershipPolicy(owned_images=owned_images),
+            credentials=read_vastai_api_key(),
+            label_prefix=label_prefix,
+        )
+
+
 class VastaiRunner(CloudRunner):
     """Vast.ai marketplace runner with hardened deployment.
 
     Args:
         config: Deployment configuration.
-        allowed_images: Docker images owned by this project.
-            destroy_instance() refuses to destroy instances running
-            images not in this set. Pass None to skip ownership checks.
+        ownership: Ownership policy. The runner and the cleanup
+            adapter both call ``ownership.matches(image_ref)``.
+        credentials: Pre-resolved credential state. When None,
+            the runner passes ``None`` to the adapter, which
+            calls ``read_vastai_api_key()`` (the v3 back-compat path).
+        label_prefix: Immutable batch label scope. Batch composition
+            always supplies a unique, validated scope; non-batch
+            callers may leave it None.
         docker_image: Docker image to use for new instances.
         min_gpu_vram_mib: Minimum GPU VRAM required (default 20 GB).
+        setup_commands: Optional pre-instance setup commands.
+
+    Note: ``allowed_images`` is a deprecated back-compat alias
+    that builds an ``OwnershipPolicy`` from the given set.
+    Simultaneous ``ownership=`` and ``allowed_images=`` raises
+    ``ValueError`` — silently ignoring one destruction-safety
+    configuration is unsafe.
     """
 
     def __init__(
         self,
         config: DeploymentConfig | None = None,
         *,
-        allowed_images: frozenset[str] | None = None,
+        ownership: OwnershipPolicy | None = None,
+        credentials: CredentialResolution | None = None,
+        label_prefix: str | None = None,
+        allowed_images: frozenset[str] | None = None,  # DEPRECATED
         docker_image: str = DEFAULT_IMAGE,
         min_gpu_vram_mib: int = MIN_GPU_VRAM_MIB,
         setup_commands: list[str] | None = None,
     ) -> None:
         """Initialize Vast.ai runner with deployment config and safety guards."""
+        if label_prefix is not None and (
+            not isinstance(label_prefix, str)  # pyright: ignore[reportUnnecessaryIsInstance]
+            or not label_prefix
+            or label_prefix != label_prefix.strip()
+        ):
+            raise ValueError(
+                "VastaiRunner.label_prefix must be None or a non-empty, pre-stripped string"
+            )
+        if ownership is not None and allowed_images is not None:
+            raise ValueError(
+                "VastaiRunner: supply either ownership= or allowed_images= "
+                "(deprecated), not both — silently ignoring one destruction-"
+                "safety configuration is unsafe."
+            )
+        if ownership is None and allowed_images is not None:
+            warnings.warn(
+                "VastaiRunner(allowed_images=...) is deprecated; "
+                "build an OwnershipPolicy and pass ownership= instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            ownership = OwnershipPolicy(owned_images=frozenset(allowed_images))
         super().__init__(config)
-        self.allowed_images = allowed_images
+        self.ownership = ownership
+        self.credentials = credentials
+        self.label_prefix = label_prefix
+        # Back-compat read access for existing callers.
+        self._allowed_images_for_backcompat = (
+            frozenset(ownership.owned_images)
+            if ownership and ownership.owned_images is not None
+            else None
+        )
         self.docker_image = docker_image
         self.min_gpu_vram_mib = min_gpu_vram_mib
         self._setup_commands = setup_commands or []
+
+    @property
+    def allowed_images(self) -> frozenset[str] | None:
+        """Back-compat read access. New code should use ``self.ownership``."""
+        return self._allowed_images_for_backcompat
+
+    @classmethod
+    def from_config(cls, canonical: VastaiProviderConfig) -> VastaiRunner:
+        """Build a VastaiRunner from the canonical config.
+
+        Preserves the canonical ``OwnershipPolicy`` and
+        ``CredentialResolution`` instances unchanged — the runner
+        and the cleanup policy will call ``ownership.matches()`` and
+        use ``credentials`` from the same instances.
+        """
+        return cls(
+            ownership=canonical.ownership,
+            credentials=canonical.credentials,
+            label_prefix=canonical.label_prefix,
+            docker_image=canonical.docker_image,
+            min_gpu_vram_mib=canonical.min_gpu_vram_mib,
+            setup_commands=list(canonical.setup_commands),
+        )
+
+    def _next_instance_label(self) -> str:
+        """Create a unique label inside this runner's immutable batch scope."""
+        prefix = self.label_prefix or "gpu-runner"
+        return f"{prefix}-{uuid4().hex[:12]}"
 
     def search_offers(self, **kwargs: object) -> list[dict[str, object]]:
         """Search Vast.ai marketplace for matching GPU offers."""
@@ -188,7 +356,7 @@ class VastaiRunner(CloudRunner):
     def create_instance(self, offer: dict[str, object]) -> CloudInstance:
         """Create a Vast.ai instance from an offer."""
         offer_id = str(offer.get("id", ""))
-        label = f"gpu-runner-{int(time.time()) % 100000}"
+        label = self._next_instance_label()
 
         try:
             output = vastai_cmd(
