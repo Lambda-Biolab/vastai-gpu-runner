@@ -815,6 +815,17 @@ class InstanceCandidate:
                 raise ValueError(
                     f"InstanceCandidate.{field_name} must be a string"
                 )
+        for field_name in ("cost_per_hour", "started_at"):
+            value = getattr(self, field_name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or value != value  # NaN
+                or value in (float("inf"), float("-inf"))
+            ):
+                raise ValueError(
+                    f"InstanceCandidate.{field_name} must be a finite real number"
+                )
 
 
 @dataclass(frozen=True)
@@ -2095,29 +2106,36 @@ from uuid import uuid4
 def resolve_label_scope(
     requested_prefix: str,
     persisted_scope: str | None,
-    persisted_requested_prefix: str | None = None,
+    persisted_requested_prefix: str = "",
 ) -> str:
-    """Reuse a persisted scope or create one for a new batch."""
+    """Reuse a persisted scope or create one for a new batch.
+
+    The returned scope is always of the form
+    ``f"{requested}-{12 hex chars}"``. The persisted scope is reused
+    only when its required requested prefix matches; an unrecognized
+    persisted shape raises ``ValueError`` rather than silently
+    re-scoping an existing batch.
+    """
     requested = validate_label_prefix(requested_prefix)
-    if persisted_scope:
-        persisted = validate_label_prefix(persisted_scope)
-        if persisted_requested_prefix is not None:
-            stored_request = validate_label_prefix(persisted_requested_prefix)
-            if stored_request != requested:
-                raise ValueError(
-                    "persisted batch prefix does not match the requested label"
-                )
-        else:
-            if not (
-                persisted.startswith(f"{requested}-")
-                and len(persisted) == len(requested) + 1 + 12
-                and all(c in "0123456789abcdef" for c in persisted[len(requested) + 1:])
-            ):
-                raise ValueError(
-                    "persisted label scope does not match the requested batch prefix"
-                )
+    if not persisted_scope:
+        return f"{requested}-{uuid4().hex[:12]}"
+    persisted = validate_label_prefix(persisted_scope)
+    if persisted_requested_prefix:
+        stored_request = validate_label_prefix(persisted_requested_prefix)
+        if stored_request != requested:
+            raise ValueError(
+                "persisted batch prefix does not match the requested label"
+            )
         return persisted
-    return f"{requested}-{uuid4().hex[:12]}"
+    if not (
+        persisted.startswith(f"{requested}-")
+        and len(persisted) == len(requested) + 1 + 12
+        and all(c in "0123456789abcdef" for c in persisted[len(requested) + 1:])
+    ):
+        raise ValueError(
+            "persisted label scope does not match the requested batch prefix"
+        )
+    return persisted
 
 
 # BatchOrchestrator.__init__ replaces its direct assignment with:
@@ -2267,12 +2285,28 @@ def batch(
         build_vastai_cleanup_policy,
     )
 
-    # `persisted_label_scope` is loaded from BatchState/JobBatchState
-    # before this composition; it is None for a new batch.
+    # `persisted_label_scope` and `persisted_requested_prefix` are loaded
+    # from BatchState/JobBatchState before this composition; they are
+    # None / "" for a new batch.
     try:
-        label_scope = resolve_label_scope(label, persisted_label_scope)
+        label_scope = resolve_label_scope(
+            label,
+            persisted_label_scope,
+            persisted_requested_prefix,
+        )
     except ValueError as exc:
         raise typer.BadParameter(str(exc), param_hint="--label") from exc
+
+    # Persist the label identity before any provider call so a crash
+    # before the first checkpoint still leaves a recoverable scope.
+    from vastai_gpu_runner.batch import persist_label_identity
+    from pathlib import Path
+    persist_label_identity(
+        Path(label_scope_state_path),
+        batch_id=label_scope,
+        label_scope=label_scope,
+        requested_label_prefix=label,
+    )
 
     base = VastaiProviderConfig.from_env()
     config = replace(
@@ -2305,6 +2339,17 @@ Empty `--allowed-images` is **fail-closed**:
 @app.command()
 def cleanup(
     label_prefix: Annotated[str, typer.Option("--label", "-l")] = ...,
+    adjacent_scopes: Annotated[
+        bool,
+        typer.Option(
+            "--allow-adjacent-scopes",
+            help=(
+                "Match labels that start with --label but are not delimited "
+                "by '-' (e.g. `--label prod` matches `production-...`). "
+                "DANGEROUS; only enable for intentional broad cleanup."
+            ),
+        ),
+    ] = False,
     allowed_images: Annotated[
         str | None,
         typer.Option(
@@ -2359,10 +2404,15 @@ def cleanup(
         credentials=read_vastai_api_key(),
     )
 
+    # Manual cleanup defaults to exact scope match (`<prefix>-`) and
+    # only matches adjacent identities if `--allow-adjacent-scopes` is
+    # passed, since unintentional broad cleanup is dangerous.
+    adjacent = adjacent_scopes
+    scope_prefix = f"{label_prefix}-" if not adjacent else label_prefix
     candidates = cleanup_policy.list_instances()
-    matches = [c for c in candidates if c.label.startswith(label_prefix)]
+    matches = [c for c in candidates if c.label.startswith(scope_prefix)]
     if not matches:
-        console.print(f"No instances matching label prefix '{label_prefix}'.")
+        console.print(f"No instances matching label scope '{label_prefix}'.")
         return
 
     console.print(f"Found {len(matches)} instance(s) matching '{label_prefix}':")
@@ -2593,7 +2643,7 @@ steps then build on v3's `providers/destroy.py` module
   - `ProviderCleanupPolicy.destroy`: the outer boundary contains candidate-type/provider validation, callback execution, and result validation; malformed candidate/provider values never raise; provider mismatch returns `PROVIDER_MISMATCH` without `.value` access; callback exceptions or `None`/non-`CleanupResult` returns become `CleanupResult(verdict=UNKNOWN, ...)` with non-empty diagnostics.
   - `CleanupResult` invariants: verdict/refusal enum types and `error: str`, verdict/refusal exclusivity, empty `error` on both successful end-states (`DESTROYED` and `ALREADY_GONE`), and non-empty `error` on unresolved verdicts/refusals; string verdicts/refusals and `error=None` raise.
   - CLI cleanup and orchestrator reporting include a final defensive unknown-outcome branch rather than silently omitting an invalid `CleanupResult`.
-   - `InstanceCandidate.__post_init__`: invalid provider or non-string `label`, `state`, `image_uuid`, `ownership_key`, or `gpu_model` raises; empty/whitespace `instance_id` raises.
+   - `InstanceCandidate.__post_init__`: invalid provider or non-string `label`, `state`, `image_uuid`, `ownership_key`, or `gpu_model` raises; non-finite/non-real `cost_per_hour` or `started_at` raises; empty/whitespace `instance_id` raises.
 
 - `tests/test_providers_vastai.py`:
   - `read_vastai_api_key` env-first: `VASTAI_API_KEY=""` → `EXPLICITLY_DISABLED`; `VASTAI_API_KEY="key"` → `AVAILABLE`; no env + file → `AVAILABLE`; no env + blank file → `ABSENT` (with warning); `OSError` → `ABSENT` (with warning). Plus invalid input rejection: `state="unknown"` or `key=123` raises; unknown `state` is not silently used.
