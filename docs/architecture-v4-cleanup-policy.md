@@ -100,7 +100,7 @@ in `VastaiProviderConfig` (because the runner also needs
 `docker_image`, `setup_commands`, etc.); the cleanup-policy factory
 takes them directly.
 
-## What changes vs the v4 first + second + third + fourth + fifth + sixth + seventh + eighth + ninth + tenth + eleventh drafts
+## What changes vs the v4 first + second + third + fourth + fifth + sixth + seventh + eighth + ninth + tenth + eleventh + twelfth + thirteenth drafts
 
 The first draft was rejected with 5 BLOCKERs and 7 CONCERNs. The
 second draft was rejected with 7 BLOCKERs, 2 CONCERNs, and 3 NITs.
@@ -112,10 +112,42 @@ seventh draft was rejected with 1 BLOCKER and 1 NIT. The eighth
 draft was rejected with 3 BLOCKERs, 2 CONCERNs, and 1 NIT. The ninth
 draft was rejected with 4 BLOCKERs, 2 CONCERNs, and 1 NIT. The tenth
 draft was rejected with 2 BLOCKERs, 1 CONCERN, and 1 NIT. The
-eleventh draft was rejected with 3 BLOCKERs and 2 CONCERNs. This
-twelfth draft addresses every finding.
+eleventh draft was rejected with 3 BLOCKERs and 2 CONCERNs. The twelfth
+draft was rejected with 2 BLOCKERs and 2 CONCERNs. The thirteenth
+draft was rejected with 3 BLOCKERs, 2 CONCERNs, and 1 NIT. This
+fourteenth draft addresses every finding.
 
-### Applied from the 15th-pass review (this pass)
+### Applied from the 17th-pass review (this pass)
+
+- **Persistent batch label scope.** `BatchState` and `JobBatchState`
+  persist `label_scope`; resume loads it before runner/orchestrator
+  construction, reuses it, and rejects requested-prefix drift. (BLOCKER 1)
+- **Verifier rejects malformed image UUIDs.** CLI ownership verification
+  refuses null and non-string `image_uuid` values instead of coercing
+  malformed data into affirmative ownership. (BLOCKER 2)
+- **Digest algorithms follow OCI grammar.** Digest algorithms are
+  lower-case, digit-capable, and registered algorithms enforce their
+  required lowercase-hex lengths. (BLOCKER 3)
+- **InstanceCandidate runtime DTO types are enforced.** Provider and
+  safety-string fields are validated before a candidate can reach the
+  orchestrator. (CONCERN 1)
+- **Review metadata is advanced with the implementation pass.** This
+  is the fourteenth draft and records the 17th-pass findings. (NIT 1)
+
+### Applied from the 16th-pass review (prior pass)
+
+- **Unique label scope was threaded through composition.**
+  `VastaiProviderConfig`, `VastaiRunner`, and `BatchOrchestrator`
+  share a validated scope; batch-created instance labels derive from it.
+- **Registered digest lengths were enforced.** `sha256`, `sha512`, and
+  `blake3` require lowercase hexadecimal encodings of their defined
+  lengths.
+- **Nullable enumeration safety fields normalize to empty strings.**
+  Null labels cannot match and null state is ineligible.
+- **CleanupResult types and reporting are defensive.** Enum/error types
+  are validated and CLI/orchestrator have unknown-outcome branches.
+
+### Applied from the 15th-pass review (prior pass)
 
 - **Full image-reference grammar.** `_repository` validates tag
   grammar/length, repository components, registry hosts/ports, and
@@ -405,10 +437,9 @@ import logging
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import AbstractSet, Callable, Optional, TYPE_CHECKING
+from typing import AbstractSet, Callable, Optional
 
-if TYPE_CHECKING:
-    from vastai_gpu_runner.types import Provider
+from vastai_gpu_runner.types import Provider
 
 logger = logging.getLogger(__name__)
 
@@ -419,7 +450,7 @@ logger = logging.getLogger(__name__)
 
 
 _DIGEST_RE = re.compile(
-    r"[A-Za-z][A-Za-z0-9]*(?:[+._-][A-Za-z][A-Za-z0-9]*)*:[A-Za-z0-9=_-]+"
+    r"[a-z0-9]+(?:[+._-][a-z0-9]+)*:[A-Za-z0-9=_-]+"
 )
 _REGISTERED_DIGEST_LENGTHS = {
     "sha256": 64,
@@ -565,9 +596,11 @@ class OwnershipVerification(Enum):
                      choice — not the verifier's).
     - ``REFUSED``  → instance exists but image does not match, or the
                      API response was malformed in a way that prevents
-                     proving absence (non-dict record, missing / null /
-                     empty / whitespace-only ``id``, non-list response,
-                     unexpected exception). The verifier refuses the
+                      proving absence (non-dict record, missing / null /
+                      empty / whitespace-only ``id``, non-string/null
+                      ``image_uuid``, non-list response,
+                      unexpected exception). The verifier refuses the
+
                      destroy to the caller.
     - ``DISABLED`` → ownership checking is disabled (no policy).
                      Bypasses the API call entirely.
@@ -750,7 +783,7 @@ class InstanceCandidate:
     filter before constructing the candidate).
     """
 
-    provider: "Provider"
+    provider: Provider
     instance_id: str
     label: str
     state: str
@@ -761,13 +794,27 @@ class InstanceCandidate:
     started_at: float = 0.0
 
     def __post_init__(self) -> None:
+        if not isinstance(self.provider, Provider):
+            raise ValueError("InstanceCandidate.provider must be a Provider")
         if (
-            not self.instance_id
+            not isinstance(self.instance_id, str)
+            or not self.instance_id
             or self.instance_id != self.instance_id.strip()
         ):
             raise ValueError(
                 "InstanceCandidate.instance_id must be non-empty and pre-stripped"
             )
+        for field_name in (
+            "label",
+            "state",
+            "image_uuid",
+            "ownership_key",
+            "gpu_model",
+        ):
+            if not isinstance(getattr(self, field_name), str):
+                raise ValueError(
+                    f"InstanceCandidate.{field_name} must be a string"
+                )
 
 
 @dataclass(frozen=True)
@@ -838,7 +885,7 @@ class ProviderCleanupPolicy:
     ``list_instances_fn`` and ``destroy_fn`` callbacks.
     """
 
-    provider: "Provider"
+    provider: Provider
     list_instances_fn: Callable[[], list[InstanceCandidate]] = field(repr=False)
     destroy_fn: Callable[[InstanceCandidate], CleanupResult] = field(repr=False)
 
@@ -1331,9 +1378,15 @@ def verify_instance_ownership(
                 )
                 return OwnershipVerification.REFUSED
             seen_ids.add(canonical_id)
-            # Strip the image_uuid exactly the same way list_vastai_instances does,
-            # so verification matches enumeration.
-            image_uuid = str(raw_record.get("image_uuid", ""))
+            image_uuid = raw_record.get("image_uuid")
+            if not isinstance(image_uuid, str):
+                logger.error(
+                    "REFUSING: instance %s cannot be verified — "
+                    "record has non-string/null image_uuid: %r. Destroy refused.",
+                    instance_id,
+                    raw_record,
+                )
+                return OwnershipVerification.REFUSED
             normalised_records.append((canonical_id, image_uuid))
 
         # Locate the requested record in the validated, normalized list.
@@ -2032,6 +2085,25 @@ def validate_label_prefix(label_prefix: str) -> str:
     return label_prefix
 
 
+from uuid import uuid4
+
+
+def resolve_label_scope(
+    requested_prefix: str,
+    persisted_scope: str | None,
+) -> str:
+    """Reuse a persisted scope or create one for a new batch."""
+    requested = validate_label_prefix(requested_prefix)
+    if persisted_scope:
+        persisted = validate_label_prefix(persisted_scope)
+        if not persisted.startswith(f"{requested}-"):
+            raise ValueError(
+                "persisted label scope does not match the requested batch prefix"
+            )
+        return persisted
+    return f"{requested}-{uuid4().hex[:12]}"
+
+
 # BatchOrchestrator.__init__ replaces its direct assignment with:
 # self._label_prefix = validate_label_prefix(label_prefix)
 
@@ -2146,6 +2218,15 @@ image), not opt-out. The `cli.py:instances` command's "Owned"
 column uses `OwnershipPolicy.matches()` (the v2 unsafe substring
 match is removed).
 
+The batch label scope is a persisted batch identity, not a per-process
+random value. `BatchState` and `JobBatchState` both store
+`label_scope`. A fresh batch creates it once; resume loads it before
+constructing `VastaiProviderConfig`, `VastaiRunner`, or
+`BatchOrchestrator`. The persisted scope wins over a CLI prefix on
+resume; a mismatched requested prefix is rejected rather than silently
+sweeping a different scope. This covers crashes between provider
+creation and checkpoint persistence and reconstruction failures.
+
 ```python
 # src/vastai_gpu_runner/cli.py (new "batch" subcommand)
 @app.command()
@@ -2159,8 +2240,7 @@ def batch(
 ) -> None:
     """Run a batch of cloud GPU units under the user's project image."""
     from dataclasses import replace
-    from uuid import uuid4
-    from vastai_gpu_runner.batch import validate_label_prefix
+    from vastai_gpu_runner.batch import resolve_label_scope
     from vastai_gpu_runner.cleanup_policy import OwnershipPolicy
     from vastai_gpu_runner.providers.vastai import (
         VastaiProviderConfig,
@@ -2168,12 +2248,13 @@ def batch(
         build_vastai_cleanup_policy,
     )
 
+    # `persisted_label_scope` is loaded from BatchState/JobBatchState
+    # before this composition; it is None for a new batch.
     try:
-        label = validate_label_prefix(label)
+        label_scope = resolve_label_scope(label, persisted_label_scope)
     except ValueError as exc:
         raise typer.BadParameter(str(exc), param_hint="--label") from exc
 
-    label_scope = f"{label}-{uuid4().hex[:12]}"
     base = VastaiProviderConfig.from_env()
     config = replace(
         base,
@@ -2409,7 +2490,7 @@ steps then build on v3's `providers/destroy.py` module
 2. **Add canonical ownership-policy type + invariant tests.**
    - `cleanup_policy.py:OwnershipPolicy` (frozen, `matches(image_ref)` with `_repository`; declared `_normalised` cache field, narrowed for strict type checking).
    - `cleanup_policy.py:ProviderCleanupPolicy` stores only provider identity and generic callbacks; provider-specific ownership is captured by provider factories, not exposed on the generic contract.
-   - Property tests: `OwnershipPolicy.matches` is reflexive, tag-insensitive, digest-by-repository, registry-port-aware, narrow type-checked, and fail-closed on empty sets or malformed full references (invalid/overlong tags, short/uppercase/non-hex registered digests, invalid generic digests, registry hosts/ports, and repository path components).
+   - Property tests: `OwnershipPolicy.matches` is reflexive, tag-insensitive, digest-by-repository, registry-port-aware, narrow type-checked, and fail-closed on empty sets or malformed full references (invalid/overlong tags, short/uppercase/non-hex registered digests, uppercase algorithms, invalid generic digests, registry hosts/ports, and repository path components).
    - The `_normalised` is precomputed in `__post_init__`; `matches` is O(1) per call.
 
 3. **Add Vast.ai runner + cleanup adapter.**
@@ -2438,6 +2519,7 @@ steps then build on v3's `providers/destroy.py` module
 
    - `BatchOrchestrator.__init__` accepts `cleanup_policy: ProviderCleanupPolicy` (required) and stores `validate_label_prefix(label_prefix)`; empty, whitespace-only, or padded prefixes raise `ValueError` before enumeration.
    - `_sweep_zombies` is policy-driven; logs every non-`DESTROYED` outcome at severity matching operational impact.
+   - Persist `label_scope: str = ""` in both `BatchState` (rename the unused `label` field) and `JobBatchState`; fresh state generates it once, resume loads it before runner/orchestrator construction, persisted scope wins, and a requested-prefix drift is rejected. Crash-after-create and reconstruction-failure resumes retain the old scope.
    - Orchestrator tests:
      - Severity logging: `LEAKED` = `ERROR`, `UNKNOWN` / `CLI_ATTEMPTED` / `CREDENTIALS_DISABLED` = `WARNING`, unexpected `NO_CREDENTIALS` = `WARNING`, refusals = `INFO` (verified with `caplog`).
      - `_sweep_zombies` continues on `destroy_fn` exceptions (they return `verdict=UNKNOWN` with `type(exc).__name__: exc`).
@@ -2463,7 +2545,7 @@ steps then build on v3's `providers/destroy.py` module
      - **severity logging**: orchestrator logs `LEAKED` at `ERROR`, `UNKNOWN` at `WARNING`, unexpected `NO_CREDENTIALS` at `WARNING`, refusals at `INFO`.
      - **non-empty error from empty exception**: `raise RuntimeError()` → orchestrator logs with non-empty error.
      - **null instance_id / nullable safety fields in enumeration**: JSON `{id: null, label: null, actual_status: null, image_uuid: null, ...}` is skipped for invalid ID; valid IDs normalize null fields to empty strings, cannot match a non-empty label scope, and are refused as ineligible on empty state rather than receiving literal `"None"` values.
-     - **label-prefix safety**: `BatchOrchestrator`, `batch --label`, and `cleanup --label` reject `""`, `" "`, and `" padded "` before enumeration; no implicit account-wide wildcard exists. A created orphan is labeled with its unique canonical batch scope, selected by its own batch, and not selected by a concurrent batch scope.
+     - **label-prefix safety and persistence**: `BatchOrchestrator`, `batch --label`, and `cleanup --label` reject `""`, `" "`, and `" padded "` before enumeration; no implicit account-wide wildcard exists. A created orphan is labeled with its persisted canonical batch scope, selected by its own batch, and not selected by a concurrent batch scope. Restart tests cover a crash immediately after provider creation and a reconstruction failure; both reload the original `label_scope` before composition and reject scope drift.
      - **CLI --allowed-images empty string**: fail-closed (empty set, refuses every candidate).
      - **CLI --allowed-images None**: opt-out (every image considered owned).
      - **destroy_fn returns None**: orchestrator receives `CleanupResult(verdict=UNKNOWN, error="...invalid result type NoneType")`.
@@ -2484,7 +2566,7 @@ steps then build on v3's `providers/destroy.py` module
 ## Test plan
 
 - `tests/test_cleanup_policy.py`:
-  - `_repository`: valid full-length lower-case `sha256`/`sha512`/`blake3` digests, generic digests, tags, registry ports, DNS/IPv6 registries, and repository paths; rejects whitespace, empty digests, short/uppercase/non-hex registered digests, empty tags, invalid tag characters (`bad!tag`), tags over 128 characters, malformed/out-of-range registry ports, invalid registry labels, upper-case or malformed repository components, multiple `@`, and multiple tags.
+  - `_repository`: valid full-length lower-case `sha256`/`sha512`/`blake3` digests, generic digests, tags, registry ports, DNS/IPv6 registries, and repository paths; rejects whitespace, empty digests, short/uppercase/non-hex registered digests, uppercase digest algorithms (`SHA256`, `Sha256`), empty tags, invalid tag characters (`bad!tag`), tags over 128 characters, malformed/out-of-range registry ports, invalid registry labels, upper-case or malformed repository components, multiple `@`, and multiple tags.
   - `OwnershipPolicy.matches`: reflexive, tag-insensitive, sha256-by-repo, registry-port-aware, fail-closed on empty sets, malformed reference rejection, narrow type-checked.
   - `OwnershipPolicy._normalised`: declared field; precomputed in `__post_init__`; `matches` is O(1) per call.
   - `ProviderCleanupPolicy` construction requires only `provider`, `list_instances_fn`, and `destroy_fn`; no Docker/Vast.ai-specific ownership field leaks into the generic contract.
@@ -2492,7 +2574,8 @@ steps then build on v3's `providers/destroy.py` module
   - `ProviderCleanupPolicy.destroy`: the outer boundary contains candidate-type/provider validation, callback execution, and result validation; malformed candidate/provider values never raise; provider mismatch returns `PROVIDER_MISMATCH` without `.value` access; callback exceptions or `None`/non-`CleanupResult` returns become `CleanupResult(verdict=UNKNOWN, ...)` with non-empty diagnostics.
   - `CleanupResult` invariants: verdict/refusal enum types and `error: str`, verdict/refusal exclusivity, empty `error` on both successful end-states (`DESTROYED` and `ALREADY_GONE`), and non-empty `error` on unresolved verdicts/refusals; string verdicts/refusals and `error=None` raise.
   - CLI cleanup and orchestrator reporting include a final defensive unknown-outcome branch rather than silently omitting an invalid `CleanupResult`.
-  - `InstanceCandidate.__post_init__`: empty `instance_id` raises; whitespace-only `instance_id` raises.
+   - `InstanceCandidate.__post_init__`: invalid provider or non-string `label`, `state`, `image_uuid`, `ownership_key`, or `gpu_model` raises; empty/whitespace `instance_id` raises.
+
 - `tests/test_providers_vastai.py`:
   - `read_vastai_api_key` env-first: `VASTAI_API_KEY=""` → `EXPLICITLY_DISABLED`; `VASTAI_API_KEY="key"` → `AVAILABLE`; no env + file → `AVAILABLE`; no env + blank file → `ABSENT` (with warning); `OSError` → `ABSENT` (with warning).
   - Canonical destructive-key identity: pass `CredentialResolution(AVAILABLE, "canonical-key")`, make `read_vastai_api_key()` fail if called, and assert `Authorization: Bearer canonical-key` reaches the ownership GET, stop PUT, every DELETE retry, and every verification GET/redestroy callback.
@@ -2540,8 +2623,12 @@ steps then build on v3's `providers/destroy.py` module
     - non-list response (e.g. `{"foo": "bar"}`) → `REFUSED` +
       `ERROR`-level
     - non-dict record in a list → `REFUSED` + `ERROR`-level
-    - record with `id=None` or `id=""` or `id="   "` (parameterized)
-      → `REFUSED` + `ERROR`-level
+     - record with `id=None` or `id=""` or `id="   "` (parameterized)
+       → `REFUSED` + `ERROR`-level
+     - record with `image_uuid=None`, integer, float, bool, list, or dict
+       (requested or unrelated record) → `REFUSED` + `ERROR`-level;
+       verifier never stringifies malformed image data.
+
     - Unexpected empty-message `RuntimeError("")` → `REFUSED` +
       `ERROR`-level (does not escape; covered by the outermost
       `except Exception` boundary).
@@ -2579,6 +2666,7 @@ steps then build on v3's `providers/destroy.py` module
   - `VastaiRunner.destroy_instance` logs typed result: LEAKED → `ERROR`, UNKNOWN → `WARNING`, refusals → `ERROR`; returns `False`.
 - `tests/test_batch.py`:
   - `validate_label_prefix` and `BatchOrchestrator.__init__` accept a non-empty pre-stripped string and reject `None`, non-strings, `""`, `" "`, and padded values before `cleanup_policy.list_instances()` can run.
+  - `resolve_label_scope` creates one scope only for new state, reuses persisted `BatchState` / `JobBatchState.label_scope` on restart, and rejects a requested-prefix mismatch; crash-after-create and reconstruction-failure tests keep the original sweep scope.
   - `_sweep_zombies` calls `cleanup_policy.list_instances()` exactly once.
   - `_sweep_zombies` calls `cleanup_policy.destroy(candidate)` for every label-matching, untracked candidate.
   - `_sweep_zombies` counts only `verdict=DESTROYED` outcomes (an
@@ -2624,12 +2712,35 @@ match in `cli.py:instances` is removed.
 
 ## Review process
 
-This is the twelfth design draft of the v4 architecture. Each prior
-draft was rejected and addressed. The eleventh draft was rejected
-with 3 BLOCKERs and 2 CONCERNs. This draft addresses every finding
-from the 15th-pass review:
+This is the fourteenth design draft of the v4 architecture. Each prior
+draft was rejected and addressed. The thirteenth draft was rejected
+with 3 BLOCKERs, 2 CONCERNs, and 1 NIT. This draft addresses every
+finding from the 17th-pass review:
 
-### Applied from the 15th-pass review (this pass)
+### Applied from the 17th-pass review (this pass)
+
+- **Label scope survives crash recovery.** `BatchState` and
+  `JobBatchState` persist the scope; resume restores it before all
+  composition and rejects drift. (BLOCKER 1)
+- **CLI verifier rejects malformed image UUIDs.** Null/non-string
+  provider data refuses the full verification. (BLOCKER 2)
+- **Digest algorithm grammar is exact.** Algorithms are lowercase and
+  may start with digits; registered encodings enforce length/hex rules.
+  (BLOCKER 3)
+- **InstanceCandidate validates runtime field types.** Malformed DTOs
+  cannot escape callback containment into label filtering. (CONCERN 1)
+- **Review metadata is current.** Draft/pass labels advance with this
+  change. (NIT 1)
+
+### Applied from the 16th-pass review (prior pass)
+
+- **Unique label scope was threaded through composition.** Config,
+  runner, instance labels, and orchestrator share one scope.
+- **Registered digests validate algorithm-specific lengths.**
+- **Nullable enumeration fields normalize safely.**
+- **CleanupResult enum/error types and reporting are defensive.**
+
+### Applied from the 15th-pass review (prior pass)
 
 - **Full Docker/OCI reference validation.** Tag grammar/length,
   repository path components, registry hosts/ports, and digest syntax
@@ -2691,7 +2802,7 @@ from the 15th-pass review:
 - NIT 1: `ABSENT` means the requested instance is absent from the
   fully validated API response.
 
-The 16th-pass review prompt for ChatGPT-with-GitHub-plugin:
+The 18th-pass review prompt for ChatGPT-with-GitHub-plugin:
 
 > Review the v4 architecture design at PR #22 (file:
 > docs/architecture-v4-cleanup-policy.md) against the v3 design at
@@ -2700,46 +2811,40 @@ The 16th-pass review prompt for ChatGPT-with-GitHub-plugin:
 > src/vastai_gpu_runner/providers/vastai.py. The v4 design
 > resolves issue #19.
 >
-> The twelfth draft (applied to 15th-pass findings) introduced:
+> The fourteenth draft (applied to 17th-pass findings) introduced:
 >
-> 1. **Complete image-reference grammar.** `_repository` validates
->    Docker/OCI tags (characters and 128-character limit), lower-case
->    repository path components, registry DNS/IPv6 hosts and ports,
->    and digest syntax before normalizing. Tests include invalid tag
->    characters, overlong tags, malformed ports, and invalid paths.
-> 2. **Non-empty label scope.** `validate_label_prefix` rejects empty,
->    blank, or non-pre-stripped prefixes. `BatchOrchestrator.__init__`,
->    `batch --label`, and `cleanup --label` enforce it before any
->    provider call; account-wide cleanup has no implicit empty-prefix
->    route.
-> 3. **Duplicate enumeration rejection.** Canonical duplicate instance
->    IDs within one page or across pages discard the full enumeration.
->    Tests cover conflicting label/image fields in both page orders.
-> 4. **Callback boundary hardening.** `ProviderCleanupPolicy` validates
->    `list_instances_fn` result type/elements and places candidate type,
->    provider mismatch, callback execution, and return validation
->    inside one exception boundary without unsafe `.value` access.
-> 5. **Destructive credential identity test.** An AVAILABLE canonical
->    key is asserted on ownership GET, stop PUT, DELETE retries,
->    verification GETs, and redestroy; `read_vastai_api_key()` must not
->    be called by the destructive path.
+> 1. **Crash-stable batch label identity.** `BatchState` and
+>    `JobBatchState` persist `label_scope`. Fresh batches generate it
+>    once; resume loads it before config/runner/orchestrator creation,
+>    reuses it, and rejects requested-prefix drift. Tests cover crash
+>    immediately after provider creation and reconstruction failure.
+> 2. **Strict verifier image UUIDs.** Every response record requires a
+>    string `image_uuid`; null, integer, float, bool, list, or dict
+>    values on requested or unrelated records return `REFUSED`.
+> 3. **Exact OCI digest algorithm grammar.** Algorithm components use
+>    lowercase `[a-z0-9]+`; uppercase variants are rejected and
+>    digit-leading generic algorithms remain valid. Registered digest
+>    lengths/encodings are still enforced.
+> 4. **Runtime InstanceCandidate invariants.** Provider and all safety
+>    string fields are type-checked in `__post_init__`, so malformed
+>    callback candidates cannot crash `startswith` before containment.
+> 5. **Current review metadata.** The document is the fourteenth draft
+>    and records the 17th-pass findings before requesting pass 18.
 >
 > Additionally, identify any new BLOCKERs or CONCERNs. Focus on:
 >
-> - Can any malformed Docker/OCI reference still normalize to a valid
->   owned repository? Are valid registry-port, IPv6, tag, and digest
->   forms preserved?
-> - Can an empty, blank, padded, or malformed label prefix reach
->   `startswith` in either CLI or programmatic composition?
-> - Can duplicate IDs or malformed enumeration callbacks yield any
->   candidates, repeated destroys, or wrong label/image scope?
-> - Does `ProviderCleanupPolicy` truly uphold its never-raises contract
->   for invalid callback results, candidate types, and provider values?
-> - Does one canonical AVAILABLE key reach every destructive REST
->   callback without environment/file re-resolution?
-> - Does the test plan still cover all 14 v3 prerequisite integration
->   scenarios plus the added cleanup-result, credential-alignment, and
->   label-prefix cases from migration step 6?
+> - Does resume always restore one persisted label scope before any
+>   runner/orchestrator construction, including crash/reconstruction
+>   failure paths, and reject scope drift?
+> - Can any malformed or non-string `image_uuid` reach affirmative CLI
+>   ownership matching?
+> - Does digest validation reject uppercase algorithms while accepting
+>   valid digit-leading generic algorithms and registered encodings?
+> - Can any malformed callback candidate escape DTO validation and
+>   crash label filtering or logging?
+> - Does the migration/test plan cover all 14 v3 prerequisite scenarios
+>   plus credential alignment, cleanup results, label persistence, and
+>   the new malformed-data cases?
 >
 > Return a labeled list of findings. Each finding is one of:
 > BLOCKER (must fix before merge), CONCERN (should fix, but not
