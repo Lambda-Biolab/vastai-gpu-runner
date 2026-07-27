@@ -57,6 +57,16 @@ Usage sketch::
 The ABC does NOT handle: weight uploads, local GPU hybrid mode, shard input
 preparation. Those live in the consumer. The ABC handles only the cloud
 lifecycle loop.
+
+The v4 architecture delegates zombie cleanup to a
+:class:`vastai_gpu_runner.cleanup_policy.ProviderCleanupPolicy`. The
+policy is required; legacy direct ``sweep_zombie_instances`` calls were
+removed in v4 step 7. ``_sweep_zombies`` is policy-driven: enumerate via
+``policy.list_instances()``, filter by the exact delimited scope
+``f"{label_prefix}-"`` so adjacent scopes like ``f"{label_prefix}evil"``
+cannot match, exclude tracked IDs, call ``policy.destroy(candidate)`` per
+candidate, and log every non-``DESTROYED`` outcome at severity matching
+operational impact.
 """
 
 from __future__ import annotations
@@ -71,7 +81,8 @@ from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import TYPE_CHECKING, Generic, Literal, Protocol, TypeVar
 
-from vastai_gpu_runner.orchestrator import check_budget, sweep_zombie_instances
+from vastai_gpu_runner.orchestrator import check_budget
+from vastai_gpu_runner.state import validate_label_prefix
 from vastai_gpu_runner.unit_lifecycle import (
     Complete,
     Continue,
@@ -81,6 +92,9 @@ from vastai_gpu_runner.unit_lifecycle import (
 )
 
 if TYPE_CHECKING:
+    from vastai_gpu_runner.cleanup_policy import (
+        ProviderCleanupPolicy,
+    )
     from vastai_gpu_runner.runner import CloudRunner
     from vastai_gpu_runner.storage.r2 import R2Sink
     from vastai_gpu_runner.types import CloudInstance
@@ -133,6 +147,7 @@ class BatchOrchestrator(ABC, Generic[UnitT]):
         *,
         runner_factory: RunnerFactory,
         label_prefix: str,
+        cleanup_policy: ProviderCleanupPolicy,
         workspace_dir: str = "/workspace",
         r2_sink: R2Sink | None = None,
         r2_batch_id: str = "",
@@ -146,6 +161,14 @@ class BatchOrchestrator(ABC, Generic[UnitT]):
     ) -> None:
         """Initialise orchestrator state. See class docstring for argument meanings.
 
+        ``cleanup_policy`` is required (v4): ``_sweep_zombies`` delegates
+        enumeration + destruction to a ``ProviderCleanupPolicy`` rather
+        than calling a legacy ``sweep_zombie_instances`` helper.
+
+        ``label_prefix`` is validated against ``validate_label_prefix``
+        before any provider call: empty, whitespace-only, or padded
+        values raise ``ValueError`` immediately.
+
         ``max_parallel_collects`` controls how many terminal units are
         finalised (``collect_unit_results`` + ``destroy_instance``)
         concurrently within a single poll cycle. Default 1 preserves
@@ -158,7 +181,8 @@ class BatchOrchestrator(ABC, Generic[UnitT]):
             msg = f"max_parallel_collects must be >= 1, got {max_parallel_collects}"
             raise ValueError(msg)
         self._runner_factory = runner_factory
-        self._label_prefix = label_prefix
+        self._label_prefix = validate_label_prefix(label_prefix)
+        self._cleanup_policy = cleanup_policy
         self._workspace_dir = workspace_dir
         self._r2_sink = r2_sink
         self._r2_batch_id = r2_batch_id
@@ -710,21 +734,135 @@ class BatchOrchestrator(ABC, Generic[UnitT]):
     # -- Zombie sweep + budget --------------------------------------------
 
     def _sweep_zombies(self) -> int:
-        """Destroy Vast.ai instances not tracked by live_runners."""
+        """Destroy orphaned instances not tracked by ``_live_runners``.
+
+        Routes through the v4 cleanup policy:
+
+        1. Enumerate instances via ``policy.list_instances()`` (which
+           may short-circuit on EXPLICITLY_DISABLED).
+        2. Filter by the exact delimited label scope
+           ``f"{self._label_prefix}-"`` so adjacent scopes like
+           ``f"{label_prefix}evil"`` cannot match.
+        3. Exclude tracked IDs (the existing semantics).
+        4. For every remaining candidate, call ``policy.destroy(candidate)``.
+        5. Count ``verdict == DESTROYED`` outcomes.
+        6. Log every non-DESTROYED outcome with severity matching
+           operational impact.
+
+        Imported types (``CleanupVerdict``, ``CleanupRefusal``) are kept
+        inside the method via a local import so this module remains
+        decoupled from the ``cleanup_policy`` package at import time.
+        """
+        # Local imports keep the module top-level free of v4-only deps
+        # for any subclass that imports ``batch`` without a configured
+        # policy (legacy test fixtures).
+        from vastai_gpu_runner.cleanup_policy import (
+            CleanupVerdict,
+        )
+
         with self._state_lock:
-            live_map: dict[int, tuple[CloudRunner, CloudInstance]] = {
-                i: (entry[0], entry[1]) for i, entry in enumerate(self._live_runners.values())
-            }
-        try:
-            return sweep_zombie_instances(
-                live_map,
-                label_prefix=self._label_prefix,
-                r2_sink=self._r2_sink,
-                r2_batch_id=self._r2_batch_id,
+            tracked_ids = {entry[1].instance_id for entry in self._live_runners.values()}
+        candidates = self._cleanup_policy.list_instances()
+        killed = 0
+        scope_prefix = f"{self._label_prefix}-"
+        for candidate in candidates:
+            if not candidate.label.startswith(scope_prefix):
+                continue
+            if candidate.instance_id in tracked_ids:
+                continue
+            result = self._cleanup_policy.destroy(candidate)
+            if result.verdict == CleanupVerdict.DESTROYED:
+                killed += 1
+                continue
+            self._log_cleanup_outcome(candidate.instance_id, result)
+        if killed:
+            logger.info("Zombie sweep: destroyed %d instance(s)", killed)
+        return killed
+
+    def _log_cleanup_outcome(self, instance_id: str, result: object) -> None:
+        """Log a non-DESTROYED cleanup outcome at severity matching operational impact.
+
+        Extracted from ``_sweep_zombies`` to keep the orchestrator's
+        cognitive complexity within the project gate. Imported enums
+        are local so this helper stays decoupled from the
+        ``cleanup_policy`` package at import time.
+        """
+        from vastai_gpu_runner.cleanup_policy import (
+            CleanupRefusal,
+            CleanupVerdict,
+        )
+
+        verdict = result.verdict  # type: ignore[attr-defined]
+        refusal = result.refusal  # type: ignore[attr-defined]
+        error = result.error  # type: ignore[attr-defined]
+        if verdict == CleanupVerdict.LEAKED:
+            logger.error(
+                "Zombie sweep: %s LEAKED — manual review required: %s",
+                instance_id,
+                error,
             )
-        except Exception as exc:
-            logger.warning("Zombie sweep failed: %s", exc)
-            return 0
+            return
+        if verdict == CleanupVerdict.UNKNOWN:
+            logger.warning(
+                "Zombie sweep: %s outcome=UNKNOWN: %s",
+                instance_id,
+                error,
+            )
+            return
+        if verdict == CleanupVerdict.CLI_ATTEMPTED:
+            logger.warning(
+                "Zombie sweep: %s CLI fallback attempted (destruction not confirmed): %s",
+                instance_id,
+                error,
+            )
+            return
+        if verdict == CleanupVerdict.ALREADY_GONE:
+            # Verifier proved absence from a well-formed response;
+            # no destroy was performed. INFO because the desired
+            # end-state was already achieved — not an operational
+            # failure.
+            logger.info(
+                "Zombie sweep: %s already gone (CLI verifier proved absence)",
+                instance_id,
+            )
+            return
+        if refusal == CleanupRefusal.CREDENTIALS_DISABLED:
+            logger.warning(
+                "Zombie sweep: %s refused (credentials disabled): %s",
+                instance_id,
+                error,
+            )
+            return
+        if refusal == CleanupRefusal.NO_CREDENTIALS:
+            # Should not reach here — the factory's CLI fallback
+            # intercepts NO_CREDENTIALS. Logged at WARNING because
+            # it indicates the orphan was not cleaned up.
+            logger.warning(
+                "Zombie sweep: %s unexpectedly returned NO_CREDENTIALS after fallback handling: %s",
+                instance_id,
+                error,
+            )
+            return
+        if refusal in (
+            CleanupRefusal.OWNERSHIP,
+            CleanupRefusal.INELIGIBLE_STATE,
+            CleanupRefusal.PROVIDER_MISMATCH,
+        ):
+            logger.info(
+                "Zombie sweep: %s refused (%s): %s",
+                instance_id,
+                refusal.value,
+                error,
+            )
+            return
+        logger.error(
+            "Zombie sweep: %s returned unrecognized cleanup outcome: "
+            "verdict=%r refusal=%r error=%s",
+            instance_id,
+            verdict,
+            refusal,
+            error,
+        )
 
     def _estimate_current_spend(self) -> float:
         """Estimate current batch spend. Override for provider-specific tracking."""

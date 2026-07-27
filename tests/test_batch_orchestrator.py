@@ -19,6 +19,13 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from vastai_gpu_runner.batch import BatchOrchestrator, FailureVerdict
+from vastai_gpu_runner.cleanup_policy import (
+    CleanupResult,
+    CleanupVerdict,
+    InstanceCandidate,
+    Provider,
+    ProviderCleanupPolicy,
+)
 from vastai_gpu_runner.runner import CloudRunner
 from vastai_gpu_runner.types import CloudInstance, DeploymentResult
 
@@ -100,12 +107,20 @@ class ConcreteOrchestrator(BatchOrchestrator[Unit]):
     assert on the exact call sequence without side-effects.
     """
 
-    def __init__(self, units: list[Unit], **kwargs: object) -> None:
+    def __init__(
+        self,
+        units: list[Unit],
+        cleanup_policy: ProviderCleanupPolicy | None = None,
+        **kwargs: object,
+    ) -> None:
         self.units = units
         self.saves: int = 0
         self.payload_calls: list[str] = []
         self.collect_calls: list[str] = []
-        super().__init__(**kwargs)  # type: ignore[arg-type]
+        super().__init__(  # type: ignore[arg-type]
+            cleanup_policy=cleanup_policy or _noop_cleanup_policy(),
+            **kwargs,
+        )
 
     # -- iter hooks ----------------------------------------------------------
 
@@ -192,6 +207,55 @@ def _orch(units: list[Unit] | None = None, **kwargs: object) -> ConcreteOrchestr
         runner_factory=lambda: runner,
         **defaults,
     )
+
+
+def _noop_cleanup_policy() -> ProviderCleanupPolicy:
+    """No-op policy used by tests that don't exercise zombie sweep."""
+
+    def _list() -> list[InstanceCandidate]:
+        return []
+
+    def _destroy(candidate: InstanceCandidate) -> CleanupResult:
+        return CleanupResult(verdict=CleanupVerdict.DESTROYED)
+
+    return ProviderCleanupPolicy(
+        provider=Provider.VASTAI,
+        list_instances_fn=_list,
+        destroy_fn=_destroy,
+    )
+
+
+def _recording_cleanup_policy(
+    *,
+    candidates: list[InstanceCandidate],
+    destroy_responses: dict[str, CleanupResult] | None = None,
+) -> ProviderCleanupPolicy:
+    """Test policy: returns ``candidates`` from ``list_instances`` and records
+    every ``destroy`` call.
+
+    ``destroy_responses`` overrides the default ``DESTROYED`` verdict for
+    specific candidate IDs.
+    """
+    responses = destroy_responses or {}
+    destroy_calls: list[InstanceCandidate] = []
+
+    def _list() -> list[InstanceCandidate]:
+        return list(candidates)
+
+    def _destroy(candidate: InstanceCandidate) -> CleanupResult:
+        destroy_calls.append(candidate)
+        return responses.get(
+            candidate.instance_id,
+            CleanupResult(verdict=CleanupVerdict.DESTROYED),
+        )
+
+    policy = ProviderCleanupPolicy(
+        provider=Provider.VASTAI,
+        list_instances_fn=_list,
+        destroy_fn=_destroy,
+    )
+    policy.__dict__["_test_destroy_invocations"] = lambda: list(destroy_calls)  # type: ignore[attr-defined]
+    return policy
 
 
 # ---------------------------------------------------------------------------
@@ -664,16 +728,14 @@ class TestCleanupPhase:
         runner = _mock_runner()
         inst = _instance("i1")
         o._live_runners[unit.key] = (runner, inst, unit)
-        with patch("vastai_gpu_runner.batch.sweep_zombie_instances", return_value=0):
-            o._cleanup_phase()
+        o._cleanup_phase()
         runner.destroy_instance.assert_called_once_with(inst)
 
     def test_clears_live_runners(self) -> None:
         unit = Unit(key="u1", status="deployed", instance_id="i1")
         o = _orch([unit])
         o._live_runners[unit.key] = (_mock_runner(), _instance("i1"), unit)
-        with patch("vastai_gpu_runner.batch.sweep_zombie_instances", return_value=0):
-            o._cleanup_phase()
+        o._cleanup_phase()
         assert o._live_runners == {}
 
     def test_destroy_exception_does_not_propagate(self) -> None:
@@ -682,14 +744,12 @@ class TestCleanupPhase:
         runner = MagicMock(spec=CloudRunner)
         runner.destroy_instance = MagicMock(side_effect=RuntimeError("API error"))
         o._live_runners[unit.key] = (runner, _instance("i1"), unit)
-        with patch("vastai_gpu_runner.batch.sweep_zombie_instances", return_value=0):
-            o._cleanup_phase()  # must not raise
+        o._cleanup_phase()  # must not raise
         assert o._live_runners == {}
 
     def test_noop_with_empty_live_runners(self) -> None:
         o = _orch()
-        with patch("vastai_gpu_runner.batch.sweep_zombie_instances", return_value=0):
-            o._cleanup_phase()  # no runners → no-op
+        o._cleanup_phase()  # no runners → no-op
         assert o._live_runners == {}
 
 
@@ -699,21 +759,51 @@ class TestCleanupPhase:
 
 
 class TestSweepZombies:
-    def test_delegates_to_sweep_zombie_instances(self) -> None:
-        o = _orch(label_prefix="myproject-boltz2-abc", r2_batch_id="batch-xyz")
-        with patch("vastai_gpu_runner.batch.sweep_zombie_instances", return_value=3) as mock_fn:
-            killed = o._sweep_zombies()
-        assert killed == 3
-        _, kwargs = mock_fn.call_args
-        assert kwargs["label_prefix"] == "myproject-boltz2-abc"
-        assert kwargs["r2_batch_id"] == "batch-xyz"
+    """v4 sweep delegates to the injected ``ProviderCleanupPolicy``.
+
+    The legacy ``sweep_zombie_instances`` helper is gone (removed in v4
+    step 7). Tests pin the new policy-driven contract end-to-end.
+    """
+
+    @staticmethod
+    def _candidate(iid: str, label: str) -> InstanceCandidate:
+        return InstanceCandidate(
+            provider=Provider.VASTAI,
+            instance_id=iid,
+            label=label,
+            state="running",
+            image_uuid="img-uuid",
+            gpu_model="RTX 4090",
+            cost_per_hour=0.4,
+            started_at=0.0,
+        )
+
+    def test_delegates_to_cleanup_policy(self) -> None:
+        candidates = [self._candidate("i1", "myproject-3f9a1b2c4d5e")]
+        policy = _recording_cleanup_policy(candidates=candidates)
+        o = _orch(label_prefix="myproject", cleanup_policy=policy)
+        killed = o._sweep_zombies()
+        assert killed == 1
+        assert {c.instance_id for c in policy._test_destroy_invocations()} == {"i1"}
 
     def test_exception_returns_zero(self) -> None:
-        o = _orch()
-        with patch(
-            "vastai_gpu_runner.batch.sweep_zombie_instances", side_effect=RuntimeError("api down")
-        ):
-            killed = o._sweep_zombies()
+        """A raising ``list_instances_fn`` returns 0 (caught by the policy)."""
+
+        def _list() -> list[InstanceCandidate]:
+            raise RuntimeError("api down")
+
+        def _destroy(candidate: InstanceCandidate) -> CleanupResult:
+            return CleanupResult(verdict=CleanupVerdict.DESTROYED)
+
+        policy = ProviderCleanupPolicy(
+            provider=Provider.VASTAI,
+            list_instances_fn=_list,
+            destroy_fn=_destroy,
+        )
+        o = _orch(cleanup_policy=policy)
+        # The policy boundary returns [] on exception; orchestrator sees
+        # zero candidates and returns 0.
+        killed = o._sweep_zombies()
         assert killed == 0
 
 
@@ -811,24 +901,21 @@ class TestRunLifecycle:
             label_prefix="test",
             poll_interval_seconds=1,
         )
-        with patch("vastai_gpu_runner.batch.sweep_zombie_instances", return_value=0):
-            o.run()
+        o.run()
         assert unit.status == "downloaded"
         assert "deployed" in unit.events
         assert "completed" in unit.events
 
     def test_no_units_is_noop(self) -> None:
         o = _orch()
-        with patch("vastai_gpu_runner.batch.sweep_zombie_instances", return_value=0):
-            o.run()
+        o.run()
         assert o._live_runners == {}
 
     def test_deploy_failure_leaves_unit_failed(self) -> None:
         unit = Unit(key="u1")
         runner = _mock_runner(deploy_result=_fail_result("no offers"))
         o = ConcreteOrchestrator([unit], runner_factory=lambda: runner, label_prefix="test")
-        with patch("vastai_gpu_runner.batch.sweep_zombie_instances", return_value=0):
-            o.run()
+        o.run()
         assert unit.status == "failed"
         assert "no offers" in unit.failure_reason
 
@@ -856,4 +943,5 @@ def test_abc_cannot_be_instantiated_directly() -> None:
         BatchOrchestrator(  # type: ignore[abstract]
             runner_factory=lambda: CloudRunner(),
             label_prefix="test",
+            cleanup_policy=_noop_cleanup_policy(),
         )
