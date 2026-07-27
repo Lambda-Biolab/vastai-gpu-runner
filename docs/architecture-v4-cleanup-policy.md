@@ -122,14 +122,13 @@ seventeenth draft was rejected with 3 BLOCKERs and 2 CONCERNs. The
 eighteenth draft was rejected with 3 BLOCKERs and 2 CONCERNs. The
 nineteenth draft was rejected with 3 BLOCKERs and 3 CONCERNs. The
 twentieth draft was rejected with 3 BLOCKERs, 2 CONCERNs, and 1 NIT.
-The twenty-first draft was rejected with 1 BLOCKER and 1 NIT. This
-twenty-second draft addresses every finding.
+The twenty-first draft was rejected with 1 BLOCKER and 1 NIT. The
+twenty-second draft was rejected with 1 BLOCKER. This twenty-third
+draft addresses every finding.
 
-### Applied from the 26th-pass review (this pass)
+### Applied from the 27th-pass review (this pass)
 
-- **Terminal schema-0 states without a recoverable scope are accepted after the loader verifies terminal status.** (BLOCKER 1)
-- **Migration validates `label`, `label_scope`, and unit status as strings before any `rsplit` or set-membership operation; unexpected migration exceptions become `StateMigrationError`.** (BLOCKER 2)
-- **Review metadata advanced to the twenty-second draft and the 26th-pass prompt.** (NIT 1)
+- **Verified-terminal scope-less legacy state is archived on disk and the loader returns `None`, so composition does not try to resolve a fresh identity for a retired batch.** (BLOCKER 1)
 
 - **`normalize_instance_id` lives only where the call sites need it.** (BLOCKER 1)
 - **Schema-0 terminal states recover the correct identity pair and respect `state_cls.TERMINAL_STATUSES`.** (BLOCKER 2)
@@ -2316,6 +2315,17 @@ def load_batch_state(
             raise StateMigrationError(
                 "nonterminal state lacks a recoverable label scope"
             )
+        # Verified-terminal scope-less legacy state is safe to retire.
+        # Archive it on disk before returning so subsequent composition
+        # does not try to resolve a fresh identity for an already-finished
+        # batch.
+        try:
+            state_cls.archive_if_all_terminal(state_path)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise StateMigrationError(
+                f"could not archive terminal scope-less legacy state: {exc}"
+            ) from exc
+        return None
     try:
         state = state_cls(**data)
     except (TypeError, ValueError) as exc:
@@ -3073,16 +3083,16 @@ match in `cli.py:instances` is removed.
 
 ## Review process
 
-This is the twenty-second design draft of the v4 architecture. Each prior
-draft was rejected and addressed. The twenty-first draft was rejected
-with 1 BLOCKER and 1 NIT. This draft addresses every
-finding from the 26th-pass review:
+This is the twenty-third design draft of the v4 architecture. Each prior
+draft was rejected and addressed. The twenty-second draft was rejected
+with 1 BLOCKER. This draft addresses every
+finding from the 27th-pass review:
 
-### Applied from the 26th-pass review (this pass)
+### Applied from the 27th-pass review (this pass)
 
-- **Terminal schema-0 states without a recoverable scope are accepted after the loader verifies terminal status.** (BLOCKER 1)
-- **Migration validates `label`, `label_scope`, and unit status as strings before any `rsplit` or set-membership operation; unexpected migration exceptions become `StateMigrationError`.** (BLOCKER 2)
-- **Review metadata advanced to the twenty-second draft and the 26th-pass prompt.** (NIT 1)
+- **Verified-terminal scope-less legacy state is archived on disk and the loader returns `None`, so composition does not try to resolve a fresh identity for a retired batch.** (BLOCKER 1)
+
+### Applied from the 26th-pass review (prior pass)
 
 ### Applied from the 25th-pass review (prior pass)
 
@@ -3185,7 +3195,7 @@ finding from the 26th-pass review:
 - NIT 1: `ABSENT` means the requested instance is absent from the
   fully validated API response.
 
-The 27th-pass review prompt for ChatGPT-with-GitHub-plugin:
+The 28th-pass review prompt for ChatGPT-with-GitHub-plugin:
 
 > Review the v4 architecture design at PR #22 (file:
 > docs/architecture-v4-cleanup-policy.md) against the v3 design at
@@ -3194,11 +3204,9 @@ The 27th-pass review prompt for ChatGPT-with-GitHub-plugin:
 > src/vastai_gpu_runner/providers/vastai.py. The v4 design
 > resolves issue #19.
 >
-> The twenty-second draft (applied to 26th-pass findings) introduced:
+> The twenty-third draft (applied to 27th-pass findings) introduced:
 >
-> 1. **Terminal schema-0 states without a recoverable scope are accepted after the loader verifies terminal status.** (BLOCKER 1)
-> 2. **Migration validates `label`, `label_scope`, and unit status as strings before any `rsplit` or set-membership operation; unexpected migration exceptions become `StateMigrationError`.** (BLOCKER 2)
-> 3. **Review metadata advanced to the twenty-second draft and the 26th-pass prompt.** (NIT 1)
+> 1. **Verified-terminal scope-less legacy state is archived on disk and the loader returns `None`, so composition does not try to resolve a fresh identity for a retired batch.** (BLOCKER 1)
 >
 > Additionally, identify any new BLOCKERs or CONCERNs. Focus on:
 >
