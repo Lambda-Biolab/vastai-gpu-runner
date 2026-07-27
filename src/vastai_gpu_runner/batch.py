@@ -72,6 +72,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Generic, Literal, Protocol, TypeVar
 
 from vastai_gpu_runner.orchestrator import check_budget, sweep_zombie_instances
+from vastai_gpu_runner.unit_lifecycle import (
+    Complete,
+    Continue,
+    Preempt,
+    UnitAction,
+    decide_next_action,
+)
 
 if TYPE_CHECKING:
     from vastai_gpu_runner.runner import CloudRunner
@@ -501,67 +508,61 @@ class BatchOrchestrator(ABC, Generic[UnitT]):
             if entry is None:
                 continue
             runner, instance, unit = entry
-            verdict = self._classify_live_unit(runner, instance, unit)
-            if verdict == "terminal":
+            action = decide_next_action(unit, runner, instance, self.unit_is_done_in_r2)
+            if isinstance(action, Complete):
                 terminal.append((unit_key, runner, instance, unit))
-            elif verdict == "preempted":
+            elif isinstance(action, Preempt):
                 preempted.append((unit_key, runner, instance, unit))
 
         for unit_key, runner, instance, unit in preempted:
-            with contextlib.suppress(Exception):
-                self.capture_preempt_diagnostics(runner, instance, unit)
-            with contextlib.suppress(Exception):
-                runner.destroy_instance(instance)
-            with self._state_lock:
-                self._handle_instance_loss(unit, unit_key, "worker died silently")
+            self._handle_preempted_unit(runner, instance, unit, unit_key)
 
         if terminal:
             self._finalise_terminal_units(terminal)
 
         return bool(terminal or preempted)
 
-    def _classify_live_unit(
+    def _handle_preempted_unit(
         self,
         runner: CloudRunner,
         instance: CloudInstance,
         unit: UnitT,
-    ) -> Literal["terminal", "running", "preempted"]:
-        """Pure classification of a live unit. No side effects.
+        unit_key: str,
+    ) -> None:
+        """Side-effect handler for a Preempt action (shared by the two callers).
 
-        R2 DONE → ``terminal``. SSH ``complete`` → ``terminal``. SSH
-        ``worker_dead`` with R2 re-check miss → ``preempted``. Otherwise
-        ``running``. Exceptions from ``check_progress`` are logged and
-        classified as ``running`` (transient SSH flakiness).
+        Captures preempt diagnostics, destroys the instance, and books
+        instance loss in state. Each side effect is independently
+        exception-suppressed so one failure cannot strand the rest.
         """
-        if self.unit_is_done_in_r2(unit):
-            return "terminal"
+        with contextlib.suppress(Exception):
+            self.capture_preempt_diagnostics(runner, instance, unit)
+        with contextlib.suppress(Exception):
+            runner.destroy_instance(instance)
+        with self._state_lock:
+            self._handle_instance_loss(unit, unit_key, "worker died silently")
 
-        try:
-            progress = runner.check_progress(instance)
-        except Exception as exc:
-            logger.warning(
-                "Poll %s: check_progress raised %s — treating as running",
-                self.unit_label(unit),
-                exc,
-            )
+    def _dispatch_unit_action(
+        self,
+        runner: CloudRunner,
+        instance: CloudInstance,
+        unit: UnitT,
+        action: UnitAction,
+    ) -> Literal["completed", "running", "preempted", "failed"]:
+        """Apply a ``UnitAction`` plan and return the legacy verdict string.
+
+        ``Continue`` is the no-op "still running" outcome. ``Preempt`` is
+        a side-effectful loss handling. ``Complete`` finalises (collect
+        + destroy) and reports ``completed``/``failed`` from the
+        finalise result.
+        """
+        if isinstance(action, Continue):
             return "running"
-
-        if progress.get("complete"):
-            return "terminal"
-
-        if progress.get("worker_dead"):
-            # Re-check R2 once more — worker may have uploaded results
-            # between the check above and now.
-            if self.unit_is_done_in_r2(unit):
-                return "terminal"
-            logger.warning(
-                "Poll %s: worker dead on %s — handling as instance loss",
-                self.unit_label(unit),
-                unit.instance_id,
-            )
+        if isinstance(action, Preempt):
+            self._handle_preempted_unit(runner, instance, unit, self.unit_key(unit))
             return "preempted"
-
-        return "running"
+        # Complete
+        return self._finalise_completed(runner, instance, unit, self.unit_key(unit))
 
     def _check_unit(
         self,
@@ -569,25 +570,16 @@ class BatchOrchestrator(ABC, Generic[UnitT]):
         instance: CloudInstance,
         unit: UnitT,
     ) -> Literal["completed", "running", "preempted", "failed"]:
-        """Single-unit poll cycle. Composes ``_classify_live_unit`` + finalise.
+        """Single-unit poll cycle. Composes ``decide_next_action`` + dispatch.
 
         Kept for backwards-compat with direct callers (unit tests, consumers
         that prefer synchronous single-unit polling). The main loop uses
-        ``_poll_cycle_once`` which batches terminal units for parallel finalise.
+        ``_poll_cycle_once`` which batches terminal units for parallel
+        finalise. Both paths share ``_dispatch_unit_action`` so the
+        terminal/preempt side effects cannot diverge.
         """
-        unit_key = self.unit_key(unit)
-        verdict = self._classify_live_unit(runner, instance, unit)
-        if verdict == "running":
-            return "running"
-        if verdict == "preempted":
-            with contextlib.suppress(Exception):
-                self.capture_preempt_diagnostics(runner, instance, unit)
-            with contextlib.suppress(Exception):
-                runner.destroy_instance(instance)
-            with self._state_lock:
-                self._handle_instance_loss(unit, unit_key, "worker died silently")
-            return "preempted"
-        return self._finalise_completed(runner, instance, unit, unit_key)
+        action = decide_next_action(unit, runner, instance, self.unit_is_done_in_r2)
+        return self._dispatch_unit_action(runner, instance, unit, action)
 
     def _finalise_terminal_units(
         self,

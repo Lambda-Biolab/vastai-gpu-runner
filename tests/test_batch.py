@@ -809,56 +809,6 @@ class TestParallelCollect:
                 max_parallel_collects=0,
             )
 
-    def test_classify_live_unit_is_pure_no_side_effects(self) -> None:
-        """_classify_live_unit must not mutate state or call destroy_instance.
-
-        This is the contract that makes parallel finalise safe: the classify
-        half is pure, so we can batch multiple units' classifications before
-        touching any state.
-        """
-        unit = FakeUnit(key="u1", status="deployed")
-        orch = FakeOrchestrator(
-            units=[unit],
-            runner_factory=_mock_runner_factory(deploy_result=_ok_deploy()),
-            label_prefix="test",
-        )
-        runner = MagicMock(spec=CloudRunner)
-        runner.check_progress = MagicMock(return_value={"complete": True, "running": False})
-        runner.destroy_instance = MagicMock(return_value=True)
-        instance = CloudInstance(instance_id="i1")
-        orch._live_runners[unit.key] = (runner, instance, unit)
-
-        verdict = orch._classify_live_unit(runner, instance, unit)
-
-        assert verdict == "terminal"
-        # No side effects: unit still "deployed", no collect called, no destroy.
-        assert unit.status == "deployed"
-        assert "u1" not in orch.collect_calls
-        runner.destroy_instance.assert_not_called()
-        assert unit.key in orch._live_runners
-
-    def test_classify_returns_preempted_without_destroying(self) -> None:
-        """Classify reports preempted but does NOT destroy — that's phase B."""
-        unit = FakeUnit(key="u1", status="deployed", instance_id="i1")
-        orch = FakeOrchestrator(
-            units=[unit],
-            runner_factory=_mock_runner_factory(deploy_result=_ok_deploy()),
-            label_prefix="test",
-        )
-        runner = MagicMock(spec=CloudRunner)
-        runner.check_progress = MagicMock(
-            return_value={"complete": False, "running": False, "worker_dead": True}
-        )
-        runner.destroy_instance = MagicMock(return_value=True)
-        instance = CloudInstance(instance_id="i1")
-        orch._live_runners[unit.key] = (runner, instance, unit)
-
-        verdict = orch._classify_live_unit(runner, instance, unit)
-
-        assert verdict == "preempted"
-        runner.destroy_instance.assert_not_called()  # destroy is phase B, not classify
-        assert unit.status == "deployed"  # state mutation is phase B too
-
     def test_poll_cycle_finalises_multiple_terminal_units_in_parallel(self) -> None:
         """3 units, all terminal in one cycle, max_parallel_collects=3.
 
