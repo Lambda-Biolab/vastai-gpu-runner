@@ -163,3 +163,108 @@ rows = build_scaling_table(
 for row in rows:
     print(f"{row.cloud_gpus} GPUs: {row.wall_time_human}, {row.cost_display}")
 ```
+
+## R2 bucket lifecycle administration
+
+The `r2-lifecycle` CLI sub-application manages one Cloudflare R2
+bucket-lifecycle expiration rule per prefix. It is a **destructive
+bucket-policy mutation** that applies to **every object matching
+the configured prefix**, regardless of how those objects were
+uploaded or otherwise managed. Activating the rule makes all
+existing objects older than the retention window eligible for
+deletion; removing the rule does NOT restore any objects already
+expired by it. The rule never activates implicitly during package
+install, `R2Sink` construction, batch startup, or worker execution
+— only the operator CLI can apply it.
+
+### Separate admin credentials
+
+Lifecycle administration requires bucket-policy write authority.
+Worker credentials should not be reused for this — workers only need
+object-level read/write. Create a separate credentials file:
+
+```bash
+# ~/.cloud-credentials.r2-admin
+export R2_ADMIN_ENDPOINT="https://<accountid>.r2.cloudflarestorage.com"
+export R2_ADMIN_ACCESS_KEY_ID="<admin-access-key>"
+export R2_ADMIN_SECRET_ACCESS_KEY="<admin-secret-key>"
+```
+
+The CLI **requires** `R2_ADMIN_*` keys — the worker-style `R2_*`
+keys are explicitly rejected so the worker's object-write
+credentials cannot be passed off as bucket-administration
+credentials. This enforces least-privilege separation between
+the two roles.
+
+### `show` — inspect the managed rule
+
+```bash
+vastai-gpu-runner r2-lifecycle show \
+    --bucket my-bucket \
+    --prefix project/batches/ \
+    --credentials-file ~/.cloud-credentials.r2-admin
+```
+
+Prints the current managed-rule state and the bucket's source
+fingerprint. Non-mutating, non-interactive.
+
+### `apply` — set the retention rule
+
+```bash
+vastai-gpu-runner r2-lifecycle apply \
+    --bucket my-bucket \
+    --prefix project/batches/ \
+    --credentials-file ~/.cloud-credentials.r2-admin \
+    --expire-after-days 30 \
+    --dry-run          # see the plan first
+vastai-gpu-runner r2-lifecycle apply \
+    --bucket my-bucket \
+    --prefix project/batches/ \
+    --credentials-file ~/.cloud-credentials.r2-admin \
+    --expire-after-days 30 \
+    --yes              # mutate; requires --yes when stdin is not a TTY
+```
+
+The CLI prompts for confirmation unless `--yes` is supplied on a
+non-interactive stdin. After applying, the CLI re-reads the bucket
+configuration to verify the rule was actually written. Unrelated
+rules on the bucket are preserved verbatim.
+
+Existing objects older than the chosen retention may become eligible
+for deletion after activation. Removal of the rule does *not*
+restore objects that were already expired by it.
+
+### `remove` — drop the managed rule
+
+```bash
+vastai-gpu-runner r2-lifecycle remove \
+    --bucket my-bucket \
+    --prefix project/batches/ \
+    --credentials-file ~/.cloud-credentials.r2-admin \
+    --dry-run
+vastai-gpu-runner r2-lifecycle remove \
+    --bucket my-bucket \
+    --prefix project/batches/ \
+    --credentials-file ~/.cloud-credentials.r2-admin \
+    --yes
+```
+
+The managed rule is identified by a deterministic rule ID derived
+from the bucket and prefix. Removing the rule does not affect
+unrelated lifecycle rules on the bucket.
+
+### `R2Sink.cleanup_batch()` is independent
+
+`R2Sink.cleanup_batch(batch_id)` immediately deletes all R2 objects
+under one batch prefix. It does *not* consult or replace the
+lifecycle configuration. Use it for one-off cleanup; use
+`r2-lifecycle apply` for ongoing retention policy.
+
+### Rsync recovery is best-effort
+
+The orchestrator's rsync fallback for instances whose R2 DONE marker
+is missing remains best-effort. Polling currently starts only after
+the parallel deployment phase completes, so a fast worker can finish
+before the first poll tick. See
+`docs/architecture-r2-collection-handshake.md` for the planned
+longer-term bounded-teardown protocol.

@@ -33,6 +33,35 @@ from vastai_gpu_runner.worker.health import check_gpu, check_r2_connectivity
 logger = logging.getLogger(__name__)
 
 
+# Fixed upper bound for the final R2 upload call.
+#
+# The worker invokes ``r2_upload.py --done`` from ``upload_results()``
+# after a successful workload. This call must complete promptly even
+# when R2 is rate-limiting or briefly unavailable, so the worker can
+# transition to ``self_destruct()`` without delaying instance teardown
+# for the prior default of 300 seconds.
+#
+# Rationale for 90s (bounded-teardown trade-off): in the shard
+# ``--done`` path, only the small ``worker.exitcode`` and ``DONE``
+# marker are uploaded — well within 90s.
+#
+# SCOPE: This timeout applies ONLY to ``BaseWorker.upload_results()``
+# which calls the SHARD uploader's ``--done`` mode. Job-based
+# workers run their upload scripts outside this path and do NOT
+# inherit the 90s ceiling. Subclasses that override
+# ``upload_results()`` to call a different script or a different
+# mode must set their own timeout; ``R2_FINAL_UPLOAD_TIMEOUT_SECONDS``
+# is the marker-only budget.
+#
+# Operators with very large final-output workloads should override
+# ``upload_results()`` and rely on the orchestrator's rsync fallback
+# (or wait for the long-term bounded-teardown protocol in
+# ``docs/architecture-r2-collection-handshake.md``).
+#
+# Not publicly configurable in v1.
+R2_FINAL_UPLOAD_TIMEOUT_SECONDS = 90
+
+
 class BaseWorker(ABC):
     """Abstract base worker for cloud GPU instances.
 
@@ -119,20 +148,59 @@ class BaseWorker(ABC):
 
         Default: calls ``r2_upload.py --done`` if the script exists.
         Override for custom upload logic.
+
+        Behaviour:
+            - Subprocess is bounded by ``R2_FINAL_UPLOAD_TIMEOUT_SECONDS``.
+            - ``subprocess.TimeoutExpired`` is caught separately and logged
+              as a warning; teardown (``self_destruct``) continues.
+            - Non-zero return codes are logged with truncated stderr/stdout.
+            - Success (``returncode == 0``) is logged explicitly.
+            - Transport failure does NOT change the workload exit code.
+            - ``self_destruct()`` always runs from ``main()`` regardless
+              of upload outcome.
         """
         r2_script = self.workspace / "r2_upload.py"
-        if r2_script.exists():
-            try:
-                subprocess.run(
-                    [sys.executable, str(r2_script), "--done"],
-                    capture_output=True,
-                    text=True,
-                    timeout=300,
-                    check=False,
-                )
-                logger.info("R2 upload complete")
-            except Exception as exc:
-                logger.warning("R2 upload failed: %s", exc)
+        if not r2_script.exists():
+            return
+
+        cmd = [sys.executable, str(r2_script), "--done"]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=R2_FINAL_UPLOAD_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                "R2 final upload exceeded %ds timeout — continuing teardown "
+                "(self_destruct will still run). Rsync fallback applies if "
+                "the orchestrator reaches collect phase.",
+                R2_FINAL_UPLOAD_TIMEOUT_SECONDS,
+            )
+            return
+        except Exception as exc:
+            # Catch-all for launch / filesystem / unexpected errors.
+            # Do NOT raise — the workload already succeeded and the
+            # self_destruct() in main()'s finally block must execute.
+            logger.warning("R2 upload launch failed: %s", exc)
+            return
+
+        if result.returncode != 0:
+            stderr_tail = (result.stderr or "")[-200:]
+            stdout_tail = (result.stdout or "")[-200:]
+            logger.warning(
+                "R2 final upload returned non-zero (rc=%d). Teardown continues.",
+                result.returncode,
+            )
+            if stderr_tail:
+                logger.warning("R2 stderr (tail): %s", stderr_tail)
+            if stdout_tail:
+                logger.warning("R2 stdout (tail): %s", stdout_tail)
+            return
+
+        logger.info("R2 upload complete")
 
     # -- Built-in operations -----------------------------------------------
 

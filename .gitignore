@@ -12,3 +12,8 @@ build/
 htmlcov/
 coverage.xml
 batch_diagnostics/
+
+# Node.js artefacts — not part of the Python project.
+node_modules/
+package-lock.json
+package.json

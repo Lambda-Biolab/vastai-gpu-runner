@@ -687,3 +687,15 @@ def _build_batch_summary(
 
 if __name__ == "__main__":
     app()
+
+
+# ---------------------------------------------------------------------------
+# r2-lifecycle — bucket lifecycle administration (sub-app)
+# ---------------------------------------------------------------------------
+#
+# Mounted as a Typer sub-application so the existing ``vastai-gpu-runner``
+# commands remain unchanged. Domain logic lives in
+# ``vastai_gpu_runner.storage.r2_lifecycle``; this is just composition.
+from vastai_gpu_runner.cli_r2_lifecycle import app as _r2_lifecycle_app  # noqa: E402
+
+app.add_typer(_r2_lifecycle_app, name="r2-lifecycle")

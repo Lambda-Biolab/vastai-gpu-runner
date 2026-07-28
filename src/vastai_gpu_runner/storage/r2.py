@@ -437,11 +437,31 @@ s3 = boto3.client(
 )
 
 
-def upload_prediction(name: str) -> int:
+def upload_prediction(name: str) -> tuple[str, int]:
+    """Upload one prediction's outputs. Fail closed on partial upload.
+
+    Returns:
+        A tuple ``(status, count)``:
+            - ``("absent", 0)`` if the prediction output directory is
+              missing (warning, not a failure; script exits 0).
+            - ``("failed", <partial_count>)`` if any required upload
+              (file or marker) failed (failure; script exits non-zero;
+              no DONE markers; a local failure sentinel is written so
+              subsequent ``--done`` / no-arg invocations also refuse
+              DONE).
+            - ``("ok", <uploaded_count>)`` on full success. A positive
+              completion marker is written atomically so ``--done``
+              can require positive proof of completion.
+
+        Using a status string instead of a boolean avoids the
+        "0 successful uploads = absent directory" collision when a
+        partial failure uploads zero files before any succeed.
+    """
     pred_dir = os.path.join(WORKSPACE, "outputs", name)
     if not os.path.isdir(pred_dir):
-        print(f"WARN: no output dir for {{name}}")
-        return 0
+        print(f"WARN: no output dir for {{name}}", file=sys.stderr)
+        return "absent", 0
+    failures: list[str] = []
     uploaded = 0
     for root, _dirs, files in os.walk(pred_dir):
         for fname in files:
@@ -452,38 +472,445 @@ def upload_prediction(name: str) -> int:
                 s3.upload_file(local_path, BUCKET, key)
                 uploaded += 1
             except Exception as exc:
-                print(f"WARN: upload failed for {{rel}}: {{exc}}")
-    s3.put_object(Bucket=BUCKET, Key=PREFIX + f"markers/{{name}}.done", Body=b"")
-    s3.put_object(
-        Bucket=BUCKET,
-        Key=BATCH_PREFIX + f"global_markers/{{name}}.done",
-        Body=f"shard_{shard_id}".encode(),
-    )
-    return uploaded
+                failures.append(rel)
+                print(f"WARN: upload failed for {{rel}}: {{exc}}", file=sys.stderr)
+    if failures:
+        # Required prediction file uploads did not complete. Omit both
+        # the per-shard and global DONE markers AND persist a local
+        # failure sentinel so any subsequent --done / no-arg invocation
+        # refuses to publish the top-level shard DONE marker. Without
+        # this sentinel, an upload that fails for transient reasons
+        # and then succeeds later (via a retry of the worker script)
+        # would still let the orchestrator accept an incomplete result
+        # set as committed.
+        print(
+            f"FAIL: {{len(failures)}} prediction file(s) failed; "
+            "omitting DONE marker for {{name}}.",
+            file=sys.stderr,
+        )
+        try:
+            _record_upload_failure(name, failures)
+        except Exception as exc:
+            # The recorder itself raised; we still must not let --done
+            # publish a false shard DONE. Record a separate global
+            # sentinel-write-failure entry as a last resort.
+            print(f"FAIL: _record_upload_failure raised: {{exc}}", file=sys.stderr)
+        _clear_prediction_success(name)
+        return "failed", uploaded
+    # File uploads succeeded; now publish the markers. Marker
+    # publication failures are also recorded so a later --done
+    # cannot mask them.
+    marker_failures: list[str] = []
+    try:
+        s3.put_object(Bucket=BUCKET, Key=PREFIX + f"markers/{{name}}.done", Body=b"")
+    except Exception as exc:
+        marker_failures.append(f"markers/{{name}}.done")
+        print(f"FAIL: marker put failed: {{exc}}", file=sys.stderr)
+    try:
+        s3.put_object(
+            Bucket=BUCKET,
+            Key=BATCH_PREFIX + f"global_markers/{{name}}.done",
+            Body=f"shard_{shard_id}".encode(),
+        )
+    except Exception as exc:
+        marker_failures.append(f"global_markers/{{name}}.done")
+        print(f"FAIL: global marker put failed: {{exc}}", file=sys.stderr)
+    if marker_failures:
+        # Marker publication failed; record and refuse DONE.
+        try:
+            _record_upload_failure(name, marker_failures)
+        except Exception as exc:
+            print(f"FAIL: _record_upload_failure raised: {{exc}}", file=sys.stderr)
+        _clear_prediction_success(name)
+        return "failed", uploaded
+    # All uploads succeeded. Atomically write the positive completion
+    # marker on the local filesystem. The --done mode requires this
+    # marker for every prediction directory under outputs/, so a
+    # missing marker (e.g. from a sentinel write failure) refuses
+    # DONE rather than masking the failure.
+    if not _record_prediction_success(name):
+        try:
+            _record_upload_failure(name, ["<local completion marker>"])
+        except Exception as exc:
+            print(f"FAIL: _record_upload_failure raised: {{exc}}", file=sys.stderr)
+        return "failed", uploaded
+    _clear_upload_failure(name)
+    return "ok", uploaded
 
 
-def upload_done_marker() -> None:
-    s3.put_object(Bucket=BUCKET, Key=PREFIX + "DONE", Body=b"")
+def _upload_exitcode() -> bool:
+    """Upload worker.exitcode. Returns True only on success.
+
+    The orchestrator reads this file to confirm the workload outcome.
+    Failing to upload it — OR the file being absent — MUST prevent
+    final ``DONE`` publication. Absence is treated as a failure
+    because we cannot verify the workload outcome without it.
+    """
     exitcode_path = os.path.join(WORKSPACE, "worker.exitcode")
-    if os.path.exists(exitcode_path):
+    if not os.path.exists(exitcode_path):
+        print(
+            "FAIL: worker.exitcode missing — refusing to publish DONE marker",
+            file=sys.stderr,
+        )
+        return False
+    try:
         s3.upload_file(exitcode_path, BUCKET, PREFIX + "worker.exitcode")
+        return True
+    except Exception as exc:
+        print(f"FAIL: worker.exitcode upload failed: {{exc}}", file=sys.stderr)
+        return False
+
+
+def _upload_failures_log_path() -> str:
+    """Return the path of the local upload-failure sentinel file."""
+    return os.path.join(WORKSPACE, "upload_failures.log")
+
+
+def _prediction_completed_dir() -> str:
+    """Return the directory holding per-prediction completion markers."""
+    return os.path.join(WORKSPACE, "prediction_completed")
+
+
+def _shard_complete_marker_path() -> str:
+    """Return the path of the whole-shard positive completion marker.
+
+    This marker is written by ``upload_all()`` (no-arg mode) after
+    every required upload succeeds. ``--done`` requires either this
+    marker OR per-prediction completion markers for every prediction
+    directory under ``outputs/``. The marker is the canonical
+    positive proof that the worker successfully published every
+    required artifact; absence blocks DONE regardless of whether
+    failure-sentinel evidence exists.
+    """
+    return os.path.join(WORKSPACE, "shard_completed")
+
+
+def _record_upload_failure(name: str, failed_rel_paths: list[str]) -> None:
+    """Append a per-prediction failure line to the sentinel file.
+
+    The sentinel persists on the local filesystem so any later
+    ``--done`` / no-arg invocation can refuse to publish the
+    top-level shard DONE marker if any per-prediction upload failed.
+    """
+    log_path = _upload_failures_log_path()
+    sentinel_write_failed = False
+    try:
+        with open(log_path, "a") as fh:
+            for rel in failed_rel_paths:
+                fh.write(f"{{name}}\\t{{rel}}\\n")
+    except Exception as exc:
+        sentinel_write_failed = True
+        print(f"FAIL: failed to write upload failure sentinel: {{exc}}", file=sys.stderr)
+
+    if sentinel_write_failed:
+        # Best-effort fallback so --done still sees evidence of the
+        # failure. We write a separate ``SENTINEL_WRITE_FAILED``
+        # line; even if THIS write also fails, ``_has_unresolved_upload_failures``
+        # treats the unreadable-file state as unresolved.
+        try:
+            with open(log_path, "a") as fh2:
+                fh2.write(f"SENTINEL_WRITE_FAILED\\t{{name}}\\n")
+        except Exception:
+            pass
+
+
+def _record_shard_complete() -> bool:
+    """Atomically write the whole-shard positive completion marker.
+
+    Returns:
+        True on success, False if the marker could not be written.
+        A False return signals to callers that ``--done`` must refuse
+        to publish the shard DONE marker.
+    """
+    final_path = _shard_complete_marker_path()
+    tmp_path = f"{{final_path}}.tmp"
+    try:
+        with open(tmp_path, "w") as fh:
+            fh.write("ok\\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, final_path)
+        return True
+    except Exception as exc:
+        print(f"FAIL: failed to record shard completion marker: {{exc}}", file=sys.stderr)
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        return False
+
+
+def _has_shard_complete_marker() -> bool:
+    """Return True iff the whole-shard completion marker exists."""
+    return os.path.exists(_shard_complete_marker_path())
+
+
+def _clear_shard_complete_marker() -> None:
+    """Remove the whole-shard completion marker (on failure)."""
+    try:
+        os.unlink(_shard_complete_marker_path())
+    except OSError:
+        pass
+
+
+def _record_prediction_success(name: str) -> bool:
+    """Atomically write a positive completion marker for *name*.
+
+    Returns:
+        True on success, False if the marker could not be written.
+        A False return signals to callers that the ``--done`` path
+        must refuse to publish the shard DONE marker.
+    """
+    marker_dir = _prediction_completed_dir()
+    tmp_path = f"{{marker_dir}}/.{{name}}.tmp"
+    final_path = f"{{marker_dir}}/{{name}}"
+    try:
+        os.makedirs(marker_dir, exist_ok=True)
+        # Atomic rename so concurrent writers cannot observe a
+        # half-written marker.
+        with open(tmp_path, "w") as fh:
+            fh.write("ok\\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, final_path)
+        return True
+    except Exception as exc:
+        print(f"FAIL: failed to record prediction completion marker: {{exc}}", file=sys.stderr)
+        # Best-effort cleanup.
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        return False
+
+
+def _clear_upload_failure(name: str) -> None:
+    """Remove any prior sentinel line for this prediction on success.
+
+    If the resulting file is empty, the file itself is removed so
+    that ``--done`` can detect the absence-of-evidence state cleanly.
+    """
+    log_path = _upload_failures_log_path()
+    if not os.path.exists(log_path):
+        return
+    try:
+        kept: list[str] = []
+        with open(log_path) as fh:
+            for line in fh:
+                parts = line.rstrip("\\n").split("\\t", 1)
+                # Keep entries that are NOT for this prediction. The
+                # ``SENTINEL_WRITE_FAILED`` marker is global and must
+                # never be cleared by a per-prediction success.
+                if (
+                    len(parts) == 2
+                    and parts[0] == name
+                    and parts[1] != "SENTINEL_WRITE_FAILED"
+                ):
+                    continue
+                kept.append(line)
+        if kept:
+            with open(log_path, "w") as fh:
+                fh.writelines(kept)
+        else:
+            os.unlink(log_path)
+    except Exception:
+        # If we cannot rewrite the sentinel, leave it alone and refuse
+        # DONE conservatively in ``_has_unresolved_upload_failures``.
+        pass
+
+
+def _clear_prediction_success(name: str) -> None:
+    """Remove the positive completion marker for *name* (on failure)."""
+    marker_path = f"{{_prediction_completed_dir()}}/{{name}}"
+    try:
+        os.unlink(marker_path)
+    except OSError:
+        pass
+
+
+def _has_unresolved_upload_failures() -> bool:
+    """Return True iff the shard's uploads are NOT provably complete.
+
+    Three sources of evidence must all be absent for completion:
+
+    1. A non-empty failure sentinel. If present, the worker
+       observed a failed upload at some point and we refuse DONE
+       until that record is cleared by a successful retry.
+    2. The whole-shard positive completion marker (written by
+       ``upload_all()``). If absent, no ``upload_all()`` ever
+       succeeded; we must require positive proof.
+    3. Per-prediction completion markers for every prediction
+       directory under ``outputs/`` (only checked as a fallback
+       when the shard_complete marker is absent).
+
+    Empty ``outputs/``: no work to prove. Non-empty outputs/ with
+    neither shard_complete nor per-prediction markers → block.
+    """
+    # (1) Failure sentinel.
+    log_path = _upload_failures_log_path()
+    if os.path.exists(log_path):
+        try:
+            with open(log_path) as fh:
+                for line in fh:
+                    if line.strip():
+                        return True
+        except Exception:
+            # Treat unreadable sentinel as unresolved.
+            return True
+    # Empty outputs/ with no failures → no work to prove.
+    outputs_dir = os.path.join(WORKSPACE, "outputs")
+    outputs_empty = not os.path.isdir(outputs_dir) or not os.listdir(outputs_dir)
+    if outputs_empty:
+        return False
+    # (2) Whole-shard completion marker is the canonical positive
+    # proof. If present, the shard is provably complete regardless
+    # of per-prediction markers.
+    if _has_shard_complete_marker():
+        return False
+    # (3) No shard_complete but maybe per-prediction markers cover
+    # every prediction directory.
+    return _missing_prediction_completions() != []
+
+
+def _missing_prediction_completions() -> list[str]:
+    """Return names of prediction directories / flat files lacking completion.
+
+    A prediction that was never invoked by ``--prediction`` has no
+    completion marker; a flat file left behind by ``upload_all()``
+    only counts as covered if the whole-shard completion marker
+    exists. We list all top-level entries (directories AND flat
+    files) under ``outputs/`` whose per-prediction marker is
+    missing. The caller combines this with the shard_complete
+    check; if either positive proof is present we proceed.
+    """
+    outputs_dir = os.path.join(WORKSPACE, "outputs")
+    if not os.path.isdir(outputs_dir):
+        return []
+    marker_dir = _prediction_completed_dir()
+    missing: list[str] = []
+    for entry in sorted(os.listdir(outputs_dir)):
+        full = os.path.join(outputs_dir, entry)
+        # Only directories map 1:1 to per-prediction markers.
+        if not os.path.isdir(full):
+            # Flat file at the top level: the shard_complete marker
+            # is the only positive proof that the worker uploaded
+            # it. We add a synthetic "FLAT:<entry>" token so the
+            # caller can require shard_complete to be present when
+            # any flat files exist.
+            if not _has_shard_complete_marker():
+                missing.append(f"FLAT:{{entry}}")
+            continue
+        marker_path = f"{{marker_dir}}/{{entry}}"
+        if not os.path.exists(marker_path):
+            missing.append(entry)
+    return missing
+
+
+def upload_done_marker() -> int:
+    """Upload DONE marker + worker.exitcode. Exit code = upload status.
+
+    Refuses to publish the top-level shard DONE marker if any prior
+    per-prediction upload left a local failure sentinel unresolved.
+    The sentinel is checked first so a transient per-prediction
+    failure cannot be masked by a later successful worker exit.
+
+    Returns:
+        0 if all required uploads succeeded; non-zero otherwise. The
+        script exits with this return code so the worker treats a
+        transport failure as a non-success.
+    """
+    if _has_unresolved_upload_failures():
+        print(
+            "FAIL: unresolved per-prediction upload failures in "
+            "upload_failures.log — refusing to publish shard DONE.",
+            file=sys.stderr,
+        )
+        return 4
+    if not _upload_exitcode():
+        # Omit DONE marker — partial publication would let the
+        # orchestrator accept an incomplete result set as committed.
+        return 1
+    try:
+        s3.put_object(Bucket=BUCKET, Key=PREFIX + "DONE", Body=b"")
+    except Exception as exc:
+        print(f"FAIL: DONE marker upload failed: {{exc}}", file=sys.stderr)
+        return 2
+    return 0
 
 
 def upload_all() -> int:
+    """Upload all outputs, then DONE marker. Returns 0 only on full success.
+
+    Failures are recorded in the local upload-failure sentinel so a
+    later ``--done`` invocation cannot mask them. On full success,
+    per-prediction completion markers are written for every
+    top-level subdirectory under ``outputs/`` AND the whole-shard
+    positive completion marker is atomically recorded. Both are
+    required for ``--done`` to publish the shard DONE marker.
+
+    A successful invocation also clears any stale ``<no-arg>``
+    failure entry so a retry after recovery can complete normally.
+    """
     uploaded = 0
+    failures: list[str] = []
     outputs_dir = os.path.join(WORKSPACE, "outputs")
-    for root, _dirs, files in os.walk(outputs_dir):
-        for fname in files:
-            local_path = os.path.join(root, fname)
-            rel = os.path.relpath(local_path, outputs_dir)
-            key = PREFIX + "outputs/" + rel
-            try:
-                s3.upload_file(local_path, BUCKET, key)
-                uploaded += 1
-            except Exception as exc:
-                print(f"WARN: upload failed for {{rel}}: {{exc}}")
-    upload_done_marker()
-    return uploaded
+    if os.path.isdir(outputs_dir):
+        for root, _dirs, files in os.walk(outputs_dir):
+            for fname in files:
+                local_path = os.path.join(root, fname)
+                rel = os.path.relpath(local_path, outputs_dir)
+                key = PREFIX + "outputs/" + rel
+                try:
+                    s3.upload_file(local_path, BUCKET, key)
+                    uploaded += 1
+                except Exception as exc:
+                    failures.append(rel)
+                    print(f"WARN: upload failed for {{rel}}: {{exc}}")
+    if failures:
+        # Required final uploads did not complete; record and omit DONE.
+        print(
+            f"FAIL: {{len(failures)}} required file(s) failed to upload; "
+            "omitting DONE marker.",
+            file=sys.stderr,
+        )
+        _record_upload_failure("<no-arg>", failures)
+        _clear_shard_complete_marker()
+        return 3
+    # All file uploads succeeded. Write per-prediction completion
+    # markers for every top-level subdirectory of outputs/ so the
+    # next --done has positive proof of every prediction.
+    if os.path.isdir(outputs_dir):
+        for entry in sorted(os.listdir(outputs_dir)):
+            full = os.path.join(outputs_dir, entry)
+            if os.path.isdir(full):
+                _record_prediction_success(entry)
+    # Write the whole-shard positive completion marker.
+    shard_marker_written = _record_shard_complete()
+    # Clear any stale failure entries from prior failed invocations.
+    _clear_upload_failure("<no-arg>")
+    if not shard_marker_written:
+        print(
+            "FAIL: failed to record shard completion marker — refusing DONE.",
+            file=sys.stderr,
+        )
+        return 5
+    if _has_unresolved_upload_failures():
+        print(
+            "FAIL: unresolved per-prediction upload failures in "
+            "upload_failures.log — refusing to publish shard DONE.",
+            file=sys.stderr,
+        )
+        return 4
+    if not _upload_exitcode():
+        _clear_shard_complete_marker()
+        return 1
+    try:
+        s3.put_object(Bucket=BUCKET, Key=PREFIX + "DONE", Body=b"")
+    except Exception as exc:
+        print(f"FAIL: DONE marker upload failed: {{exc}}", file=sys.stderr)
+        _clear_shard_complete_marker()
+        return 2
+    return 0
 
 
 def check_prediction(name: str) -> bool:
@@ -513,14 +940,29 @@ if args.check == "__connectivity__":
 elif args.check:
     sys.exit(0 if check_prediction(args.check) else 1)
 elif args.prediction:
-    n = upload_prediction(args.prediction)
-    print(f"R2: {{args.prediction}} uploaded ({{n}} files)")
+    status, count = upload_prediction(args.prediction)
+    if status == "absent":
+        # No output dir — not a failure; warn and exit 0.
+        print(f"R2: {{args.prediction}} no output dir")
+        sys.exit(0)
+    if status == "failed":
+        # Partial failure — required uploads did not complete.
+        print(
+            f"R2: {{args.prediction}} failed (partial upload)", file=sys.stderr,
+        )
+        sys.exit(1)
+    print(f"R2: {{args.prediction}} uploaded ({{count}} files)")
 elif args.done:
-    upload_done_marker()
-    print("R2: DONE marker uploaded")
+    rc = upload_done_marker()
+    if rc == 0:
+        print("R2: DONE marker uploaded")
+    else:
+        print(f"R2: DONE marker upload failed (rc={{rc}})", file=sys.stderr)
+    sys.exit(rc)
 else:
-    n = upload_all()
-    print(f"R2: all uploaded ({{n}} files)")
+    rc = upload_all()
+    print(f"R2: all uploaded (rc={{rc}})")
+    sys.exit(rc)
 '''
 
     def generate_job_upload_script(
@@ -599,18 +1041,25 @@ def _save_chunk_state(state: dict) -> None:
         f.write(_json.dumps(state))
 
 
-def _flush_large_file_chunk() -> bool:
+def _flush_large_file_chunk():
+    """Flush the next chunk of the large file.
+
+    Returns:
+        - ``"uploaded"`` if a new chunk was uploaded successfully.
+        - ``"none"`` if there is no new data to send (no chunk produced).
+        - ``"failed"`` if a chunk was attempted but the upload failed.
+    """
     if not LARGE_FILE:
-        return False
+        return "none"
     state = _load_chunk_state()
     offset = state["offset"]
     chunk_index = state["chunk_index"]
     file_path = os.path.join(OUTPUT, LARGE_FILE)
     if not os.path.exists(file_path):
-        return False
+        return "none"
     file_size = os.path.getsize(file_path)
     if file_size <= offset:
-        return False
+        return "none"
     chunk_size = file_size - offset
     stem, ext = os.path.splitext(LARGE_FILE)
     chunk_key = PREFIX + f"{{stem}}_chunk_{{chunk_index:03d}}{{ext}}"
@@ -630,18 +1079,19 @@ def _flush_large_file_chunk() -> bool:
         state["chunk_index"] = chunk_index + 1
         _save_chunk_state(state)
         print(f"  chunk {{chunk_index}}: {{chunk_size}} bytes")
-        return True
+        return "uploaded"
     except Exception as exc:
         print(f"WARN: chunk upload failed: {{exc}}")
-        return False
+        return "failed"
     finally:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
 
 
 def upload_checkpoint() -> int:
+    """Best-effort checkpoint upload. NEVER publishes DONE marker."""
     uploaded = 0
-    if _flush_large_file_chunk():
+    if _flush_large_file_chunk() == "uploaded":
         uploaded += 1
     files = CHECKPOINT_FILES or (
         [f for f in os.listdir(OUTPUT) if f != LARGE_FILE] if os.path.isdir(OUTPUT) else []
@@ -657,17 +1107,88 @@ def upload_checkpoint() -> int:
     return uploaded
 
 
-def upload_done_marker() -> None:
-    s3.put_object(Bucket=BUCKET, Key=PREFIX + "DONE", Body=b"")
+def _upload_exitcode_job() -> bool:
+    """Upload worker.exitcode for job-based workers. Required for DONE.
+
+    Absence is treated as a failure because we cannot verify the
+    workload outcome without it; final ``DONE`` must not be published.
+    """
     exitcode_path = os.path.join(WORKSPACE, "worker.exitcode")
-    if os.path.exists(exitcode_path):
+    if not os.path.exists(exitcode_path):
+        print(
+            "FAIL: worker.exitcode missing — refusing to publish DONE marker",
+            file=sys.stderr,
+        )
+        return False
+    try:
         s3.upload_file(exitcode_path, BUCKET, PREFIX + "worker.exitcode")
+        return True
+    except Exception as exc:
+        print(f"FAIL: worker.exitcode upload failed: {{exc}}", file=sys.stderr)
+        return False
+
+
+def _upload_failures_log_path_job() -> str:
+    """Return the path of the local upload-failure sentinel file."""
+    return os.path.join(WORKSPACE, "upload_failures.log")
+
+
+def _has_unresolved_upload_failures_job() -> bool:
+    """Return True iff the local sentinel lists any unresolved failure."""
+    log_path = _upload_failures_log_path_job()
+    if not os.path.exists(log_path):
+        return False
+    try:
+        with open(log_path) as fh:
+            for line in fh:
+                if line.strip():
+                    return True
+    except Exception:
+        # Treat unreadable sentinel as unresolved.
+        return True
+    # Job uploader publishes all output files in a single --done
+    # call; we do not enforce per-prediction completion markers here
+    # because the job workload has no notion of "predictions".
+    # The failure sentinel alone is sufficient to refuse DONE.
+    return False
+
+
+def upload_done_marker() -> int:
+    """Upload DONE marker + worker.exitcode. Returns 0 only on full success.
+
+    Returns:
+        0 on success; non-zero on any required upload failure. The
+        script exits with this code so the worker treats transport
+        failure as a non-success without crashing.
+    """
+    if _has_unresolved_upload_failures_job():
+        print(
+            "FAIL: unresolved per-prediction upload failures in "
+            "upload_failures.log — refusing to publish job DONE.",
+            file=sys.stderr,
+        )
+        return 4
+    if not _upload_exitcode_job():
+        return 1
+    try:
+        s3.put_object(Bucket=BUCKET, Key=PREFIX + "DONE", Body=b"")
+    except Exception as exc:
+        print(f"FAIL: DONE marker upload failed: {{exc}}", file=sys.stderr)
+        return 2
+    return 0
 
 
 def upload_all() -> int:
-    uploaded = 0
-    if _flush_large_file_chunk():
-        uploaded += 1
+    """Final upload — chunk flush + all output files + DONE. Fail closed.
+
+    Returns:
+        0 on full success; non-zero on any required final upload
+        failure. The script exits with this code.
+    """
+    failures: list[str] = []
+    chunk_status = _flush_large_file_chunk()
+    if chunk_status == "failed":
+        failures.append(LARGE_FILE or "<chunk>")
     if os.path.isdir(OUTPUT):
         for fname in os.listdir(OUTPUT):
             if fname == LARGE_FILE:
@@ -676,11 +1197,31 @@ def upload_all() -> int:
             if os.path.isfile(local_path):
                 try:
                     s3.upload_file(local_path, BUCKET, PREFIX + fname)
-                    uploaded += 1
                 except Exception as exc:
+                    failures.append(fname)
                     print(f"WARN: upload failed for {{fname}}: {{exc}}")
-    upload_done_marker()
-    return uploaded
+    if failures:
+        print(
+            f"FAIL: {{len(failures)}} required file(s) failed to upload; "
+            "omitting DONE marker.",
+            file=sys.stderr,
+        )
+        return 3
+    if _has_unresolved_upload_failures_job():
+        print(
+            "FAIL: unresolved per-prediction upload failures in "
+            "upload_failures.log — refusing to publish job DONE.",
+            file=sys.stderr,
+        )
+        return 4
+    if not _upload_exitcode_job():
+        return 1
+    try:
+        s3.put_object(Bucket=BUCKET, Key=PREFIX + "DONE", Body=b"")
+    except Exception as exc:
+        print(f"FAIL: DONE marker upload failed: {{exc}}", file=sys.stderr)
+        return 2
+    return 0
 
 
 parser = argparse.ArgumentParser()
@@ -692,9 +1233,11 @@ if args.checkpoint:
     n = upload_checkpoint()
     print(f"R2: checkpoint uploaded ({{n}} files)")
 elif args.done:
-    n = upload_all()
-    print(f"R2: final upload ({{n}} files + DONE)")
+    rc = upload_all()
+    print(f"R2: final upload (rc={{rc}})")
+    sys.exit(rc)
 else:
-    n = upload_all()
-    print(f"R2: all uploaded ({{n}} files)")
+    rc = upload_all()
+    print(f"R2: all uploaded (rc={{rc}})")
+    sys.exit(rc)
 '''

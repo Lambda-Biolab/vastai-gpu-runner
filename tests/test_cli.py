@@ -607,3 +607,701 @@ def _empty_vastai_config() -> object:
     )
     # Caller will replace docker_image + ownership via dataclasses.replace.
     return base
+
+
+# ---------------------------------------------------------------------------
+# r2-lifecycle sub-commands
+# ---------------------------------------------------------------------------
+
+
+class _FakeS3Lifecycle:
+    """Minimal S3 client that records lifecycle calls."""
+
+    def __init__(self, rules: list[dict[str, object]] | None = None) -> None:
+        self.rules: list[dict[str, object]] = list(rules or [])
+        self.put_calls: list[list[dict[str, object]]] = []
+        self.delete_calls = 0
+        self.fail_get: Exception | None = None
+        self.fail_put: Exception | None = None
+        self.fail_delete: Exception | None = None
+
+    def get_bucket_lifecycle_configuration(self, *, Bucket: str) -> dict[str, object]:  # noqa: N803
+        if self.fail_get is not None:
+            raise self.fail_get
+        return {"Rules": list(self.rules)}
+
+    def put_bucket_lifecycle_configuration(
+        self,
+        *,
+        Bucket: str,  # noqa: N803
+        LifecycleConfiguration: dict[str, object],  # noqa: N803
+    ) -> dict[str, object]:
+        if self.fail_put is not None:
+            raise self.fail_put
+        rules = LifecycleConfiguration.get("Rules", [])
+        self.put_calls.append(list(rules))
+        self.rules = list(rules)
+        return {}
+
+    def delete_bucket_lifecycle(self, *, Bucket: str) -> dict[str, object]:  # noqa: N803
+        if self.fail_delete is not None:
+            raise self.fail_delete
+        self.delete_calls += 1
+        self.rules = []
+        return {}
+
+
+def _client_error(code: str) -> Exception:
+    class _FakeClientError(Exception):
+        pass
+
+    err = _FakeClientError(code)
+    err.response = {"Error": {"Code": code}}  # type: ignore[attr-defined]
+    return err
+
+
+def _creds_file(tmp_path: Path) -> Path:
+    """Write an admin credentials file with redacted-test secrets."""
+    p = tmp_path / "creds"
+    p.write_text(
+        'export R2_ADMIN_ENDPOINT="https://r2.example"\n'
+        'export R2_ADMIN_ACCESS_KEY_ID="akey"\n'
+        'export R2_ADMIN_SECRET_ACCESS_KEY="test-secret-fixture"\n',
+    )
+    return p
+
+
+def _patch_lifecycle_client(monkeypatch, client: _FakeS3Lifecycle) -> None:
+    """Replace ``build_admin_client`` so the CLI uses our fake client."""
+
+    def _builder(_creds: object) -> _FakeS3Lifecycle:
+        return client
+
+    monkeypatch.setattr(
+        "vastai_gpu_runner.storage.r2_lifecycle.build_admin_client",
+        _builder,
+    )
+
+
+class TestR2LifecycleShow:
+    def test_show_prints_not_configured(
+        self,
+        monkeypatch,
+        tmp_path: Path,
+    ) -> None:
+        client = _FakeS3Lifecycle()
+        _patch_lifecycle_client(monkeypatch, client)
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            [
+                "r2-lifecycle",
+                "show",
+                "--bucket",
+                "bkt",
+                "--prefix",
+                "project/",
+                "--credentials-file",
+                str(_creds_file(tmp_path)),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert "not configured" in result.output
+        assert "project/" in result.output
+
+    def test_show_prints_configured_when_rule_present(
+        self,
+        monkeypatch,
+        tmp_path: Path,
+    ) -> None:
+        rule_id = "vastai-gpu-runner-expire-4d59ad9c6433"  # deterministic for bkt/project/
+        client = _FakeS3Lifecycle(
+            rules=[
+                {
+                    "ID": rule_id,
+                    "Status": "Enabled",
+                    "Filter": {"Prefix": "project/"},
+                    "Expiration": {"Days": 30},
+                }
+            ],
+        )
+        _patch_lifecycle_client(monkeypatch, client)
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            [
+                "r2-lifecycle",
+                "show",
+                "--bucket",
+                "bkt",
+                "--prefix",
+                "project/",
+                "--credentials-file",
+                str(_creds_file(tmp_path)),
+            ],
+        )
+        assert result.exit_code == 0
+        assert "configured" in result.output
+        assert "30" in result.output
+
+    def test_show_rejects_empty_prefix(
+        self,
+        monkeypatch,
+        tmp_path: Path,
+    ) -> None:
+        client = _FakeS3Lifecycle()
+        _patch_lifecycle_client(monkeypatch, client)
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            [
+                "r2-lifecycle",
+                "show",
+                "--bucket",
+                "bkt",
+                "--prefix",
+                "/",
+                "--credentials-file",
+                str(_creds_file(tmp_path)),
+            ],
+        )
+        assert result.exit_code != 0
+        assert "validation" in result.output or "bucket-wide" in result.output
+
+    def test_show_access_denied_returns_4(
+        self,
+        monkeypatch,
+        tmp_path: Path,
+    ) -> None:
+        client = _FakeS3Lifecycle()
+        client.fail_get = _client_error("AccessDenied")
+        _patch_lifecycle_client(monkeypatch, client)
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            [
+                "r2-lifecycle",
+                "show",
+                "--bucket",
+                "bkt",
+                "--prefix",
+                "project/",
+                "--credentials-file",
+                str(_creds_file(tmp_path)),
+            ],
+        )
+        assert result.exit_code == 4
+        assert "access denied" in result.output
+
+    def test_show_no_secret_in_output(
+        self,
+        monkeypatch,
+        tmp_path: Path,
+    ) -> None:
+        client = _FakeS3Lifecycle()
+        _patch_lifecycle_client(monkeypatch, client)
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            [
+                "r2-lifecycle",
+                "show",
+                "--bucket",
+                "bkt",
+                "--prefix",
+                "project/",
+                "--credentials-file",
+                str(_creds_file(tmp_path)),
+                "-v",
+            ],
+        )
+        # test-secret-fixture is the secret in the test creds file.
+        assert "test-secret-fixture" not in result.output
+
+
+class TestR2LifecycleApply:
+    def test_apply_dry_run_does_not_put(
+        self,
+        monkeypatch,
+        tmp_path: Path,
+    ) -> None:
+        client = _FakeS3Lifecycle()
+        _patch_lifecycle_client(monkeypatch, client)
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            [
+                "r2-lifecycle",
+                "apply",
+                "--bucket",
+                "bkt",
+                "--prefix",
+                "project/",
+                "--credentials-file",
+                str(_creds_file(tmp_path)),
+                "--expire-after-days",
+                "30",
+                "--dry-run",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert client.put_calls == []
+        assert "dry-run" in result.output
+
+    def test_apply_no_op_does_not_put(
+        self,
+        monkeypatch,
+        tmp_path: Path,
+    ) -> None:
+        rule_id = "vastai-gpu-runner-expire-4d59ad9c6433"
+        existing = [
+            {
+                "ID": rule_id,
+                "Status": "Enabled",
+                "Filter": {"Prefix": "project/"},
+                "Expiration": {"Days": 30},
+            }
+        ]
+        client = _FakeS3Lifecycle(rules=existing)
+        _patch_lifecycle_client(monkeypatch, client)
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            [
+                "r2-lifecycle",
+                "apply",
+                "--bucket",
+                "bkt",
+                "--prefix",
+                "project/",
+                "--credentials-file",
+                str(_creds_file(tmp_path)),
+                "--expire-after-days",
+                "30",
+                "--yes",
+            ],
+        )
+        assert result.exit_code == 0
+        assert "no-op" in result.output
+        assert client.put_calls == []
+
+    def test_apply_yes_executes_put(
+        self,
+        monkeypatch,
+        tmp_path: Path,
+    ) -> None:
+        client = _FakeS3Lifecycle()
+        _patch_lifecycle_client(monkeypatch, client)
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            [
+                "r2-lifecycle",
+                "apply",
+                "--bucket",
+                "bkt",
+                "--prefix",
+                "project/",
+                "--credentials-file",
+                str(_creds_file(tmp_path)),
+                "--expire-after-days",
+                "30",
+                "--yes",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert "applied" in result.output
+        assert len(client.put_calls) == 1
+
+    def test_apply_refuses_without_yes_when_stdin_not_tty(
+        self,
+        monkeypatch,
+        tmp_path: Path,
+    ) -> None:
+        # typer.confirm uses click's getchar; the CliRunner doesn't simulate
+        # a TTY by default, so we expect the refusal path.
+        client = _FakeS3Lifecycle()
+        _patch_lifecycle_client(monkeypatch, client)
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            [
+                "r2-lifecycle",
+                "apply",
+                "--bucket",
+                "bkt",
+                "--prefix",
+                "project/",
+                "--credentials-file",
+                str(_creds_file(tmp_path)),
+                "--expire-after-days",
+                "30",
+            ],
+        )
+        # Either refused with exit 9, or typer exited cleanly because
+        # confirm() raised Abort. Both mean no PUT happened.
+        assert client.put_calls == []
+        assert result.exit_code != 0 or "refusing" in result.output
+
+    def test_apply_verification_failure_returns_8(
+        self,
+        monkeypatch,
+        tmp_path: Path,
+    ) -> None:
+        client = _FakeS3Lifecycle()
+
+        original_put = client.put_bucket_lifecycle_configuration
+
+        def corrupt_put(
+            *,
+            Bucket: str,  # noqa: N803
+            LifecycleConfiguration: dict[str, object],  # noqa: N803
+        ) -> dict[str, object]:
+            original_put(
+                Bucket=Bucket,
+                LifecycleConfiguration=LifecycleConfiguration,
+            )
+            # Corrupt the resulting state so read-after-write fails.
+            # Use a fresh list of fresh dicts to avoid mutating the
+            # rule references held by the manager's plan.
+            client.rules = [{**r, "Expiration": {"Days": 999}} for r in client.rules]
+            return {}
+
+        client.put_bucket_lifecycle_configuration = corrupt_put  # type: ignore[method-assign]
+        _patch_lifecycle_client(monkeypatch, client)
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            [
+                "r2-lifecycle",
+                "apply",
+                "--bucket",
+                "bkt",
+                "--prefix",
+                "project/",
+                "--credentials-file",
+                str(_creds_file(tmp_path)),
+                "--expire-after-days",
+                "30",
+                "--yes",
+            ],
+        )
+        assert result.exit_code == 8, result.output
+        assert "verification" in result.output
+
+    def test_apply_rule_limit_returns_7(
+        self,
+        monkeypatch,
+        tmp_path: Path,
+    ) -> None:
+        client = _FakeS3Lifecycle()
+        client.fail_put = _client_error("TooManyRules")
+        _patch_lifecycle_client(monkeypatch, client)
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            [
+                "r2-lifecycle",
+                "apply",
+                "--bucket",
+                "bkt",
+                "--prefix",
+                "project/",
+                "--credentials-file",
+                str(_creds_file(tmp_path)),
+                "--expire-after-days",
+                "30",
+                "--yes",
+            ],
+        )
+        assert result.exit_code == 7
+
+    def test_apply_missing_retention_rejected(
+        self,
+        monkeypatch,
+        tmp_path: Path,
+    ) -> None:
+        client = _FakeS3Lifecycle()
+        _patch_lifecycle_client(monkeypatch, client)
+        runner = CliRunner()
+        # Typer Option(min=1) → "Invalid value" if user passes 0 or omits.
+        result = runner.invoke(
+            app,
+            [
+                "r2-lifecycle",
+                "apply",
+                "--bucket",
+                "bkt",
+                "--prefix",
+                "project/",
+                "--credentials-file",
+                str(_creds_file(tmp_path)),
+                "--expire-after-days",
+                "0",
+                "--yes",
+            ],
+        )
+        assert result.exit_code != 0
+        assert client.put_calls == []
+
+    def test_apply_no_secret_in_output(
+        self,
+        monkeypatch,
+        tmp_path: Path,
+    ) -> None:
+        client = _FakeS3Lifecycle()
+        _patch_lifecycle_client(monkeypatch, client)
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            [
+                "r2-lifecycle",
+                "apply",
+                "--bucket",
+                "bkt",
+                "--prefix",
+                "project/",
+                "--credentials-file",
+                str(_creds_file(tmp_path)),
+                "--expire-after-days",
+                "30",
+                "--yes",
+                "-v",
+            ],
+        )
+        assert "skey" not in result.output
+
+
+class TestR2LifecycleRemove:
+    def test_remove_dry_run_does_not_put(
+        self,
+        monkeypatch,
+        tmp_path: Path,
+    ) -> None:
+        rule_id = "vastai-gpu-runner-expire-4d59ad9c6433"
+        existing = [
+            {
+                "ID": rule_id,
+                "Status": "Enabled",
+                "Filter": {"Prefix": "project/"},
+                "Expiration": {"Days": 30},
+            }
+        ]
+        client = _FakeS3Lifecycle(rules=existing)
+        _patch_lifecycle_client(monkeypatch, client)
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            [
+                "r2-lifecycle",
+                "remove",
+                "--bucket",
+                "bkt",
+                "--prefix",
+                "project/",
+                "--credentials-file",
+                str(_creds_file(tmp_path)),
+                "--dry-run",
+            ],
+        )
+        assert result.exit_code == 0
+        assert client.put_calls == []
+        assert "dry-run" in result.output
+
+    def test_remove_yes_executes(
+        self,
+        monkeypatch,
+        tmp_path: Path,
+    ) -> None:
+        rule_id = "vastai-gpu-runner-expire-4d59ad9c6433"
+        existing = [
+            {
+                "ID": rule_id,
+                "Status": "Enabled",
+                "Filter": {"Prefix": "project/"},
+                "Expiration": {"Days": 30},
+            }
+        ]
+        client = _FakeS3Lifecycle(rules=existing)
+        _patch_lifecycle_client(monkeypatch, client)
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            [
+                "r2-lifecycle",
+                "remove",
+                "--bucket",
+                "bkt",
+                "--prefix",
+                "project/",
+                "--credentials-file",
+                str(_creds_file(tmp_path)),
+                "--yes",
+            ],
+        )
+        assert result.exit_code == 0
+        assert "removed" in result.output
+        # This is the only rule, so remove calls delete_bucket_lifecycle,
+        # NOT put_bucket_lifecycle_configuration.
+        assert len(client.put_calls) == 0
+        assert client.delete_calls == 1
+        assert all(r["ID"] != rule_id for r in client.rules)
+
+    def test_remove_no_op_when_absent(
+        self,
+        monkeypatch,
+        tmp_path: Path,
+    ) -> None:
+        client = _FakeS3Lifecycle()
+        _patch_lifecycle_client(monkeypatch, client)
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            [
+                "r2-lifecycle",
+                "remove",
+                "--bucket",
+                "bkt",
+                "--prefix",
+                "project/",
+                "--credentials-file",
+                str(_creds_file(tmp_path)),
+                "--yes",
+            ],
+        )
+        assert result.exit_code == 0
+        assert "no-op" in result.output
+        assert client.put_calls == []
+
+    def test_remove_with_foreign_uses_put_not_delete(
+        self,
+        monkeypatch,
+        tmp_path: Path,
+    ) -> None:
+        """When foreign rules remain, remove uses PUT (not DELETE)."""
+        rule_id = "vastai-gpu-runner-expire-4d59ad9c6433"
+        existing = [
+            {
+                "ID": rule_id,
+                "Status": "Enabled",
+                "Filter": {"Prefix": "project/"},
+                "Expiration": {"Days": 30},
+            },
+            {"ID": "f", "Status": "Enabled"},
+        ]
+        client = _FakeS3Lifecycle(rules=existing)
+        _patch_lifecycle_client(monkeypatch, client)
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            [
+                "r2-lifecycle",
+                "remove",
+                "--bucket",
+                "bkt",
+                "--prefix",
+                "project/",
+                "--credentials-file",
+                str(_creds_file(tmp_path)),
+                "--yes",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert "removed" in result.output
+        assert len(client.put_calls) == 1
+        assert client.delete_calls == 0
+        assert all(r["ID"] != rule_id for r in client.rules)
+
+    def test_remove_collision_returns_5(
+        self,
+        monkeypatch,
+        tmp_path: Path,
+    ) -> None:
+        rule_id = "vastai-gpu-runner-expire-4d59ad9c6433"
+        existing = [
+            {
+                "ID": rule_id,
+                "Status": "Enabled",
+                "Filter": {"Prefix": "project/"},
+                # No Days field — triggers collision check during apply,
+                # not remove. To exercise the remove path we instead make
+                # remove fail by stubbing the verification.
+                "Expiration": {"Days": 30},
+            }
+        ]
+        client = _FakeS3Lifecycle(rules=existing)
+        _patch_lifecycle_client(monkeypatch, client)
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            [
+                "r2-lifecycle",
+                "remove",
+                "--bucket",
+                "bkt",
+                "--prefix",
+                "project/",
+                "--credentials-file",
+                str(_creds_file(tmp_path)),
+                "--yes",
+            ],
+        )
+        assert result.exit_code == 0  # No collision on the remove path.
+
+
+class TestR2LifecycleCLIIntegration:
+    def test_help_prints(self) -> None:
+        runner = CliRunner()
+        result = runner.invoke(app, ["r2-lifecycle", "--help"])
+        assert result.exit_code == 0
+        assert "show" in result.output
+        assert "apply" in result.output
+        assert "remove" in result.output
+
+    def test_missing_credentials_file_exits_3(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            [
+                "r2-lifecycle",
+                "show",
+                "--bucket",
+                "bkt",
+                "--prefix",
+                "project/",
+                "--credentials-file",
+                str(tmp_path / "missing"),
+            ],
+        )
+        # Missing credentials file is now a typed ``CredentialsError``
+        # which maps to exit code 3.
+        assert result.exit_code == 3
+        assert "credentials" in result.output.lower()
+
+    def test_missing_creds_keys_exits_3(
+        self,
+        monkeypatch,
+        tmp_path: Path,
+    ) -> None:
+        creds = tmp_path / "creds"
+        creds.write_text('export R2_ENDPOINT="https://r2.example"\n')
+        client = _FakeS3Lifecycle()
+        _patch_lifecycle_client(monkeypatch, client)
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            [
+                "r2-lifecycle",
+                "show",
+                "--bucket",
+                "bkt",
+                "--prefix",
+                "project/",
+                "--credentials-file",
+                str(creds),
+            ],
+        )
+        assert result.exit_code == 3

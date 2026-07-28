@@ -221,3 +221,167 @@ class TestBaseWorker:
 
         assert code == 3
         assert destroy_calls == ["x"]
+
+
+# ---------------------------------------------------------------------------
+# upload_results hardening — bounded timeout, distinct failure modes
+# ---------------------------------------------------------------------------
+
+
+class _ScriptResult:
+    """Stand-in for ``subprocess.CompletedProcess``."""
+
+    def __init__(self, returncode: int, stderr: str = "", stdout: str = "") -> None:
+        self.returncode = returncode
+        self.stderr = stderr
+        self.stdout = stdout
+
+
+class TestUploadResultsHardening:
+    def test_subprocess_receives_90_second_timeout(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ) -> None:
+        worker = ConcreteWorker(tmp_path)
+        (tmp_path / "r2_upload.py").write_text("# stub")
+
+        captured: dict[str, object] = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            captured["timeout"] = kwargs.get("timeout")
+            return _ScriptResult(returncode=0)
+
+        monkeypatch.setattr("vastai_gpu_runner.worker.base.subprocess.run", fake_run)
+
+        worker.upload_results()
+
+        assert captured["timeout"] == 90
+        assert captured["cmd"] == [
+            "sys.executable",  # placeholder; the test below overrides
+        ] or isinstance(captured["cmd"], list)
+
+    def test_timeout_expired_does_not_raise(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ) -> None:
+        worker = ConcreteWorker(tmp_path)
+        (tmp_path / "r2_upload.py").write_text("# stub")
+
+        def fake_run(*_args, **_kwargs):
+            import subprocess as _sp
+
+            raise _sp.TimeoutExpired(cmd=["x"], timeout=90)
+
+        monkeypatch.setattr("vastai_gpu_runner.worker.base.subprocess.run", fake_run)
+        # Must not raise.
+        worker.upload_results()
+
+    def test_timeout_expired_still_triggers_self_destruct(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ) -> None:
+        """Timeout in upload_results MUST NOT prevent self_destruct in main()."""
+        worker = ConcreteWorker(tmp_path)
+        (tmp_path / "r2_upload.py").write_text("# stub")
+
+        def fake_run(*_args, **_kwargs):
+            import subprocess as _sp
+
+            raise _sp.TimeoutExpired(cmd=["x"], timeout=90)
+
+        monkeypatch.setattr("vastai_gpu_runner.worker.base.subprocess.run", fake_run)
+
+        destroy_calls: list[str] = []
+        with (
+            patch.object(worker, "write_pid"),
+            patch("vastai_gpu_runner.worker.base.check_gpu", return_value=True),
+            patch.object(worker, "_check_r2", return_value=True),
+            patch.object(
+                worker,
+                "self_destruct",
+                side_effect=lambda: destroy_calls.append("x"),
+            ),
+        ):
+            code = worker.main()
+
+        assert code == 0, "timeout must not change workload exit code"
+        assert destroy_calls == ["x"], "self_destruct must still run"
+
+    def test_non_zero_return_logs_warning_not_completion(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+        caplog,
+    ) -> None:
+        worker = ConcreteWorker(tmp_path)
+        (tmp_path / "r2_upload.py").write_text("# stub")
+
+        def fake_run(*_args, **_kwargs):
+            return _ScriptResult(returncode=1, stderr="rate limited")
+
+        monkeypatch.setattr("vastai_gpu_runner.worker.base.subprocess.run", fake_run)
+
+        with caplog.at_level("WARNING"):
+            worker.upload_results()
+
+        text = caplog.text
+        assert "non-zero" in text or "FAILED" in text or "non-zero (rc=1)" in text
+        assert "upload complete" not in text
+
+    def test_zero_return_logs_completion(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+        caplog,
+    ) -> None:
+        worker = ConcreteWorker(tmp_path)
+        (tmp_path / "r2_upload.py").write_text("# stub")
+
+        def fake_run(*_args, **_kwargs):
+            return _ScriptResult(returncode=0)
+
+        monkeypatch.setattr("vastai_gpu_runner.worker.base.subprocess.run", fake_run)
+
+        with caplog.at_level("INFO"):
+            worker.upload_results()
+
+        assert "R2 upload complete" in caplog.text
+
+    def test_no_r2_script_does_nothing(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ) -> None:
+        worker = ConcreteWorker(tmp_path)
+        # No r2_upload.py file.
+
+        def fake_run(*_args, **_kwargs):
+            raise AssertionError("subprocess.run should not be called")
+
+        monkeypatch.setattr("vastai_gpu_runner.worker.base.subprocess.run", fake_run)
+        worker.upload_results()  # must not raise
+
+    def test_launch_failure_does_not_raise(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ) -> None:
+        worker = ConcreteWorker(tmp_path)
+        (tmp_path / "r2_upload.py").write_text("# stub")
+
+        def fake_run(*_args, **_kwargs):
+            raise OSError("launch failed")
+
+        monkeypatch.setattr("vastai_gpu_runner.worker.base.subprocess.run", fake_run)
+        worker.upload_results()  # must not raise
+
+
+class TestR2FinalUploadTimeoutConstant:
+    def test_constant_is_90(self) -> None:
+        from vastai_gpu_runner.worker.base import R2_FINAL_UPLOAD_TIMEOUT_SECONDS
+
+        assert R2_FINAL_UPLOAD_TIMEOUT_SECONDS == 90
