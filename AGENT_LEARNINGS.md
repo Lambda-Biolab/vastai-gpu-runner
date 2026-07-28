@@ -90,3 +90,71 @@ description: Non-obvious patterns that prevent repeated mistakes across sprints
   reliable call-log capture.
 - **Example**: `tests/test_r2_upload_scripts.py::_run_script`
 - **References**: PR #39 (planned).
+
+### Fail-closed uploader: positive completion proof, not just negative evidence
+
+- **Context**: The worker shard DONE marker is authoritative for the
+  orchestrator. A generated upload script that publishes DONE despite
+  a failed required upload lets the orchestrator accept an incomplete
+  result set as committed.
+- **Problem**: A failure-only sentinel is not enough:
+  - Sentinel write itself can fail (disk full, permission denied).
+  - A subsequent successful `--done` invocation sees no failure
+    evidence and publishes DONE.
+  - A no-arg `upload_all()` upload of `outputs/<flat_file>` (no
+    prediction subdirectory) has no per-prediction completion marker
+    to track.
+  - A failed `upload_all()` followed by a successful retry cannot
+    clear the prior `<no-arg>` failure entry.
+- **Solution**: Positive completion proof via atomically-written
+  markers.
+  - Each `--prediction` writes `<workspace>/prediction_completed/<name>`.
+  - Each successful `upload_all()` writes the same per-prediction
+    markers AND `<workspace>/shard_completed` atomically. It also
+    clears any stale `<no-arg>` failure entry.
+  - `--done` requires EITHER the shard_completed marker OR
+    per-prediction completion markers for every prediction directory
+    under `outputs/`. Flat files at the top of `outputs/` require
+    `shard_completed` (no per-prediction marker applies).
+  - Sentinel-write failures fall through to a global
+    `SENTINEL_WRITE_FAILED` entry; even if THAT also fails, the
+    unreadable-file state itself counts as evidence of unresolved
+    failures.
+- **Example**: `src/vastai_gpu_runner/storage/r2.py`
+  (`_has_unresolved_upload_failures`, `_record_shard_complete`,
+  `_record_prediction_success`, `_clear_shard_complete_marker`).
+- **References**: PR #39.
+
+### boto3 lifecycle contract: LifecycleConfiguration wrapper required
+
+- **Context**: Calling `put_bucket_lifecycle_configuration(Rules=[...])`
+  on a real boto3 client raises `ParamValidationError` before any
+  request leaves the SDK. The correct request shape is
+  `LifecycleConfiguration={"Rules": [...]}`.
+- **Problem**: A test double that accepts the wrong shape masks the
+  bug at the unit-test layer. The production client fails on the
+  first non-no-op apply or remove.
+- **Solution**: Use a real boto3 client wired to `botocore.stub.Stubber`
+  for at least one contract test per mutation path. `Stubber.add_response`
+  validates the parameter names against the service model — any
+  incorrect shape raises before the stub is consulted. The fake
+  `FakeS3` used by the rest of the suite mirrors the real
+  `LifecycleConfiguration=` signature so the two test populations
+  stay consistent.
+- **Example**: `tests/test_r2_lifecycle.py::TestBoto3Contract`.
+- **References**: PR #39.
+
+### Bucket removal: DELETE when no rules remain
+
+- **Context**: Cloudflare R2 / S3 reject `put_bucket_lifecycle_configuration`
+  with an empty `Rules` array — a lifecycle configuration must
+  contain at least one rule.
+- **Problem**: `remove()` that always PUTs the post-state fails when
+  the managed rule was the only rule on the bucket.
+- **Solution**: Branch on the post-removal state. If any rules
+  remain, `put_bucket_lifecycle_configuration`. If none remain,
+  `delete_bucket_lifecycle`. Both paths still re-read after the
+  mutation for verification.
+- **Example**: `src/vastai_gpu_runner/storage/r2_lifecycle.py::remove`
+  + `_delete_lifecycle`.
+- **References**: PR #39.
