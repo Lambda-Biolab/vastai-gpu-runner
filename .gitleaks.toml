@@ -1,0 +1,82 @@
+# gitleaks config for vastai-gpu-runner
+#
+# Goals:
+# 1. Catch real R2 / S3 / cloud provider secret keys (the access key
+#    the screenshot shared this week was visible to the security
+#    bot's regex matcher, not the literal secret — but the pattern
+#    was still a real footgun we want to flag).
+# 2. Flag any Python f-string that interpolates a *_SECRET_*-named
+#    env var into a string. This is the pattern that, if the env
+#    var is ever set to a literal value, would produce a string
+#    containing the secret. It is the only safe way to catch that
+#    footgun at static-analysis time without running the code.
+# 3. Allowlist the existing fixture strings (R2_ENDPOINT host,
+#    VASTAI_API_KEY example values, etc.) so the scanner does not
+#    fire on every commit.
+#
+# Reference: https://github.com/gitleaks/gitleaks
+
+title = "vastai-gpu-runner secret detection"
+
+# Use the gitleaks default rules (AWS, GCP, GitHub, Stripe, etc.)
+# as a baseline.
+[extend]
+useDefault = true
+
+# -----------------------------------------------------------------------------
+# Custom rule: f-string interpolation of a *_SECRET_* env var.
+# -----------------------------------------------------------------------------
+# The access key leaked this week was technically not in a commit —
+# it was in a Python f-string that READS the secret from
+# ``os.environ`` at runtime. If the env var is ever set to a literal
+# value, the resulting string contains the secret. The pattern is
+# the only safe way to catch this at static-analysis time.
+[[rules]]
+id = "python-fstring-secret-env-var"
+description = "Python f-string interpolating a *_SECRET_* env var"
+# Match common f-string interpolation patterns. The actual env-var
+# NAME detection is the keywords list (and the high-entropy check).
+regex = '''(?i)f['"][^'"]*\{[^}]*SECRET[^}]*\}[^'"]*['"]'''
+keywords = [
+    "secret",
+    "SECRET_ACCESS_KEY",
+    "SECRET_KEY",
+    "R2_ADMIN_SECRET",
+    "R2_SECRET",
+    "AWS_SECRET",
+    "VASTAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+]
+entropy = 3.5
+
+# -----------------------------------------------------------------------------
+# Allowlist: documented fixtures and false-positive anchors.
+# -----------------------------------------------------------------------------
+[allowlist]
+description = "general allowlist"
+# We allowlist specific test fixture files; not the whole tests/ tree.
+# The f-string rule still fires on the pattern, which is the right
+# signal even when the value is fake.
+regexes = [
+    # The Vast.ai API key documentation example.
+    '''VASTAI_API_KEY="topsecret"''',
+    '''VASTAI_API_KEY="topsecret_value"''',
+    # The R2 worker/admin credential docstring example.
+    '''R2_ADMIN_SECRET_ACCESS_KEY="test-secret-fixture"''',
+    # Sentinel test sentinel name strings.
+    '''SENTINEL_WRITE_FAILED''',
+    # A plain literal sentinel-name string.
+    '''"SENTINEL_WRITE_FAILED\\t"''',
+]
+
+# Stop-words: gitleaks allows substrings that should always be
+# considered safe (they make a match false-positive-prone).
+stopwords = [
+    "no_secret",
+    "secret_key_redacted",
+    "secret_access_key_redacted",
+    # The dataclass default is sentinel "<redacted>"; the docstring
+    # has the literal "<redacted>". Let it pass.
+    "<redacted>",
+]
