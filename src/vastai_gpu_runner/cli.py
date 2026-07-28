@@ -685,10 +685,6 @@ def _build_batch_summary(
     }
 
 
-if __name__ == "__main__":
-    app()
-
-
 # ---------------------------------------------------------------------------
 # r2-lifecycle — bucket lifecycle administration (sub-app)
 # ---------------------------------------------------------------------------
@@ -699,3 +695,7 @@ if __name__ == "__main__":
 from vastai_gpu_runner.cli_r2_lifecycle import app as _r2_lifecycle_app  # noqa: E402
 
 app.add_typer(_r2_lifecycle_app, name="r2-lifecycle")
+
+
+if __name__ == "__main__":
+    app()
