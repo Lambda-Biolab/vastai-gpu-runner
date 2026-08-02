@@ -44,7 +44,14 @@ class CloudRunner:
     # -- Provider-specific methods (override in subclasses) ----------------
 
     def search_offers(self, **kwargs: object) -> list[dict[str, object]]:
-        """Search for GPU offers matching the deployment config."""
+        """Search for GPU offers matching the deployment config.
+
+        The base class signature uses ``**kwargs: object`` so test
+        doubles (subclassed ``CloudRunner``) can override this
+        method without needing to replicate the keyword arguments.
+        Subclasses should keep the ``**kwargs`` parameter for
+        signature compatibility.
+        """
         return []
 
     def create_instance(self, offer: Mapping[str, object]) -> CloudInstance:

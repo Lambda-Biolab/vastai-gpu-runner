@@ -38,7 +38,7 @@ import json
 import random
 import threading
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -350,7 +350,7 @@ class StressCloudRunner(CloudRunner):
             StressCloudRunner._id_counter += 1
             self._runner_id = f"runner-{StressCloudRunner._id_counter}"
 
-    def search_offers(self) -> list[dict[str, object]]:
+    def search_offers(self, **kwargs: object) -> list[dict[str, object]]:
         """Return a single deterministic cheap offer."""
         # Mimic a real Vast.ai RTX 3060 offer (cheapest available).
         return [
@@ -375,7 +375,7 @@ class StressCloudRunner(CloudRunner):
         local_output_dir: Path,
         *,
         max_retries: int = 3,
-        offers: list[dict[str, object]] | None = None,
+        offers: Sequence[Mapping[str, object]] | None = None,
         used_machine_ids: set[str] | None = None,
         machine_lock: threading.Lock | object | None = None,
     ) -> DeploymentResult:
