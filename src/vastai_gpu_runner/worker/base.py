@@ -242,7 +242,7 @@ class BaseWorker(ABC):
             # (parsed.hostname == endpoint_host). The request can
             # only ever hit console.vast.ai regardless of
             # instance_id/api_key contents.
-            req = urllib.request.Request(url, method="DELETE")  # nosec B310  # noqa: S310
+            req = urllib.request.Request(url, method="DELETE")  # nosec B310
             urllib.request.urlopen(req, timeout=15)  # nosec B310  # noqa: S310
             logger.info("Self-destruct: instance %s destroyed", instance_id)
         except Exception as exc:
