@@ -291,8 +291,7 @@ def _orch(
     """Factory for ConcreteOrchestrator with safe defaults."""
     return ConcreteOrchestrator(
         units=units or [],
-        runner_factory=runner_factory
-        or _mock_runner_factory(deploy_result=_ok_result()),
+        runner_factory=runner_factory or _mock_runner_factory(deploy_result=_ok_result()),
         label_prefix=label_prefix,
         workspace_dir=workspace_dir,
         r2_sink=r2_sink,

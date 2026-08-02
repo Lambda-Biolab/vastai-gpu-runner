@@ -403,9 +403,7 @@ def main() -> int:
         DEADLINE_SECONDS,
         int((BUDGET_USD / max(hourly_rate, 0.01)) * 3600),
     )
-    last_offer_rate = float(
-        cast("dict[str, float]", candidate_offers[-1])["dph_total"]
-    )
+    last_offer_rate = float(cast("dict[str, float]", candidate_offers[-1])["dph_total"])
     print(
         f"[stress] {len(candidate_offers)} candidate offers "
         f"(${hourly_rate:.4f}/hr .. ${last_offer_rate:.4f}/hr); "

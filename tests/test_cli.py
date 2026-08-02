@@ -628,9 +628,7 @@ class _FakeS3Lifecycle:
         # boto3's response shape is dict[str, object] under the hood,
         # but tests pass narrower dict types (e.g. dict[str, str]) for
         # convenience. Accept any mapping and coerce on storage.
-        self.rules: list[dict[str, object]] = [
-            cast("dict[str, object]", r) for r in (rules or [])
-        ]
+        self.rules: list[dict[str, object]] = [cast("dict[str, object]", r) for r in (rules or [])]
         self.put_calls: list[list[dict[str, object]]] = []
         self.delete_calls = 0
         self.fail_get: Exception | None = None
