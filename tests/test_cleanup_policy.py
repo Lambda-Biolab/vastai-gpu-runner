@@ -1,4 +1,4 @@
-# pyright: reportPrivateUsage=warning, reportMissingParameterType=warning, reportUnusedFunction=false, reportUnusedClass=false
+# pyright: reportPrivateUsage=warning, reportMissingParameterType=warning, reportUnusedFunction=false, reportUnusedClass=false, reportCallIssue=false
 """Tests for cleanup_policy — provider-agnostic DTOs + generic policy.
 
 Per docs/architecture-v4-cleanup-policy.md migration step 2.
@@ -347,7 +347,7 @@ class TestProviderCleanupPolicyConstruction:
     def test_kw_only(self) -> None:
         # Positional construction should fail because of kw_only=True.
         with pytest.raises(TypeError):
-            ProviderCleanupPolicy(  # type: ignore[reportCallIssue]
+            ProviderCleanupPolicy(
                 Provider.VASTAI,
                 lambda: [],
                 lambda c: CleanupResult(verdict=CleanupVerdict.DESTROYED),
