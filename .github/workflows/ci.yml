@@ -20,7 +20,10 @@ permissions:
 # - complexity-threshold: 10 (stricter than the standard 15)
 # - extra-test-args: -q --cov --cov-branch --cov-report=term-missing
 #   (coverage is local-machine only, not uploaded)
-# - stress-real-vastai: opt-in real-Vast.ai smoke test
+# - real-Vast.ai + real-R2 stress test lives in
+#   .github/workflows/stress-real.yml (separate workflow, opt-in
+#   via workflow_dispatch or 'stress:run' PR label — costs real
+#   money so it must NEVER run automatically).
 # - concurrency: cancel-in-progress for the same ref
 # - skip codeql on PR (merge-ref SHA race)
 
@@ -59,38 +62,6 @@ jobs:
       - name: Test with coverage
         # Coverage is local-machine only (term-missing), not uploaded.
         run: uv run pytest -q --cov --cov-branch --cov-report=term-missing
-
-  stress-real-vastai:
-    # Opt-in real-Vast.ai smoke test. Skipped unless the repository
-    # has VASTAI_API_KEY configured. The ``tests/stress/test_real_vastai_stress.py``
-    # module is gated on the env var (pytest.skipif) so it auto-skips
-    # when the key is missing. Uses the cheapest RTX 3060 offers on
-    # Vast.ai ($0.0321-$0.05/hr) and a $0.30 budget ceiling.
-    runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
-    env:
-      VASTAI_API_KEY: ${{ secrets.VASTAI_API_KEY }}
-      STRESS_BUDGET_USD: "0.30"
-      STRESS_DEADLINE_SECONDS: "600"
-    steps:
-      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
-      - name: Install uv
-        uses: astral-sh/setup-uv@d269b9917d8e33f7165632f15cc38a13726f64b5 # v9.0.0
-        with:
-          python-version: "3.12"
-          enable-cache: true
-          cache-dependency-glob: "uv.lock"
-      - name: Install dependencies
-        run: uv sync --frozen --dev
-      - name: Real-Vast.ai smoke test (opt-in via VASTAI_API_KEY secret)
-        run: |
-          if [ -n "$VASTAI_API_KEY" ]; then
-            echo "VASTAI_API_KEY set — running real-Vast.ai smoke test"
-            uv run pytest tests/stress/test_real_vastai_stress.py -v
-          else
-            echo "VASTAI_API_KEY not set — skipping (test suite auto-skips without it)"
-            uv run pytest tests/stress/test_real_vastai_stress.py -v --collect-only
-          fi
 
   codeql:
     name: CodeQL

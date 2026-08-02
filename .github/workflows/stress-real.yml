@@ -1,0 +1,128 @@
+name: stress-real
+
+# Real-Vast.ai + real-R2 stress test for the v4 architecture.
+#
+# This is a SEPARATE workflow from the main CI for two reasons:
+# 1. Cost: the test runs against real Vast.ai + R2. Cheapest
+#    RTX 3060 offers on Vast.ai are $0.0321-$0.05/hr, and R2 admin
+#    operations carry (small) costs. The default budget is $0.50
+#    per run. Running this on every PR would add real cost.
+# 2. Time: the PR-39 stress test takes 5-10 minutes. Running it
+#    on every PR would significantly slow down the CI feedback
+#    loop for no real benefit (the unit + integration tests already
+#    cover the fast path).
+#
+# Triggers (all opt-in, no automatic schedule):
+# - workflow_dispatch: manual on-demand (e.g. before a release).
+#   Trigger from the Actions tab on main or any branch.
+# - pull_request with the 'stress:run' label: opt-in per PR.
+#   Add the label to a PR to trigger the test on demand.
+#   Remove the label to cancel.
+#
+# No secrets are hardcoded. All cloud credentials are referenced
+# via ${{ secrets.* }} and must be set at the org level (Settings
+# → Secrets and variables → Actions → Org secrets):
+# - VASTAI_API_KEY: Vast.ai API key with credit.
+# - R2_ENDPOINT, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY: R2
+#   worker credentials (uploader path).
+# - R2_ADMIN_ENDPOINT, R2_ADMIN_ACCESS_KEY_ID,
+#   R2_ADMIN_SECRET_ACCESS_KEY: R2 admin credentials (lifecycle
+#   policy path — separated from worker per least privilege).
+# - R2_BUCKET: a bucket the worker can write to AND the admin can
+#   manage lifecycle on.
+#
+# Without any of these secrets, the workflow runs but the test
+# scripts print a "not set" message and exit cleanly (exit 0).
+# The stress test is NEVER a hard failure of the org's CI; it
+# only fails when the secrets ARE set AND a real cloud bug surfaces.
+# That way the cost is bounded to "we opted in to run this".
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_budget_usd:
+        description: 'Maximum cloud spend (USD)'
+        default: '0.50'
+        required: false
+  pull_request:
+    types: [labeled]
+    # Only run when the 'stress:run' label is added to the PR.
+
+# Never cancel a real-cloud run mid-flight — those are too
+# expensive to retry.
+concurrency:
+  group: stress-real-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  stress-real:
+    name: Real-Vast.ai + real-R2 stress test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+       contains(github.event.pull_request.labels.*.name, 'stress:run'))
+    env:
+      VASTAI_API_KEY: ${{ secrets.VASTAI_API_KEY }}
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_ADMIN_ENDPOINT: ${{ secrets.R2_ADMIN_ENDPOINT }}
+      R2_ADMIN_ACCESS_KEY_ID: ${{ secrets.R2_ADMIN_ACCESS_KEY_ID }}
+      R2_ADMIN_SECRET_ACCESS_KEY: ${{ secrets.R2_ADMIN_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      STRESS_BUDGET_USD: ${{ github.event.inputs.max_budget_usd || '0.50' }}
+      STRESS_DEADLINE_SECONDS: '900'
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.0.0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d269b9917d8e33f7165632f15cc38a13726f64b5 # v9.0.0
+        with:
+          python-version: '3.12'
+          enable-cache: true
+          cache-dependency-glob: 'uv.lock'
+
+      - name: Install dependencies + vastai CLI
+        # vastai CLI is not in pyproject.toml (it's a stress-test
+        # only dep). Install at runtime to keep the production
+        # dependency surface clean.
+        run: |
+          uv sync --frozen --dev
+          uv pip install vastai
+
+      - name: Run cheapest-RTX-3060 deploy + SSH + destroy
+        # The pytest-style smoke test. ~3-5 min on a healthy host
+        # pool, longer if RTX 3060 hosts are flaky. fail-closed on
+        # any boot or SSH failure; cleanup invariant (zero active
+        # instances after destroy) is the hard assertion.
+        run: |
+          if [ -z "${VASTAI_API_KEY:-}" ]; then
+            echo "VASTAI_API_KEY not set — skipping cheapest-RTX-3060 deploy"
+            exit 0
+          fi
+          uv run pytest tests/stress/test_real_vastai_stress.py -v -s
+
+      - name: Run PR-39 r2-lifecycle + worker hardening
+        # The PR-39 stress: deploys multiple RTX 3060 candidates
+        # with the new r2-lifecycle admin operations, exercises
+        # the worker's fail-closed uploader, then tears down. ~5-10
+        # min depending on the candidate pool. Runs as a script
+        # (not pytest) so it can exercise the full CLI lifecycle.
+        # The script exits 1 if the deploy doesn't boot (real
+        # world RTX 3060 hosts are flaky) but still verifies the
+        # teardown invariant.
+        run: |
+          if [ -z "${VASTAI_API_KEY:-}" ]; then
+            echo "VASTAI_API_KEY not set — skipping PR-39 stress"
+            exit 0
+          fi
+          if [ -z "${R2_ADMIN_ENDPOINT:-}" ] || [ -z "${R2_BUCKET:-}" ]; then
+            echo "R2 admin creds / bucket not set — skipping PR-39 stress"
+            exit 0
+          fi
+          uv run python tests/stress/stress_pr39_real_vastai.py
