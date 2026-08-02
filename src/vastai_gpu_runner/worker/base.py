@@ -238,7 +238,7 @@ class BaseWorker(ABC):
             if parsed.hostname != endpoint_host:
                 msg = f"refusing to call non-Vast.ai host: {parsed.hostname!r}"
                 raise ValueError(msg)
-            # bandit B310 / ruff S310: host is verified above
+            # Bandit B310 / ruff S310: host is verified above
             # (parsed.hostname == endpoint_host). The request can
             # only ever hit console.vast.ai regardless of
             # instance_id/api_key contents.

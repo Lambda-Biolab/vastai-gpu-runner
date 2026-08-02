@@ -129,9 +129,9 @@ def _all_units_terminal(units: list[object], terminal_statuses: frozenset[str]) 
 
 def _pre_v4_collection_shapes_ok(data: dict) -> str | None:
     """Return an error string if ``shards``/``jobs`` are not lists/nulls, else None."""
-    if not isinstance(data.get("shards"), (list, type(None))):
+    if not isinstance(data.get("shards"), list | type(None)):
         return "shards must be a list or null in schema_version 0"
-    if not isinstance(data.get("jobs"), (list, type(None))):
+    if not isinstance(data.get("jobs"), list | type(None)):
         return "jobs must be a list or null in schema_version 0"
     return None
 
@@ -252,9 +252,9 @@ def _validate_persisted_schema(data: dict) -> int:
             f"unsupported schema_version {schema_version}; "
             f"expected one of {sorted(_VALID_SCHEMA_VERSIONS)}"
         )
-    if not isinstance(data.get("shards"), (list, type(None))):
+    if not isinstance(data.get("shards"), list | type(None)):
         raise StateMigrationError("persisted shards must be a list or null")
-    if not isinstance(data.get("jobs"), (list, type(None))):
+    if not isinstance(data.get("jobs"), list | type(None)):
         raise StateMigrationError("persisted jobs must be a list or null")
     return schema_version
 
@@ -353,9 +353,7 @@ def _replace_nested_list(
     try:
         state_dict[key] = [dataclass(**item) for item in raw_list_typed]  # type: ignore[operator]
     except (TypeError, ValueError) as exc:
-        raise StateMigrationError(
-            f"could not deserialize {owner_name}.{key}: {exc}"
-        ) from exc
+        raise StateMigrationError(f"could not deserialize {owner_name}.{key}: {exc}") from exc
 
 
 def load_batch_state(state_path: Path, *, state_cls: type[T]) -> T | None:
