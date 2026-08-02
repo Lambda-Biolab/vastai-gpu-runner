@@ -468,7 +468,7 @@ class StressCloudRunner(CloudRunner):
 
 def make_runner_factory(
     behaviors: Sequence[StressBehavior],
-) -> object:
+) -> RunnerFactory:
     """Build a runner factory that hands out a fresh runner per call.
 
     Each call to the returned factory creates a runner with the

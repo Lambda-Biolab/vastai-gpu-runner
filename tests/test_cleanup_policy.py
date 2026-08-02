@@ -347,7 +347,7 @@ class TestProviderCleanupPolicyConstruction:
     def test_kw_only(self) -> None:
         # Positional construction should fail because of kw_only=True.
         with pytest.raises(TypeError):
-            ProviderCleanupPolicy(  # type: ignore[misc]
+            ProviderCleanupPolicy(  # type: ignore[call-arg,misc]
                 Provider.VASTAI,
                 lambda: [],
                 lambda c: CleanupResult(verdict=CleanupVerdict.DESTROYED),

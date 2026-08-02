@@ -897,7 +897,7 @@ class TestZombieSweep:
             cleanup_policy=policy,
         )
         orch._sweep_zombies()
-        assert policy._test_list_invocations() == 1
+        assert policy._test_list_invocations() == 1  # type: ignore[attr-defined]
 
     def test_sweep_filters_by_delimited_scope(self) -> None:
         """Only candidates with ``label.startswith(f"{label_prefix}-")`` are destroyed.

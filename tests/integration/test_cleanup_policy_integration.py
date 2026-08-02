@@ -432,8 +432,11 @@ class TestDestroyFnReturnsNone:
     def test_orchestrator_substitutes_unknown_with_diagnostic(self) -> None:
         c = _candidate("i1")
 
-        def _destroy(candidate: InstanceCandidate) -> None:
-            return None
+        def _destroy(candidate: InstanceCandidate) -> CleanupResult:
+            # Returns None to test the boundary's invalid-result check.
+            # pyright can't follow the intent — None is not assignable
+            # to CleanupResult, but that's the whole point of the test.
+            return None  # type: ignore[return-value]
 
         policy = ProviderCleanupPolicy(
             provider=Provider.VASTAI,

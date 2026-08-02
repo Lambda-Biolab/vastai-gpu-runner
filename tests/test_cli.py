@@ -17,6 +17,7 @@ from unittest.mock import patch
 
 from typer.testing import CliRunner
 
+from vastai_gpu_runner.cleanup_policy import InstanceCandidate
 from vastai_gpu_runner.cli import app
 from vastai_gpu_runner.providers.destroy_adapters.vastai import (
     CredentialResolution,
@@ -163,7 +164,7 @@ class TestCleanupCommand:
         )
 
     @staticmethod
-    def _patched_policy(candidates: list[object]) -> object:
+    def _patched_policy(candidates: list[InstanceCandidate]) -> object:
         """Patch ``build_vastai_cleanup_policy`` so the candidates list is fed in."""
         from vastai_gpu_runner.cleanup_policy import (
             CleanupResult,
@@ -172,10 +173,10 @@ class TestCleanupCommand:
             ProviderCleanupPolicy,
         )
 
-        def _list() -> list[object]:
+        def _list() -> list[InstanceCandidate]:
             return list(candidates)
 
-        def _destroy(candidate: object) -> CleanupResult:
+        def _destroy(candidate: InstanceCandidate) -> CleanupResult:
             return CleanupResult(verdict=CleanupVerdict.DESTROYED)
 
         return ProviderCleanupPolicy(
@@ -201,7 +202,7 @@ class TestCleanupCommand:
 
     def test_accepts_canonical_scope(self) -> None:
         c = self._v4_candidate("i1", "prod-3f9a1b2c4d5e-deadbeef")
-        policy = self._patched_policy([c])
+        policy = self._patched_policy(cast("list[InstanceCandidate]", [c]))
         with (
             patch(
                 "vastai_gpu_runner.providers.destroy_adapters.vastai.read_vastai_api_key",
@@ -221,7 +222,7 @@ class TestCleanupCommand:
 
     def test_dry_run_does_not_destroy(self) -> None:
         c = self._v4_candidate("i1", "prod-3f9a1b2c4d5e-deadbeef")
-        policy = self._patched_policy([c])
+        policy = self._patched_policy(cast("list[InstanceCandidate]", [c]))
         with (
             patch(
                 "vastai_gpu_runner.providers.destroy_adapters.vastai.read_vastai_api_key",
@@ -249,10 +250,10 @@ class TestCleanupCommand:
             ProviderCleanupPolicy,
         )
 
-        def _list() -> list[object]:
-            return [c1, c2]
+        def _list() -> list[InstanceCandidate]:
+            return cast("list[InstanceCandidate]", [c1, c2])
 
-        def _destroy(candidate: object) -> CleanupResult:
+        def _destroy(candidate: InstanceCandidate) -> CleanupResult:
             # OwnershipPolicy with empty set refuses every image.
             return CleanupResult(
                 refusal=CleanupRefusal.OWNERSHIP,
@@ -310,7 +311,7 @@ class TestCleanupCommand:
     def test_delimiter_safety(self) -> None:
         """``prod-3f9a1b2c4d5eevil-...`` does NOT match canonical scope ``prod-3f9a1b2c4d5e``."""
         evil = self._v4_candidate("i1", "prod-3f9a1b2c4d5eevil-abcdef012345")
-        policy = self._patched_policy([evil])
+        policy = self._patched_policy(cast("list[InstanceCandidate]", [evil]))
         with (
             patch(
                 "vastai_gpu_runner.providers.destroy_adapters.vastai.read_vastai_api_key",
@@ -330,7 +331,7 @@ class TestCleanupCommand:
     def test_adjacent_scopes_match_broadly(self) -> None:
         """``--allow-adjacent-scopes`` enables broad prefix matching (DANGEROUS)."""
         evil = self._v4_candidate("i1", "prod-3f9a1b2c4d5eevil-abcdef012345")
-        policy = self._patched_policy([evil])
+        policy = self._patched_policy(cast("list[InstanceCandidate]", [evil]))
         with (
             patch(
                 "vastai_gpu_runner.providers.destroy_adapters.vastai.read_vastai_api_key",
@@ -369,10 +370,10 @@ class TestCleanupCommand:
             "i2": CleanupResult(verdict=CleanupVerdict.ALREADY_GONE),
         }
 
-        def _list() -> list[object]:
-            return [c1, c2]
+        def _list() -> list[InstanceCandidate]:
+            return cast("list[InstanceCandidate]", [c1, c2])
 
-        def _destroy(candidate: object) -> CleanupResult:
+        def _destroy(candidate: InstanceCandidate) -> CleanupResult:
             return responses[candidate.instance_id]  # type: ignore[attr-defined]
 
         policy = ProviderCleanupPolicy(
@@ -650,8 +651,12 @@ class _FakeS3Lifecycle:
         if self.fail_put is not None:
             raise self.fail_put
         rules = LifecycleConfiguration.get("Rules", [])
-        self.put_calls.append(list(rules))
-        self.rules = list(rules)
+        # pyright's list invariance means we can't cast a list[Any]
+        # to list[dict[str, object]] directly. The runtime value is
+        # boto3-shaped (list[dict[str, object]]) and tests pass that
+        # shape, so the cast is safe.
+        self.put_calls.append(rules)  # type: ignore[arg-type]
+        self.rules = rules  # type: ignore[assignment]
         return {}
 
     def delete_bucket_lifecycle(self, *, Bucket: str) -> dict[str, object]:  # noqa: N803

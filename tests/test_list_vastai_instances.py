@@ -309,7 +309,7 @@ class TestListVastaiInstancesRecordValidation:
         self, source_field: str, candidate_attr: str
     ) -> None:
         kwargs = {"image_uuid": "img", "label": "prod", "actual_status": "running"}
-        kwargs[source_field] = None
+        kwargs[source_field] = None  # type: ignore[assignment]
         with patch("vastai_gpu_runner.providers.vastai._list_vastai_instances_cli") as cli_mock:
             cli_mock.return_value = [_inst(**kwargs)]
             result = list_vastai_instances(credentials=self._creds())
