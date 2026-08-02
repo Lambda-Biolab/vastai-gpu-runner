@@ -59,6 +59,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
@@ -397,14 +398,17 @@ def main() -> int:
     if not candidate_offers:
         print("no RTX 3060 offers available")
         return 1
-    hourly_rate = float(candidate_offers[0]["dph_total"])
+    hourly_rate = float(cast("dict[str, float]", candidate_offers[0])["dph_total"])
     max_runtime_seconds = min(
         DEADLINE_SECONDS,
         int((BUDGET_USD / max(hourly_rate, 0.01)) * 3600),
     )
+    last_offer_rate = float(
+        cast("dict[str, float]", candidate_offers[-1])["dph_total"]
+    )
     print(
         f"[stress] {len(candidate_offers)} candidate offers "
-        f"(${hourly_rate:.4f}/hr .. ${float(candidate_offers[-1]['dph_total']):.4f}/hr); "
+        f"(${hourly_rate:.4f}/hr .. ${last_offer_rate:.4f}/hr); "
         f"budget=${BUDGET_USD:.2f} ({max_runtime_seconds}s ceiling)"
     )
 
@@ -550,8 +554,9 @@ def main() -> int:
         for attempt_idx, offer in enumerate(candidate_offers, start=1):
             if _deadline_exceeded(start):
                 break
-            try_id = int(offer["id"])
-            try_rate = float(offer["dph_total"])
+            offer_dict = cast("dict[str, float]", offer)
+            try_id = int(offer_dict["id"])
+            try_rate = float(offer_dict["dph_total"])
             print(
                 f"[stress] attempt {attempt_idx}/{len(candidate_offers)}: "
                 f"offer id={try_id} ${try_rate:.4f}/hr"
@@ -589,6 +594,7 @@ def main() -> int:
             # tests/stress/test_real_vastai_stress.py).
         else:
             instance = deploy_result.instance
+            assert instance is not None
             print(
                 f"[stress] deployed {instance.instance_id} "
                 f"({instance.ssh_host}:{instance.ssh_port})"

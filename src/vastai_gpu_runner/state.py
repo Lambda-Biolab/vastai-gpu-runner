@@ -44,7 +44,9 @@ import time
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import ClassVar
+from typing import ClassVar, TypeVar
+
+T = TypeVar("T")
 
 logger = logging.getLogger(__name__)
 
@@ -326,7 +328,7 @@ def _hydrate_nested_units(state: object, data: dict) -> object:
     return state
 
 
-def load_batch_state(state_path: Path, *, state_cls: type) -> object:
+def load_batch_state(state_path: Path, *, state_cls: type[T]) -> T | None:
     """Load a v4 BatchState/JobBatchState or raise ``StateMigrationError``.
 
     The legacy ``load_or_none`` helper always returns ``None`` on any

@@ -10,7 +10,9 @@ with mocked ``vastai_cmd`` and ``read_vastai_api_key`` boundaries.
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from pathlib import Path
+from typing import Any, cast
 from unittest.mock import patch
 
 from typer.testing import CliRunner
@@ -618,8 +620,16 @@ def _empty_vastai_config() -> object:
 class _FakeS3Lifecycle:
     """Minimal S3 client that records lifecycle calls."""
 
-    def __init__(self, rules: list[dict[str, object]] | None = None) -> None:
-        self.rules: list[dict[str, object]] = list(rules or [])
+    def __init__(
+        self,
+        rules: Sequence[dict[str, Any]] | None = None,
+    ) -> None:
+        # boto3's response shape is dict[str, object] under the hood,
+        # but tests pass narrower dict types (e.g. dict[str, str]) for
+        # convenience. Accept any mapping and coerce on storage.
+        self.rules: list[dict[str, object]] = [
+            cast("dict[str, object]", r) for r in (rules or [])
+        ]
         self.put_calls: list[list[dict[str, object]]] = []
         self.delete_calls = 0
         self.fail_get: Exception | None = None

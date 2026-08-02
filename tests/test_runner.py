@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 from unittest.mock import MagicMock
 
 from vastai_gpu_runner.runner import CloudRunner
@@ -68,7 +69,7 @@ class TestCloudRunner:
         ]
         result = runner.run_full_cycle({}, Path("/tmp/test"), offers=offers)
         assert result.success is True
-        runner.destroy_instance.assert_called_once_with(inst1)
+        cast("MagicMock", runner.destroy_instance).assert_called_once_with(inst1)
 
     def test_machine_dedup(self) -> None:
         """Skips machines already claimed by other threads."""
@@ -231,10 +232,10 @@ class TestCaptureDeployFailureDiagnostics:
         args = runner.capture_deploy_failure_diagnostics.call_args
         assert args.args[0] is inst
         assert "Boot timeout" in args.args[1]
-        runner.destroy_instance.assert_called_once_with(inst)
+        cast("MagicMock", runner.destroy_instance).assert_called_once_with(inst)
         # Verify order: diagnostic hook fires before destroy on SAME attempt
         hook_call_num = runner.capture_deploy_failure_diagnostics.call_args_list[0]
-        destroy_call_num = runner.destroy_instance.call_args_list[0]
+        destroy_call_num = cast("MagicMock", runner.destroy_instance).call_args_list[0]
         assert hook_call_num is not None
         assert destroy_call_num is not None
 
@@ -284,7 +285,7 @@ class TestCaptureDeployFailureDiagnostics:
         offers = [{"id": "1", "machine_id": "m1"}]
         runner.run_full_cycle({}, Path("/tmp/test"), offers=offers, max_retries=1)
 
-        runner.destroy_instance.assert_called_once_with(inst)
+        cast("MagicMock", runner.destroy_instance).assert_called_once_with(inst)
 
     def test_hook_not_called_on_success(self) -> None:
         """Diagnostics only fire on failure."""

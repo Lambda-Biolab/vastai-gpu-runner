@@ -223,7 +223,7 @@ class BaseWorker(ABC):
 
         try:
             url = f"https://console.vast.ai/api/v0/instances/{instance_id}/?api_key={api_key}"
-            req = urllib.request.Request(url, method="DELETE")  # noqa: S310
+            req = urllib.request.Request(url, method="DELETE")
             urllib.request.urlopen(req, timeout=15)  # noqa: S310
             logger.info("Self-destruct: instance %s destroyed", instance_id)
         except Exception as exc:

@@ -30,6 +30,7 @@ import json
 import os
 import time
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -150,7 +151,7 @@ def test_real_rtx_3060_deploy_ssh_destroy(
     if offer is None:
         pytest.skip("no RTX 3060 offers available")
 
-    hourly_rate = float(offer["dph_total"])
+    hourly_rate = float(cast("dict[str, float]", offer)["dph_total"])
     max_runtime_seconds = min(
         _DEADLINE_SECONDS,
         int((STRESS_BUDGET_USD / max(hourly_rate, 0.01)) * 3600),

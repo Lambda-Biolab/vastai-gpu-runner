@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from unittest.mock import MagicMock
 
-from vastai_gpu_runner.batch import BatchOrchestrator, FailureVerdict
+from vastai_gpu_runner.batch import BatchOrchestrator, FailureVerdict, RunnerFactory
 from vastai_gpu_runner.cleanup_policy import (
     CleanupResult,
     CleanupVerdict,
@@ -21,6 +21,8 @@ from vastai_gpu_runner.cleanup_policy import (
     Provider,
     ProviderCleanupPolicy,
 )
+from vastai_gpu_runner.runner import CloudRunner
+from vastai_gpu_runner.storage.r2 import R2Sink
 from vastai_gpu_runner.types import CloudInstance
 
 
@@ -41,6 +43,25 @@ class FakeUnit:
     events: list[str] = field(default_factory=list)
 
 
+def _noop_runner_factory() -> CloudRunner:
+    """Build a factory returning a single MagicMock CloudRunner.
+
+    Used as the default when FakeOrchestrator is constructed without
+    an explicit runner_factory. Returns a no-op mock so tests that
+    don't exercise the runner don't need to wire one.
+    """
+    runner = MagicMock()
+    runner.run_full_cycle = MagicMock(
+        return_value=MagicMock(
+            success=True,
+            instance=CloudInstance(instance_id="noop"),
+        )
+    )
+    runner.check_progress = MagicMock(return_value={"running": True, "complete": False})
+    runner.destroy_instance = MagicMock(return_value=True)
+    return runner
+
+
 class FakeOrchestrator(BatchOrchestrator[FakeUnit]):
     """Minimal concrete orchestrator for v4 tests.
 
@@ -53,15 +74,38 @@ class FakeOrchestrator(BatchOrchestrator[FakeUnit]):
         self,
         units: list[FakeUnit],
         cleanup_policy: ProviderCleanupPolicy | None = None,
-        **kwargs: object,
+        *,
+        runner_factory: RunnerFactory = _noop_runner_factory,
+        label_prefix: str = "test",
+        workspace_dir: str = "/tmp/test",
+        r2_sink: R2Sink | None = None,
+        r2_batch_id: str = "test-batch",
+        budget_usd: float = 0.0,
+        max_retries: int = 2,
+        max_parallel_deploys: int = 1,
+        max_parallel_collects: int = 1,
+        poll_interval_seconds: int = 30,
+        zombie_sweep_every_n_cycles: int = 5,
+        poll_timeout_seconds: float = 0.0,
     ) -> None:
         self.units = units
         self.state_saves = 0
         self.payload_builds: list[str] = []
         self.collect_calls: list[str] = []
-        super().__init__(  # type: ignore[arg-type]
+        super().__init__(
+            runner_factory=runner_factory,
+            label_prefix=label_prefix,
             cleanup_policy=cleanup_policy or _noop_cleanup_policy(),
-            **kwargs,
+            workspace_dir=workspace_dir,
+            r2_sink=r2_sink,
+            r2_batch_id=r2_batch_id,
+            budget_usd=budget_usd,
+            max_retries=max_retries,
+            max_parallel_deploys=max_parallel_deploys,
+            max_parallel_collects=max_parallel_collects,
+            poll_interval_seconds=poll_interval_seconds,
+            zombie_sweep_every_n_cycles=zombie_sweep_every_n_cycles,
+            poll_timeout_seconds=poll_timeout_seconds,
         )
 
     def iter_pending_units(self) -> Iterable[FakeUnit]:
