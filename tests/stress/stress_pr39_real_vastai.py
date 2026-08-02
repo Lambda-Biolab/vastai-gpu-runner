@@ -418,6 +418,9 @@ def main() -> int:
     # ----------------------------------------------------------------
     print("\n[stress] === Phase 1: r2-lifecycle admin scenarios ===")
 
+    # NB: CodeQL flags this write_text as a "clear-text storage of
+    # sensitive information" alert. The opt-in is recorded in
+    # .codeqlignore at the repo root with the rationale.
     admin_creds_file = Path(tempfile.mkdtemp(prefix="admin_creds_")) / "creds"
     admin_creds_file.write_text(
         f'export R2_ADMIN_ENDPOINT="{os.environ["R2_ADMIN_ENDPOINT"]}"\n'
