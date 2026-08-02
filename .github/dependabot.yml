@@ -9,7 +9,6 @@ updates:
       prefix: "chore(deps)"
     labels:
       - "dependencies"
-      - "python"
     groups:
       python-deps:
         patterns: ["*"]
@@ -22,7 +21,7 @@ updates:
       prefix: "chore(ci)"
     labels:
       - "dependencies"
-      - "github-actions"
+      - "github_actions"
     groups:
       github-actions:
         patterns: ["*"]
