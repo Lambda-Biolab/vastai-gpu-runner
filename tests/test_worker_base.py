@@ -1,4 +1,4 @@
-# pyright: reportPrivateUsage=warning, reportMissingParameterType=warning
+# pyright: reportPrivateUsage=warning, reportMissingParameterType=warning, reportUnusedFunction=false, reportUnusedClass=false
 """Tests for worker base class and health checks."""
 
 from __future__ import annotations

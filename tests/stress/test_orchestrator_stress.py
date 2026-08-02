@@ -1,4 +1,4 @@
-# pyright: reportPrivateUsage=warning, reportMissingParameterType=warning
+# pyright: reportPrivateUsage=warning, reportMissingParameterType=warning, reportUnusedFunction=false, reportUnusedClass=false
 """End-to-end v4 BatchOrchestrator stress tests.
 
 These tests exercise the FULL ``BatchOrchestrator.run()`` lifecycle

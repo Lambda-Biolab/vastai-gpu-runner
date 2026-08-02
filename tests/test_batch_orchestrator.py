@@ -1,4 +1,4 @@
-# pyright: reportPrivateUsage=warning, reportMissingParameterType=warning
+# pyright: reportPrivateUsage=warning, reportMissingParameterType=warning, reportUnusedFunction=false, reportUnusedClass=false
 """Comprehensive tests for BatchOrchestrator ABC concrete methods.
 
 Covers the full lifecycle: instance-loss state machine, resume, deploy,

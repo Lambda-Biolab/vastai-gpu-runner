@@ -1,4 +1,4 @@
-# pyright: reportPrivateUsage=warning, reportMissingParameterType=warning
+# pyright: reportPrivateUsage=warning, reportMissingParameterType=warning, reportUnusedFunction=false, reportUnusedClass=false
 """End-to-end real-Vast.ai + real-R2 stress test for PR #39.
 
 Exercises the v4 deploy path AND the new ``r2-lifecycle`` CLI AND

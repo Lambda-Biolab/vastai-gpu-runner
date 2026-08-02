@@ -1,4 +1,4 @@
-# pyright: reportPrivateUsage=warning, reportMissingParameterType=warning
+# pyright: reportPrivateUsage=warning, reportMissingParameterType=warning, reportUnusedFunction=false, reportUnusedClass=false
 """Tests for providers.vastai.list_vastai_instances — credential-aware enumeration.
 
 Per docs/architecture-v4-cleanup-policy.md migration step 3

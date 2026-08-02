@@ -1,4 +1,4 @@
-# pyright: reportPrivateUsage=warning, reportMissingParameterType=warning
+# pyright: reportPrivateUsage=warning, reportMissingParameterType=warning, reportUnusedFunction=false, reportUnusedClass=false
 """Tests for cleanup_policy — provider-agnostic DTOs + generic policy.
 
 Per docs/architecture-v4-cleanup-policy.md migration step 2.

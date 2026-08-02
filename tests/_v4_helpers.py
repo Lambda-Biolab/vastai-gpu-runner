@@ -1,4 +1,4 @@
-# pyright: reportPrivateUsage=warning, reportMissingParameterType=warning
+# pyright: reportPrivateUsage=warning, reportMissingParameterType=warning, reportUnusedFunction=false, reportUnusedClass=false
 """Shared test helpers for v4 integration tests.
 
 The ``FakeOrchestrator`` and ``_noop_cleanup_policy`` / ``_recording_cleanup_policy``
