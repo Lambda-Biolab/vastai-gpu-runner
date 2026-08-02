@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
 
-      - uses: github/codeql-action/init@3434fbbc53af0fe47685ef3897703b39ef77b5cb # v4
+      - uses: github/codeql-action/init@1cd4d01d58f636bbdbffbfd3c121b3446d07e9f3 # v4
         with:
           # `build-mode: none` is the canonical mode for interpreted
           # languages (Python, Ruby, JavaScript/TypeScript) —
@@ -54,7 +54,7 @@ jobs:
 
       - name: Perform CodeQL Analysis
         id: analyze
-        uses: github/codeql-action/analyze@3434fbbc53af0fe47685ef3897703b39ef77b5cb # v4
+        uses: github/codeql-action/analyze@1cd4d01d58f636bbdbffbfd3c121b3446d07e9f3 # v4
         with:
           output: sarif-results
 
