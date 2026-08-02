@@ -1,59 +1,63 @@
 name: CI
 
-on:
+"on":
   push:
     branches: [main]
     tags: ["v*"]
   pull_request:
     branches: [main]
+  schedule:
+    - cron: "27 11 * * 0"
   workflow_dispatch:
 
 permissions:
   contents: read
+
+# Standard Python project CI bundle, vastai-gpu-runner flavor.
+# Mirrors templates/python-repo/.github/workflows/ci.yml with
+# vastai-gpu-runner-specific bits:
+# - python-versions matrix: ['3.11', '3.12']
+# - complexity-threshold: 10 (stricter than the standard 15)
+# - extra-test-args: -q --cov --cov-branch --cov-report=term-missing
+#   (coverage is local-machine only, not uploaded)
+# - stress-real-vastai: opt-in real-Vast.ai smoke test
+# - concurrency: cancel-in-progress for the same ref
+# - skip codeql on PR (merge-ref SHA race)
 
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  lint-and-test:
+  lint-type-test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     strategy:
       matrix:
         python-version: ["3.11", "3.12"]
-
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
-
       - name: Install uv
         uses: astral-sh/setup-uv@d269b9917d8e33f7165632f15cc38a13726f64b5 # v9.0.0
         with:
           python-version: ${{ matrix.python-version }}
           enable-cache: true
           cache-dependency-glob: "uv.lock"
-
       - name: Install dependencies
         run: uv sync --frozen --dev
-
-      - name: Lint with ruff
-        run: |
-          uv run ruff format --check src/ tests/
-          uv run ruff check src/ tests/
-
-      - name: Type check with pyright
-        # Tests are first-class code — caught here so the gate stays
-        # in sync with the opencode-config standard. [tool.pyright].include
-        # in pyproject.toml already includes "tests".
+      - name: Format check
+        run: uv run ruff format --check src/ tests/
+      - name: Lint
+        run: uv run ruff check src/ tests/
+      - name: Type check
+        # Tests are first-class code.
         run: uv run pyright src/ tests/
-
-      - name: Check complexity
+      - name: Complexity gate
+        # vastai-gpu-runner uses a stricter 10 (vs standard 15).
         run: uv run complexipy src/ --max-complexity-allowed 10
-
-      - name: Run tests with coverage
-        # Coverage is generated locally (term-missing report) so
-        # contributors can spot uncovered lines on their own
-        # machines. We do not upload to any external service —
-        # coverage stays a local-machine signal.
+      - name: Test with coverage
+        # Coverage is local-machine only (term-missing), not uploaded.
         run: uv run pytest -q --cov --cov-branch --cov-report=term-missing
 
   stress-real-vastai:
@@ -70,17 +74,14 @@ jobs:
       STRESS_DEADLINE_SECONDS: "600"
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
-
       - name: Install uv
         uses: astral-sh/setup-uv@d269b9917d8e33f7165632f15cc38a13726f64b5 # v9.0.0
         with:
           python-version: "3.12"
           enable-cache: true
           cache-dependency-glob: "uv.lock"
-
       - name: Install dependencies
         run: uv sync --frozen --dev
-
       - name: Real-Vast.ai smoke test (opt-in via VASTAI_API_KEY secret)
         run: |
           if [ -n "$VASTAI_API_KEY" ]; then
@@ -90,3 +91,63 @@ jobs:
             echo "VASTAI_API_KEY not set — skipping (test suite auto-skips without it)"
             uv run pytest tests/stress/test_real_vastai_stress.py -v --collect-only
           fi
+
+  codeql:
+    name: CodeQL
+    if: github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+      - uses: github/codeql-action/init@e296a935590eb16afc0c0108289f68c87e2a89a5 # v4.30.7
+        with:
+          languages: python
+          build-mode: none
+      - name: Perform CodeQL Analysis
+        id: analyze
+        uses: github/codeql-action/analyze@e296a935590eb16afc0c0108289f68c87e2a89a5 # v4.30.7
+        with:
+          output: sarif-results
+
+  mutation:
+    name: Weekly Mutation Testing
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+      - uses: astral-sh/setup-uv@d269b9917d8e33f7165632f15cc38a13726f64b5 # v9.0.0
+      - run: uv python install 3.12
+      - run: uv sync --frozen --dev
+      - run: uv pip install mutmut
+      - run: uv run mutmut run --max-children=4
+
+  sbom:
+    name: Generate SBOM
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+      - uses: qte77/gha-sbom-action@cd873b1278a6793a99cfe199c01d603d72cca717 # v0.1.1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+  links:
+    name: Link Checker
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+      - uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
+        with:
+          args: "--config .lychee.toml ."
+          fail: true
