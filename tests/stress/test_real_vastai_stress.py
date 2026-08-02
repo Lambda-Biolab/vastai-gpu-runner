@@ -352,7 +352,6 @@ def test_real_cheapest_rtx_3060_visible_to_v4_policy() -> None:
 
 
 def make_deployment_config() -> DeploymentConfig:
-
     """Build a minimal real ``DeploymentConfig`` for VastaiRunner.
 
     The v4 VastaiRunner requires a real ``DeploymentConfig`` (not a
