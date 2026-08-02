@@ -127,11 +127,19 @@ class R2Sink:
         Returns:
             List of downloaded file paths (relative to local_dir).
         """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
         local_dir.mkdir(parents=True, exist_ok=True)
         prefix = f"{self.shard_prefix(batch_id, shard_id)}outputs/"
+        keys = self._list_object_keys(prefix)
+        return self._download_keys(keys, prefix, local_dir, "shard", batch_id, shard_id)
 
+    def _list_object_keys(self, prefix: str) -> list[tuple[str, str]]:
+        """List (key, rel_path) tuples under a prefix.
+
+        Extracted to keep ``download_shard`` and ``download_job``
+        under the org complexity threshold (10). The nested loop
+        over paginator pages + Contents is the source of the
+        extra branches.
+        """
         keys: list[tuple[str, str]] = []
         paginator = self._client.get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
@@ -140,6 +148,24 @@ class R2Sink:
                 rel_path = key[len(prefix) :]
                 if rel_path:
                     keys.append((key, rel_path))
+        return keys
+
+    def _download_keys(
+        self,
+        keys: list[tuple[str, str]],
+        prefix: str,
+        local_dir: Path,
+        kind: str,
+        batch_id: str,
+        unit_id: object,
+    ) -> list[str]:
+        """Download a list of (key, rel_path) tuples concurrently.
+
+        ``kind`` is ``"shard"`` or ``"job"`` and ``unit_id`` is the
+        shard number or job name; used for the log line so the
+        context is clear regardless of which downloader is calling.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
         for _, rel_path in keys:
             (local_dir / rel_path).parent.mkdir(parents=True, exist_ok=True)
@@ -160,9 +186,10 @@ class R2Sink:
                     logger.warning("R2 download failed: %s", rel_path)
 
         logger.info(
-            "Downloaded %d files from R2 for shard %d (batch %s)",
+            "Downloaded %d files from R2 for %s %s (batch %s)",
             len(downloaded),
-            shard_id,
+            kind,
+            unit_id,
             batch_id,
         )
         return downloaded
@@ -228,39 +255,10 @@ class R2Sink:
         Returns:
             List of downloaded relative file paths.
         """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
         local_dir.mkdir(parents=True, exist_ok=True)
         prefix = self.job_prefix(batch_id, job_name)
-
-        keys: list[tuple[str, str]] = []
-        paginator = self._client.get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
-            for obj in page.get("Contents", []):
-                key = obj["Key"]
-                rel_path = key[len(prefix) :]
-                if rel_path:
-                    keys.append((key, rel_path))
-
-        for _, rel_path in keys:
-            (local_dir / rel_path).parent.mkdir(parents=True, exist_ok=True)
-
-        def _dl_one(item: tuple[str, str]) -> str:
-            key, rel_path = item
-            self._client.download_file(self.bucket, key, str(local_dir / rel_path))
-            return rel_path
-
-        downloaded: list[str] = []
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            futures = {pool.submit(_dl_one, item): item for item in keys}
-            for future in as_completed(futures):
-                try:
-                    downloaded.append(future.result())
-                except Exception:
-                    _, rel_path = futures[future]
-                    logger.warning("R2 download failed: %s", rel_path)
-
-        return downloaded
+        keys = self._list_object_keys(prefix)
+        return self._download_keys(keys, prefix, local_dir, "job", batch_id, job_name)
 
     # -- Batch management --------------------------------------------------
 
