@@ -421,22 +421,40 @@ def main() -> int:
     # NB: CodeQL flags this write_text as a "clear-text storage of
     # sensitive information" alert. The opt-in is recorded in
     # .codeqlignore at the repo root with the rationale.
-    admin_creds_file = Path(tempfile.mkdtemp(prefix="admin_creds_")) / "creds"
-    admin_creds_file.write_text(
+    admin_creds_dir = Path(tempfile.mkdtemp(prefix="admin_creds_"))
+    admin_creds_file = admin_creds_dir / "creds"
+    # Open with O_CREAT | O_WRONLY | O_TRUNC | O_NOFOLLOW and
+    # explicit mode 0o600 (read-write, owner only). This is
+    # more defensive than write_text() which respects the
+    # process umask — on a misconfigured system (umask 022)
+    # write_text() would leave the file at 0644 (world-readable).
+    # The O_NOFOLLOW guards against symlink replacement between
+    # the open() and the write (TOCTOU).
+    body = (
         f'export R2_ADMIN_ENDPOINT="{os.environ["R2_ADMIN_ENDPOINT"]}"\n'
         f'export R2_ADMIN_ACCESS_KEY_ID="{os.environ["R2_ADMIN_ACCESS_KEY_ID"]}"\n'
-        # codeql[py/clear-text-storage-sensitive-data] ignore: the
-        # credential is read from $R2_ADMIN_SECRET_ACCESS_KEY at
-        # test invocation time, not hardcoded. Written to a
-        # per-invocation mkdtemp() dir (mode 700), used in-memory
-        # by the r2-lifecycle subprocess, and the file is not
-        # committed. The r2-lifecycle CLI's only auth option is a
-        # credentials file, so this is the minimal-friction way
-        # to pass the keys. (Belt-and-suspenders with the
-        # .codeqlignore entry at the repo root, in case the
-        # org-level CodeQL scan doesn't pick that up.)
         f'export R2_ADMIN_SECRET_ACCESS_KEY="{os.environ["R2_ADMIN_SECRET_ACCESS_KEY"]}"\n'
     )
+    # codeql[py/clear-text-storage-sensitive-data] ignore: the
+    # credential is read from $R2_ADMIN_SECRET_ACCESS_KEY at
+    # test invocation time, not hardcoded. The file is written
+    # with explicit mode 0o600 in a per-invocation mkdtemp()
+    # dir (mode 700), used in-memory by the r2-lifecycle
+    # subprocess, and the file is not committed. The
+    # r2-lifecycle CLI's only auth option is a credentials
+    # file, so this is the minimal-friction way to pass the
+    # keys. (Belt-and-suspenders with the .codeqlignore entry
+    # at the repo root, in case the org-level CodeQL scan
+    # doesn't pick that up.)
+    fd = os.open(
+        admin_creds_file,
+        os.O_CREAT | os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        os.write(fd, body.encode("utf-8"))
+    finally:
+        os.close(fd)
 
     test_lifecycle_prefix = f"lifecycle-test/{run_id}"
 
