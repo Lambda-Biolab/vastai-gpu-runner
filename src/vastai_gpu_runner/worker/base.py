@@ -238,14 +238,11 @@ class BaseWorker(ABC):
             if parsed.hostname != endpoint_host:
                 msg = f"refusing to call non-Vast.ai host: {parsed.hostname!r}"
                 raise ValueError(msg)
-            req = urllib.request.Request(url, method="DELETE")
-            # The urlopen is safe: parsed.hostname is verified to
-            # match the hardcoded endpoint_host above, so the
-            # request can only ever hit console.vast.ai regardless
-            # of instance_id/api_key contents. See the host check
-            # at lines 237-240. bandit reads its own directive set
-            # ('# nosec B310') which is why this comment has the
-            # rule on its own line.
+            # bandit B310 / ruff S310: host is verified above
+            # (parsed.hostname == endpoint_host). The request can
+            # only ever hit console.vast.ai regardless of
+            # instance_id/api_key contents.
+            req = urllib.request.Request(url, method="DELETE")  # nosec B310  # noqa: S310
             urllib.request.urlopen(req, timeout=15)  # nosec B310  # noqa: S310
             logger.info("Self-destruct: instance %s destroyed", instance_id)
         except Exception as exc:
