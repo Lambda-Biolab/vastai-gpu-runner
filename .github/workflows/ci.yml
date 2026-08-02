@@ -42,7 +42,7 @@ jobs:
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
       - name: Install uv
-        uses: astral-sh/setup-uv@d269b9917d8e33f7165632f15cc38a13726f64b5 # v9.0.0
+        uses: astral-sh/setup-uv@7e7e21ddc30bd66316c7b9889405f485b5022c96 # v9.0.0
         with:
           python-version: ${{ matrix.python-version }}
           enable-cache: true
@@ -90,7 +90,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
-      - uses: astral-sh/setup-uv@d269b9917d8e33f7165632f15cc38a13726f64b5 # v9.0.0
+      - uses: astral-sh/setup-uv@7e7e21ddc30bd66316c7b9889405f485b5022c96 # v9.0.0
       - run: uv python install 3.12
       - run: uv sync --frozen --dev
       - run: uv pip install mutmut
