@@ -205,3 +205,49 @@ The v3 `sweep_zombie_instances`, `load_vastai_api_key`, `ensure_detached`, and `
 | Function | Returns | Description |
 |----------|---------|-------------|
 | `query_vastai_pricing(gpu_types, max_cost_per_hour, ...)` | `dict[str, PriceSummary]` | Live marketplace query with fallback |
+
+## R2 lifecycle (`vastai_gpu_runner.storage.r2_lifecycle`)
+
+Bucket-lifecycle administration for Cloudflare R2. Operator-facing;
+not invoked from worker code.
+
+| Name | Type | Description |
+|------|------|-------------|
+| `R2AdminCredentials` | dataclass | `endpoint`, `access_key_id`, `secret_access_key`. `R2AdminCredentials.from_file(path)` parses a shell-export credentials file containing **only** `R2_ADMIN_*` keys. Worker-style `R2_*` keys are explicitly rejected to enforce credential separation. |
+| `R2ExpirationPolicy` | dataclass | `bucket`, `prefix`, `expire_after_days >= 1`. `canonical_prefix` is computed. |
+| `R2LifecycleManager(creds, *, client=None)` | class | `inspect_managed_rule(bucket, prefix)`, `plan_apply(policy)`, `plan_remove(bucket, prefix)`, `apply(plan)`, `remove(plan)`. All mutations are read-after-write verified. |
+| `LifecyclePlan` | dataclass | Operation, bucket, canonical prefix, managed rule ID, before/after rules, no-op flag, source fingerprint, warnings. |
+| `LifecycleResult` | dataclass | Operation, verified flag, no-op flag, post-write rules count. |
+| `R2LifecycleError` | exception | Base. Subtypes: `ValidationError`, `CredentialsError`, `AccessDeniedError`, `CollisionError`, `StalePlanError`, `RuleLimitError`, `VerificationError`. |
+| `canonicalise_prefix(raw)` | function | Canonical form (trailing `/`, no leading `/`, no root). |
+| `managed_rule_id(bucket, canonical_prefix)` | function | Deterministic rule ID `vastai-gpu-runner-expire-<12-hex>`. |
+| `fingerprint_rules(rules)` | function | Order-sensitive stable fingerprint for OPTIMISTIC stale-plan detection. |
+
+## Worker upload bounds (`vastai_gpu_runner.worker.base`)
+
+| Name | Value | Description |
+|------|-------|-------------|
+| `R2_FINAL_UPLOAD_TIMEOUT_SECONDS` | `90` | Hard upper bound on `upload_results()` subprocess. Transport failure does not change the workload exit code; `self_destruct()` still runs. |
+
+## CLI — `r2-lifecycle` sub-app
+
+```
+vastai-gpu-runner r2-lifecycle show   --bucket B --prefix P/ --credentials-file F
+vastai-gpu-runner r2-lifecycle apply  --bucket B --prefix P/ --credentials-file F --expire-after-days N [--dry-run] [--yes]
+vastai-gpu-runner r2-lifecycle remove --bucket B --prefix P/ --credentials-file F [--dry-run] [--yes]
+```
+
+Exit codes:
+
+| Code | Meaning |
+|------|---------|
+| 0 | Success (or no-op). |
+| 1 | Generic lifecycle error (catch-all). |
+| 2 | Validation error. |
+| 3 | Credentials missing or malformed (file not found, missing keys). |
+| 4 | Access denied. |
+| 5 | Managed-rule ID collision with incompatible shape. |
+| 6 | Stale plan (bucket changed between plan and apply). |
+| 7 | Provider rejected rule count (`TooManyRules`). |
+| 8 | Read-after-write mismatch. |
+| 9 | Refused to mutate without `--yes` on non-interactive stdin. |

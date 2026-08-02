@@ -1,3 +1,4 @@
+# pyright: reportPrivateUsage=warning, reportMissingParameterType=warning, reportUnusedFunction=false, reportUnusedClass=false
 """Tests for providers.destroy_adapters.vastai — Vast.ai destroy adapter."""
 
 from __future__ import annotations

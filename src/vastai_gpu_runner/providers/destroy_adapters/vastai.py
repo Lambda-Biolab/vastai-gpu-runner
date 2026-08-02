@@ -209,7 +209,7 @@ def verify_instance_ownership(
     *,
     ownership: OwnershipPolicy | None = None,
     allowed_images: frozenset[str] | None = None,
-) -> OwnershipVerification:
+) -> _CleanupPolicyOwnershipVerification:
     """Back-compat shim for the v3 ``allowed_images=`` signature.
 
     v4 callers should pass ``ownership=OwnershipPolicy(...)`` directly.

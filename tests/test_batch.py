@@ -1,3 +1,4 @@
+# pyright: reportPrivateUsage=warning, reportMissingParameterType=warning, reportUnusedFunction=false, reportUnusedClass=false
 """Tests for BatchOrchestrator ABC.
 
 Uses a mock CloudRunner and a concrete in-memory orchestrator subclass.
@@ -26,7 +27,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from vastai_gpu_runner.batch import BatchOrchestrator, FailureVerdict
+from vastai_gpu_runner.batch import BatchOrchestrator, FailureVerdict, RunnerFactory
 from vastai_gpu_runner.cleanup_policy import (
     CleanupRefusal,
     CleanupResult,
@@ -36,6 +37,7 @@ from vastai_gpu_runner.cleanup_policy import (
     ProviderCleanupPolicy,
 )
 from vastai_gpu_runner.runner import CloudRunner
+from vastai_gpu_runner.storage.r2 import R2Sink
 from vastai_gpu_runner.types import CloudInstance, DeploymentResult
 
 if TYPE_CHECKING:
@@ -64,6 +66,24 @@ class FakeUnit:
     events: list[str] = field(default_factory=list)
 
 
+def _noop_runner_factory() -> CloudRunner:
+    """Build a factory returning a single MagicMock CloudRunner.
+
+    Default runner_factory for tests that don't need to exercise
+    the runner.
+    """
+    runner = MagicMock()
+    runner.run_full_cycle = MagicMock(
+        return_value=MagicMock(
+            success=True,
+            instance=CloudInstance(instance_id="noop"),
+        )
+    )
+    runner.check_progress = MagicMock(return_value={"running": True, "complete": False})
+    runner.destroy_instance = MagicMock(return_value=True)
+    return runner
+
+
 class FakeOrchestrator(BatchOrchestrator[FakeUnit]):
     """Test orchestrator that owns a list of FakeUnits and records events."""
 
@@ -71,15 +91,38 @@ class FakeOrchestrator(BatchOrchestrator[FakeUnit]):
         self,
         units: list[FakeUnit],
         cleanup_policy: ProviderCleanupPolicy | None = None,
-        **kwargs: object,
+        *,
+        runner_factory: RunnerFactory = _noop_runner_factory,
+        label_prefix: str = "test",
+        workspace_dir: str = "/tmp/test",
+        r2_sink: R2Sink | None = None,
+        r2_batch_id: str = "test-batch",
+        budget_usd: float = 0.0,
+        max_retries: int = 2,
+        max_parallel_deploys: int = 1,
+        max_parallel_collects: int = 1,
+        poll_interval_seconds: int = 30,
+        zombie_sweep_every_n_cycles: int = 5,
+        poll_timeout_seconds: float = 0.0,
     ) -> None:
         self.units = units
         self.state_saves = 0
         self.payload_builds: list[str] = []
         self.collect_calls: list[str] = []
-        super().__init__(  # type: ignore[arg-type]
+        super().__init__(
+            runner_factory=runner_factory,
+            label_prefix=label_prefix,
             cleanup_policy=cleanup_policy or _noop_cleanup_policy(),
-            **kwargs,
+            workspace_dir=workspace_dir,
+            r2_sink=r2_sink,
+            r2_batch_id=r2_batch_id,
+            budget_usd=budget_usd,
+            max_retries=max_retries,
+            max_parallel_deploys=max_parallel_deploys,
+            max_parallel_collects=max_parallel_collects,
+            poll_interval_seconds=poll_interval_seconds,
+            zombie_sweep_every_n_cycles=zombie_sweep_every_n_cycles,
+            poll_timeout_seconds=poll_timeout_seconds,
         )
 
     def iter_pending_units(self) -> Iterable[FakeUnit]:
@@ -180,7 +223,7 @@ def _mock_runner_factory(
     *,
     deploy_result: DeploymentResult,
     progress: dict[str, object] | None = None,
-) -> object:
+) -> RunnerFactory:
     """Build a factory returning mock CloudRunners with controlled behaviour."""
 
     def factory() -> CloudRunner:
@@ -487,7 +530,7 @@ class TestCapturePreemptDiagnostics:
 
     def _orch_with_preempted_unit(
         self,
-    ) -> tuple[FakeOrchestrator, CloudRunner, CloudInstance, FakeUnit]:
+    ) -> tuple[FakeOrchestrator, MagicMock, CloudInstance, FakeUnit]:
         unit = FakeUnit(key="u1", status="deployed", instance_id="i1")
         orch = FakeOrchestrator(
             units=[unit],
@@ -591,11 +634,12 @@ class TestCapturePreemptDiagnostics:
     def test_poll_cycle_once_also_captures_on_preempted(self) -> None:
         """The parallel-poll path (``_poll_cycle_once``) must also capture."""
         orch, runner, instance, unit = self._orch_with_preempted_unit()
-        orch.capture_preempt_diagnostics = MagicMock()  # type: ignore[method-assign]
+        capture_mock = MagicMock()
+        orch.capture_preempt_diagnostics = capture_mock  # type: ignore[method-assign]
 
         orch._poll_cycle_once()
 
-        orch.capture_preempt_diagnostics.assert_called_once_with(runner, instance, unit)
+        capture_mock.assert_called_once_with(runner, instance, unit)
         runner.destroy_instance.assert_called_once()
 
 
@@ -853,7 +897,7 @@ class TestZombieSweep:
             cleanup_policy=policy,
         )
         orch._sweep_zombies()
-        assert policy._test_list_invocations() == 1
+        assert policy._test_list_invocations() == 1  # type: ignore[attr-defined]
 
     def test_sweep_filters_by_delimited_scope(self) -> None:
         """Only candidates with ``label.startswith(f"{label_prefix}-")`` are destroyed.
@@ -873,7 +917,10 @@ class TestZombieSweep:
 
         killed = orch._sweep_zombies()
 
-        destroyed_ids = {c.instance_id for c in policy._test_destroy_invocations()}
+        destroyed_ids = {
+            c.instance_id
+            for c in policy._test_destroy_invocations()  # type: ignore[attr-defined]
+        }
         assert destroyed_ids == {"i1"}
         assert killed == 1
 
@@ -894,7 +941,10 @@ class TestZombieSweep:
 
         killed = orch._sweep_zombies()
 
-        destroyed_ids = {c.instance_id for c in policy._test_destroy_invocations()}
+        destroyed_ids = {
+            c.instance_id
+            for c in policy._test_destroy_invocations()  # type: ignore[attr-defined]
+        }
         assert destroyed_ids == {"i2"}
         assert killed == 1
 

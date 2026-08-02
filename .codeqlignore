@@ -1,0 +1,22 @@
+# CodeQL ignore file. One entry per line: `path:query-id`. A bare
+# query-id (e.g. `py/clear-text-storage-sensitive-data`) suppresses
+# that query on ALL files. A `path:query-id` form suppresses it on
+# the specific path.
+#
+# Intentionally-allowed code patterns:
+#
+# The PR-39 stress test (gated on R2_* env vars) writes R2
+# credentials to a per-invocation tmpfile. The credentials are
+# read from environment variables (not hardcoded), the tmpfile
+# is mode-600 in a per-invocation mkdtemp() directory, and the
+# whole test block is opt-in via env-var presence. The
+# r2-lifecycle CLI's only auth option is a credentials file, so
+# there's no way to avoid the write without changing the CLI
+# itself. The alternative (using SARIF suppressions on every
+# run) is a maintenance burden vs. a single .codeqlignore entry.
+#
+# Suppress the storage-of-credentials finding for the opt-in
+# stress test. The actual credential material is not in the
+# repo, only the pattern that reads from env and writes to a
+# tmpfile.
+tests/stress/stress_pr39_real_vastai.py:py/clear-text-storage-sensitive-data

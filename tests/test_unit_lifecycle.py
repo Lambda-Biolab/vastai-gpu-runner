@@ -1,3 +1,4 @@
+# pyright: reportPrivateUsage=warning, reportMissingParameterType=warning, reportUnusedFunction=false, reportUnusedClass=false
 """Tests for unit_lifecycle — per-cycle decision tree."""
 
 from __future__ import annotations
@@ -6,6 +7,7 @@ import logging
 
 import pytest
 
+from vastai_gpu_runner.types import CloudInstance
 from vastai_gpu_runner.unit_lifecycle import (
     Action,
     Complete,
@@ -66,7 +68,7 @@ class TestDecideNextAction:
         action = decide_next_action(
             unit="u1",
             runner=_FakeRunner({"complete": False, "worker_dead": False}),
-            instance="i1",
+            instance=CloudInstance(instance_id="i1"),
             is_done_in_r2=lambda u: True,
         )
         assert isinstance(action, Complete)
@@ -76,7 +78,7 @@ class TestDecideNextAction:
         action = decide_next_action(
             unit="u1",
             runner=_FakeRunner({"complete": True, "worker_dead": False}),
-            instance="i1",
+            instance=CloudInstance(instance_id="i1"),
             is_done_in_r2=lambda u: False,
         )
         assert isinstance(action, Complete)
@@ -91,7 +93,7 @@ class TestDecideNextAction:
         action = decide_next_action(
             unit="u1",
             runner=_FakeRunner({"complete": False, "worker_dead": True, "log_tail": "x"}),
-            instance="i1",
+            instance=CloudInstance(instance_id="i1"),
             is_done_in_r2=is_done,
         )
         assert isinstance(action, Complete)
@@ -101,7 +103,7 @@ class TestDecideNextAction:
         action = decide_next_action(
             unit="u1",
             runner=_FakeRunner({"complete": False, "worker_dead": True, "log_tail": "fatal"}),
-            instance="i1",
+            instance=CloudInstance(instance_id="i1"),
             is_done_in_r2=lambda u: False,
         )
         assert isinstance(action, Preempt)
@@ -113,7 +115,7 @@ class TestDecideNextAction:
         action = decide_next_action(
             unit="u1",
             runner=_FakeRunner({}),
-            instance="i1",
+            instance=CloudInstance(instance_id="i1"),
             is_done_in_r2=lambda u: False,
         )
         assert isinstance(action, Continue)
@@ -122,7 +124,7 @@ class TestDecideNextAction:
         action = decide_next_action(
             unit="u1",
             runner=_RaisingRunner(),
-            instance="i1",
+            instance=CloudInstance(instance_id="i1"),
             is_done_in_r2=lambda u: False,
         )
         assert isinstance(action, Continue)
@@ -135,7 +137,7 @@ class TestDecideNextAction:
             action = decide_next_action(
                 unit="u1",
                 runner=_FakeRunner({"complete": True, "worker_dead": False}),
-                instance="i1",
+                instance=CloudInstance(instance_id="i1"),
                 is_done_in_r2=is_done,
             )
         assert isinstance(action, Complete)
@@ -145,7 +147,7 @@ class TestDecideNextAction:
         action = decide_next_action(
             unit="u1",
             runner=_FakeRunner("not a dict"),  # type: ignore[arg-type]
-            instance="i1",
+            instance=CloudInstance(instance_id="i1"),
             is_done_in_r2=lambda u: False,
         )
         assert isinstance(action, Continue)
@@ -155,7 +157,7 @@ class TestDecideNextAction:
             decide_next_action(
                 unit="u1",
                 runner=_RaisingRunner(),
-                instance="i1",
+                instance=CloudInstance(instance_id="i1"),
                 is_done_in_r2=lambda u: False,
             )
         assert any("check_progress raised" in r.message for r in caplog.records)
@@ -170,7 +172,7 @@ class TestDecideNextAction:
             action = decide_next_action(
                 unit="u1",
                 runner=_FakeRunner({"complete": False, "worker_dead": True}),
-                instance="i1",
+                instance=CloudInstance(instance_id="i1"),
                 is_done_in_r2=is_done,
             )
         assert isinstance(action, Continue)

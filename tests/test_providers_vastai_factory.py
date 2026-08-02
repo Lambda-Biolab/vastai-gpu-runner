@@ -1,3 +1,4 @@
+# pyright: reportPrivateUsage=warning, reportMissingParameterType=warning, reportUnusedFunction=false, reportUnusedClass=false
 """Tests for providers.vastai.build_vastai_cleanup_policy — v4 factory.
 
 Per docs/architecture-v4-cleanup-policy.md migration step 3d.
@@ -26,10 +27,11 @@ from vastai_gpu_runner.providers.destroy_adapters.vastai import (
     CredentialState,
 )
 from vastai_gpu_runner.providers.vastai import (
+    VastaiRunner,
     _describe_destroy_result,
     build_vastai_cleanup_policy,
 )
-from vastai_gpu_runner.types import Provider
+from vastai_gpu_runner.types import CloudInstance, Provider
 
 
 def _candidate(
@@ -384,7 +386,7 @@ class TestCliFallbackDispatch:
 
 
 class TestVastaiRunnerDestroyInstance:
-    def _runner(self) -> object:
+    def _runner(self) -> VastaiRunner:
         from vastai_gpu_runner.providers.vastai import VastaiRunner
 
         return VastaiRunner(
@@ -392,7 +394,7 @@ class TestVastaiRunnerDestroyInstance:
             credentials=CredentialResolution(state=CredentialState.AVAILABLE, key="k"),
         )
 
-    def _instance(self) -> object:
+    def _instance(self) -> CloudInstance:
         from vastai_gpu_runner.types import CloudInstance, InstanceStatus, Provider
 
         return CloudInstance(

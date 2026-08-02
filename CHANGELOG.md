@@ -1,5 +1,101 @@
 # Changelog
 
+## Unreleased — R2 lifecycle + fail-closed worker upload
+
+### Added
+
+- **`storage/r2_lifecycle.py`** — provider-agnostic domain for managing
+  one Cloudflare R2 bucket-lifecycle expiration rule per prefix.
+  `R2AdminCredentials` (redacted `__repr__`) — accepts ONLY
+  `R2_ADMIN_*` keys (worker-style `R2_*` keys are explicitly
+  rejected to enforce credential separation between worker
+  object-write credentials and bucket-policy admin credentials).
+  `R2ExpirationPolicy` (validated in `__post_init__`),
+  `R2LifecycleManager` with `plan_apply`, `plan_remove`, `apply`,
+  `remove`. The PUT request is wrapped in
+  ``LifecycleConfiguration={"Rules": [...]}`` per the boto3 / R2
+  contract (verified via ``botocore.stub.Stubber`` contract tests).
+  `apply` uses ``put_bucket_lifecycle_configuration``;
+  `remove` uses ``delete_bucket_lifecycle`` when the managed rule
+  is the only one remaining (R2 / S3 require at least one rule per
+  configuration, so DELETE is the documented way to clear it).
+  Deterministic managed-rule IDs
+  (`vastai-gpu-runner-expire-<12-hex>`). Optimistic stale-plan
+  detection via source-fingerprint comparison (an external writer
+  can still race the subsequent PUT). Read-after-write verification
+  compares the *complete* normalised rule collection against
+  `plan.after_rules`. Typed exception hierarchy:
+  `ValidationError`, `CredentialsError`, `AccessDeniedError`,
+  `CollisionError`, `StalePlanError`, `VerificationError`,
+  `RuleLimitError`.
+- **`r2-lifecycle` CLI sub-application** (`cli_r2_lifecycle.py`,
+  mounted as `vastai-gpu-runner r2-lifecycle ...`) — three commands:
+  `show`, `apply`, `remove`. Required `--credentials-file`,
+  no-default `--expire-after-days`, `--dry-run`, `--yes`, exit
+  codes 1-9 for typed errors. Bucket-wide (root) prefix rejected.
+- **`docs/architecture-r2-collection-handshake.md`** — proposed
+  long-term bounded-teardown protocol. Explicitly NOT implemented
+  in this change.
+- **`tests/test_r2_lifecycle.py`** — 71 unit tests for the lifecycle
+  domain (canonicalisation, deterministic IDs, plan/apply/remove,
+  full-ruleset read-after-write, fresh-bucket 404 handling,
+  access-denied, rule-limit, secret redaction, collision checks
+  for both apply and remove).
+- **`tests/test_r2_upload_scripts.py`** — 16 behavioural tests for
+  the generated upload scripts: success path, exitcode failure,
+  missing-exitcode failure (worker.exitcode absent is a failure),
+  required-file failure, prediction failure omits DONE markers,
+  DONE-marker failure, chunk flush failure, checkpoint mode
+  stays best-effort.
+
+### Changed
+
+- **`BaseWorker.upload_results()`** — fixed `R2_FINAL_UPLOAD_TIMEOUT_SECONDS`
+  lowered from 300s to 90s. `subprocess.TimeoutExpired` caught
+  separately with a warning that explicitly notes teardown continues.
+  Non-zero return codes now logged with truncated stderr/stdout
+  (not as "R2 upload complete"). Transport failure does NOT change
+  the workload exit code; `self_destruct()` still runs from
+  `main()`'s `finally`. Module constant `R2_FINAL_UPLOAD_TIMEOUT_SECONDS`
+  exported for downstream visibility. Docstring revised to
+  acknowledge that the job uploader's `--done` mode may upload
+  large output sets and is therefore a deliberate best-effort
+  cutoff.
+- **Generated shard uploader (`R2Sink.generate_upload_script`)** —
+  `upload_prediction()` now fails closed: if any required file
+  upload fails, the per-shard and global DONE markers are NOT
+  published and the script exits non-zero. A local upload-failure
+  sentinel (`<workspace>/upload_failures.log`) is persisted on
+  failure so subsequent `--done` or no-arg invocations also refuse
+  to publish the top-level shard DONE marker — a transient
+  per-prediction upload failure cannot be masked by a later
+  successful worker exit. The whole-shard positive completion
+  marker (`<workspace>/shard_completed`) is written atomically by
+  `upload_all()` on full success and required by `--done` as
+  positive proof of completion; `upload_all()` also writes
+  per-prediction completion markers for every subdirectory under
+  `outputs/` and clears any stale `<no-arg>` failure entry so a
+  retry after recovery can complete normally.
+  `upload_done_marker()` and `upload_all()` no longer treat a
+  missing `worker.exitcode` as success — absence is a failure
+  because we cannot verify the workload outcome without it. The
+  `worker.exitcode` upload is attempted *before* the `DONE`
+  marker.
+- **Generated job uploader (`R2Sink.generate_job_upload_script`)** —
+  `_flush_large_file_chunk()` now returns `"uploaded" | "none" | "failed"`
+  so callers can distinguish "no new bytes" from "chunk flush failed".
+  `upload_all()` tracks required-file failures and omits `DONE` on
+  any failure. `_upload_exitcode_job()` rejects missing exitcode.
+  Checkpoint mode (`--checkpoint`) remains best-effort — failures
+  are warnings, no `DONE` is published.
+- **`docs/guide.md`** — new "R2 bucket lifecycle administration"
+  section documenting the operator workflow, admin credentials
+  separation, lifecycle as maximum-retention backstop, and the
+  best-effort rsync fallback caveat.
+- **`docs/api.md`** — new `R2 lifecycle` and `Worker upload bounds`
+  sections, plus CLI sub-app reference and full exit-code table
+  (0, 1, 2, 3, 4, 5, 6, 7, 8, 9).
+
 ## 0.4.0 (2026-07-27) — v4 cleanup-policy architecture
 
 ### Added

@@ -1,3 +1,4 @@
+# pyright: reportPrivateUsage=warning, reportMissingParameterType=warning, reportUnusedFunction=false, reportUnusedClass=false
 """End-to-end v4 BatchOrchestrator stress tests.
 
 These tests exercise the FULL ``BatchOrchestrator.run()`` lifecycle
@@ -88,7 +89,7 @@ class TestLargeJobConcurrentDeploys:
     """50 shards, max_parallel_deploys=8, all complete end-to-end."""
 
     def test_50_shards_all_complete_with_concurrent_deploys(self, tmp_path: Path) -> None:
-        threads_before = {t.ident for t in threading.enumerate()}
+        threads_before = {t.ident for t in threading.enumerate() if t.ident is not None}
         state, state_path = build_batch_state(num_shards=50)
         orchestrator = StressOrchestrator(
             state=state,
@@ -127,7 +128,7 @@ class TestConnectionDropsDuringPoll:
     """Each shard loses 1 SSH poll; runner still completes via retry."""
 
     def test_30_shards_with_ssh_drops_converge(self, tmp_path: Path) -> None:
-        threads_before = {t.ident for t in threading.enumerate()}
+        threads_before = {t.ident for t in threading.enumerate() if t.ident is not None}
         state, state_path = build_batch_state(num_shards=30)
         # Per-shard: 1 SSH drop, then 2 polls to complete. The
         # orchestrator's poll loop retries on transient SSH
@@ -167,7 +168,7 @@ class TestResumeAfterKillMidCycle:
     """Instantiate, run a partial cycle, snapshot, instantiate fresh, continue."""
 
     def test_partial_run_then_resume_from_persisted_state(self, tmp_path: Path) -> None:
-        threads_before = {t.ident for t in threading.enumerate()}
+        threads_before = {t.ident for t in threading.enumerate() if t.ident is not None}
         # First orchestrator: only 5 shards deploy before we
         # snapshot. We do this by writing a pre-state where 45
         # shards are already completed (downloaded) and 5 are
@@ -219,7 +220,7 @@ class TestPreV4StateResume:
     """A pre-v4 state file is migrated in place and the run continues."""
 
     def test_pre_v4_state_migrates_and_runs(self, tmp_path: Path) -> None:
-        threads_before = {t.ident for t in threading.enumerate()}
+        threads_before = {t.ident for t in threading.enumerate() if t.ident is not None}
         state_path = tmp_path / "pre_v4_state.json"
         # Write a real pre-v4 (schema_version 0) fixture.
         # 8 deployed shards (mid-poll) + 12 pending shards.
@@ -323,7 +324,7 @@ class TestMixedFailuresSucceedPreemptFatal:
     """
 
     def test_60_shards_with_random_outcomes_first_run(self, tmp_path: Path) -> None:
-        threads_before = {t.ident for t in threading.enumerate()}
+        threads_before = {t.ident for t in threading.enumerate() if t.ident is not None}
         state, state_path = build_batch_state(num_shards=60)
         orchestrator = StressOrchestrator(
             state=state,
@@ -374,7 +375,7 @@ class TestMixedFailuresSucceedPreemptFatal:
 
     def test_60_shards_with_random_outcomes_resume_converges(self, tmp_path: Path) -> None:
         """Second ``run()`` invocation resumes preempted shards → all download."""
-        threads_before = {t.ident for t in threading.enumerate()}
+        threads_before = {t.ident for t in threading.enumerate() if t.ident is not None}
         state, state_path = build_batch_state(num_shards=60)
         orchestrator = StressOrchestrator(
             state=state,
@@ -449,7 +450,7 @@ class TestBudgetAbortMidPoll:
     """budget_usd=0 aborts before zombie sweep."""
 
     def test_zero_budget_aborts_run_before_sweep(self, tmp_path: Path) -> None:
-        threads_before = {t.ident for t in threading.enumerate()}
+        threads_before = {t.ident for t in threading.enumerate() if t.ident is not None}
         state, state_path = build_batch_state(num_shards=4)
         # Use a runner that never completes so the budget check
         # fires during the poll loop.
@@ -482,7 +483,7 @@ class TestBudgetAbortMidPoll:
 
     def test_budget_exceeded_aborts(self, tmp_path: Path) -> None:
         """``budget_usd=0.001`` aborts after first deploy because cost > ceiling."""
-        threads_before = {t.ident for t in threading.enumerate()}
+        threads_before = {t.ident for t in threading.enumerate() if t.ident is not None}
         state, state_path = build_batch_state(num_shards=10)
         orchestrator = StressOrchestrator(
             state=state,
@@ -521,7 +522,7 @@ class TestConcurrentMaxParallelDoesNotDoubleClaim:
     """50 shards, max_parallel_deploys=8: no double-claim race."""
 
     def test_50_shards_thread_safe_offer_claim(self, tmp_path: Path) -> None:
-        threads_before = {t.ident for t in threading.enumerate()}
+        threads_before = {t.ident for t in threading.enumerate() if t.ident is not None}
         state, state_path = build_batch_state(num_shards=50)
         # Each runner claims a unique machine_id (no contention).
         # The orchestrator tracks used_machine_ids to prevent
@@ -554,7 +555,7 @@ class TestZombieSweepDuringLiveRun:
     """Orphan instance is destroyed by ``_sweep_zombies`` mid-run."""
 
     def test_zombie_sweep_destroys_orphan_during_run(self, tmp_path: Path) -> None:
-        threads_before = {t.ident for t in threading.enumerate()}
+        threads_before = {t.ident for t in threading.enumerate() if t.ident is not None}
         # Configure a cleanup policy that reports 1 orphan with a
         # matching label_scope prefix; the sweep must destroy it.
         orphan = InstanceCandidate(
@@ -655,7 +656,7 @@ class TestStatePersistenceAtomicWrite:
     """Every ``save_state`` writes; subsequent loads recover."""
 
     def test_save_state_writes_to_disk(self, tmp_path: Path) -> None:
-        threads_before = {t.ident for t in threading.enumerate()}
+        threads_before = {t.ident for t in threading.enumerate() if t.ident is not None}
         state, state_path = build_batch_state(num_shards=5)
         orchestrator = StressOrchestrator(
             state=state,
@@ -685,7 +686,7 @@ class TestStatePersistenceAtomicWrite:
 
     def test_atomic_write_no_tmp_leftovers(self, tmp_path: Path) -> None:
         """``BatchState.save`` uses tmp+rename; no ``.tmp`` is left behind."""
-        threads_before = {t.ident for t in threading.enumerate()}
+        threads_before = {t.ident for t in threading.enumerate() if t.ident is not None}
         state, state_path = build_batch_state(num_shards=2)
         orchestrator = StressOrchestrator(
             state=state,

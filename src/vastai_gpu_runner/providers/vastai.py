@@ -21,6 +21,7 @@ import re
 import subprocess
 import time
 import warnings
+from collections.abc import Mapping
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1068,7 +1069,7 @@ class VastaiRunner(CloudRunner):
             logger.error("Failed to search Vast.ai offers: %s", exc)
             return []
 
-    def create_instance(self, offer: dict[str, object]) -> CloudInstance:
+    def create_instance(self, offer: Mapping[str, object]) -> CloudInstance:
         """Create a Vast.ai instance from an offer."""
         offer_id = str(offer.get("id", ""))
         label = self._next_instance_label()

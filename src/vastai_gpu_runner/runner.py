@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import subprocess
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING
 
 from vastai_gpu_runner.types import CloudInstance, DeploymentConfig, DeploymentResult
@@ -43,10 +44,17 @@ class CloudRunner:
     # -- Provider-specific methods (override in subclasses) ----------------
 
     def search_offers(self, **kwargs: object) -> list[dict[str, object]]:
-        """Search for GPU offers matching the deployment config."""
+        """Search for GPU offers matching the deployment config.
+
+        The base class signature uses ``**kwargs: object`` so test
+        doubles (subclassed ``CloudRunner``) can override this
+        method without needing to replicate the keyword arguments.
+        Subclasses should keep the ``**kwargs`` parameter for
+        signature compatibility.
+        """
         return []
 
-    def create_instance(self, offer: dict[str, object]) -> CloudInstance:
+    def create_instance(self, offer: Mapping[str, object]) -> CloudInstance:
         """Create a cloud instance from an offer."""
         raise NotImplementedError
 
@@ -140,7 +148,7 @@ class CloudRunner:
         local_output_dir: Path,
         *,
         max_retries: int = 3,
-        offers: list[dict[str, object]] | None = None,
+        offers: Sequence[Mapping[str, object]] | None = None,
         used_machine_ids: set[str] | None = None,
         machine_lock: threading.Lock | object | None = None,
     ) -> DeploymentResult:
@@ -198,7 +206,7 @@ class CloudRunner:
 
     def _try_one_offer(
         self,
-        offer: dict[str, object],
+        offer: Mapping[str, object],
         files: dict[str, Path],
         attempt: int,
     ) -> tuple[DeploymentResult | None, str]:

@@ -1,3 +1,4 @@
+# pyright: reportPrivateUsage=warning, reportMissingParameterType=warning, reportUnusedFunction=false, reportUnusedClass=false
 """Comprehensive tests for BatchOrchestrator ABC concrete methods.
 
 Covers the full lifecycle: instance-loss state machine, resume, deploy,
@@ -13,12 +14,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from vastai_gpu_runner.batch import BatchOrchestrator, FailureVerdict
+from vastai_gpu_runner.batch import BatchOrchestrator, FailureVerdict, RunnerFactory
 from vastai_gpu_runner.cleanup_policy import (
     CleanupResult,
     CleanupVerdict,
@@ -27,6 +28,7 @@ from vastai_gpu_runner.cleanup_policy import (
     ProviderCleanupPolicy,
 )
 from vastai_gpu_runner.runner import CloudRunner
+from vastai_gpu_runner.storage.r2 import R2Sink
 from vastai_gpu_runner.types import CloudInstance, DeploymentResult
 
 if TYPE_CHECKING:
@@ -99,6 +101,55 @@ class Unit:
     events: list[str] = field(default_factory=list)
 
 
+def _noop_runner_factory() -> CloudRunner:
+    """Default runner factory — a MagicMock CloudRunner with no-op behavior."""
+    runner = MagicMock()
+    runner.run_full_cycle = MagicMock(
+        return_value=MagicMock(
+            success=True,
+            instance=CloudInstance(instance_id="noop"),
+        )
+    )
+    runner.check_progress = MagicMock(return_value={"running": True, "complete": False})
+    runner.destroy_instance = MagicMock(return_value=True)
+    return runner
+
+
+def _mock_runner_factory(
+    *,
+    deploy_result: DeploymentResult | None = None,
+) -> RunnerFactory:
+    """Build a factory returning mock CloudRunners with controlled behaviour.
+
+    Equivalent to ``_mock_runner`` in other tests but typed as
+    ``RunnerFactory`` so it can be passed directly to the
+    ``BatchOrchestrator.__init__``.
+    """
+    from vastai_gpu_runner.types import DeploymentResult
+
+    if deploy_result is None:
+        deploy_result = DeploymentResult(
+            success=True,
+            instance=CloudInstance(
+                instance_id="inst-1",
+                ssh_host="1.2.3.4",
+                ssh_port=22,
+                cost_per_hour=0.5,
+            ),
+        )
+
+    def factory() -> CloudRunner:
+        r = CloudRunner()
+        r.run_full_cycle = MagicMock(return_value=deploy_result)  # type: ignore[method-assign]
+        r.check_progress = MagicMock(  # type: ignore[method-assign]
+            return_value={"running": True, "complete": False}
+        )
+        r.destroy_instance = MagicMock(return_value=True)  # type: ignore[method-assign]
+        return r
+
+    return factory
+
+
 class ConcreteOrchestrator(BatchOrchestrator[Unit]):
     """Minimal concrete orchestrator for unit tests.
 
@@ -111,15 +162,38 @@ class ConcreteOrchestrator(BatchOrchestrator[Unit]):
         self,
         units: list[Unit],
         cleanup_policy: ProviderCleanupPolicy | None = None,
-        **kwargs: object,
+        *,
+        runner_factory: RunnerFactory = _noop_runner_factory,
+        label_prefix: str = "test",
+        workspace_dir: str = "/tmp/test",
+        r2_sink: R2Sink | None = None,
+        r2_batch_id: str = "test-batch",
+        budget_usd: float = 0.0,
+        max_retries: int = 2,
+        max_parallel_deploys: int = 1,
+        max_parallel_collects: int = 1,
+        poll_interval_seconds: int = 30,
+        zombie_sweep_every_n_cycles: int = 5,
+        poll_timeout_seconds: float = 0.0,
     ) -> None:
         self.units = units
         self.saves: int = 0
         self.payload_calls: list[str] = []
         self.collect_calls: list[str] = []
-        super().__init__(  # type: ignore[arg-type]
+        super().__init__(
+            runner_factory=runner_factory,
+            label_prefix=label_prefix,
             cleanup_policy=cleanup_policy or _noop_cleanup_policy(),
-            **kwargs,
+            workspace_dir=workspace_dir,
+            r2_sink=r2_sink,
+            r2_batch_id=r2_batch_id,
+            budget_usd=budget_usd,
+            max_retries=max_retries,
+            max_parallel_deploys=max_parallel_deploys,
+            max_parallel_collects=max_parallel_collects,
+            poll_interval_seconds=poll_interval_seconds,
+            zombie_sweep_every_n_cycles=zombie_sweep_every_n_cycles,
+            poll_timeout_seconds=poll_timeout_seconds,
         )
 
     # -- iter hooks ----------------------------------------------------------
@@ -197,15 +271,39 @@ class ConcreteOrchestrator(BatchOrchestrator[Unit]):
         self.save_state()
 
 
-def _orch(units: list[Unit] | None = None, **kwargs: object) -> ConcreteOrchestrator:
-    """Factory for ConcreteOrchestrator with safe defaults (kwargs override defaults)."""
-    runner = _mock_runner(deploy_result=_ok_result())
-    defaults: dict[str, object] = {"label_prefix": "test"}
-    defaults.update(kwargs)
+def _orch(
+    units: list[Unit] | None = None,
+    *,
+    runner_factory: RunnerFactory | None = None,
+    label_prefix: str = "test",
+    workspace_dir: str = "/tmp/test",
+    r2_sink: R2Sink | None = None,
+    r2_batch_id: str = "test-batch",
+    budget_usd: float = 0.0,
+    max_retries: int = 2,
+    max_parallel_deploys: int = 1,
+    max_parallel_collects: int = 1,
+    poll_interval_seconds: int = 30,
+    zombie_sweep_every_n_cycles: int = 5,
+    poll_timeout_seconds: float = 0.0,
+    cleanup_policy: ProviderCleanupPolicy | None = None,
+) -> ConcreteOrchestrator:
+    """Factory for ConcreteOrchestrator with safe defaults."""
     return ConcreteOrchestrator(
         units=units or [],
-        runner_factory=lambda: runner,
-        **defaults,
+        runner_factory=runner_factory or _mock_runner_factory(deploy_result=_ok_result()),
+        label_prefix=label_prefix,
+        workspace_dir=workspace_dir,
+        r2_sink=r2_sink,
+        r2_batch_id=r2_batch_id,
+        budget_usd=budget_usd,
+        max_retries=max_retries,
+        max_parallel_deploys=max_parallel_deploys,
+        max_parallel_collects=max_parallel_collects,
+        poll_interval_seconds=poll_interval_seconds,
+        zombie_sweep_every_n_cycles=zombie_sweep_every_n_cycles,
+        poll_timeout_seconds=poll_timeout_seconds,
+        cleanup_policy=cleanup_policy,
     )
 
 
@@ -532,7 +630,7 @@ class TestHandlePreemptedUnit:
         o = self._setup(unit, runner)
         o._handle_preempted_unit(runner, _instance(), unit, unit.key)
         # destroy_instance called once
-        runner.destroy_instance.assert_called_once()
+        cast("MagicMock", runner.destroy_instance).assert_called_once()
         # instance loss recorded (retryable → on_unit_preempted → status="pending")
         assert "preempted" in unit.events
         assert unit.status == "pending"
@@ -547,7 +645,7 @@ class TestHandlePreemptedUnit:
             OSError("SSH lost")
         )
         o._handle_preempted_unit(runner, _instance(), unit, unit.key)
-        runner.destroy_instance.assert_called_once()
+        cast("MagicMock", runner.destroy_instance).assert_called_once()
         assert unit.status == "pending"
 
     def test_destroy_failure_does_not_block_loss_handling(self) -> None:
@@ -577,7 +675,7 @@ class TestDispatchUnitAction:
         o = self._setup(unit, runner)
         result = o._dispatch_unit_action(runner, _instance(), unit, _Continue())
         assert result == "running"
-        runner.destroy_instance.assert_not_called()
+        cast("MagicMock", runner.destroy_instance).assert_not_called()
         assert unit.status == "deployed"
 
     def test_preempt_action_routes_to_handle_preempted_unit(self) -> None:
@@ -599,7 +697,7 @@ class TestDispatchUnitAction:
             _Preempt(cause=_PreemptCause.WORKER_DIED, detail="fatal"),
         )
         assert result == "preempted"
-        runner.destroy_instance.assert_called_once()
+        cast("MagicMock", runner.destroy_instance).assert_called_once()
         assert "preempted" in unit.events
         assert unit.status == "pending"
 
@@ -613,7 +711,7 @@ class TestDispatchUnitAction:
         result = o._dispatch_unit_action(runner, _instance(), unit, _Complete())
         assert result == "completed"
         assert unit.status == "downloaded"
-        runner.destroy_instance.assert_called_once()
+        cast("MagicMock", runner.destroy_instance).assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -636,7 +734,7 @@ class TestFinaliseCompleted:
         assert result == "completed"
         assert unit.status == "downloaded"
         assert "completed" in unit.events
-        runner.destroy_instance.assert_called_once_with(inst)
+        cast("MagicMock", runner.destroy_instance).assert_called_once_with(inst)
         assert unit.key not in o._live_runners
 
     def test_collect_failure_calls_on_failed_and_destroy(self) -> None:
@@ -645,7 +743,7 @@ class TestFinaliseCompleted:
         result = o._finalise_completed(runner, inst, unit, unit.key)
         assert result == "failed"
         assert unit.status == "failed"
-        runner.destroy_instance.assert_called_once()
+        cast("MagicMock", runner.destroy_instance).assert_called_once()
 
     def test_collect_exception_calls_on_failed_and_destroy(self) -> None:
         unit = Unit(key="u1", status="deployed")
@@ -658,7 +756,7 @@ class TestFinaliseCompleted:
         result = o._finalise_completed(runner, inst, unit, unit.key)
         assert result == "failed"
         assert unit.status == "failed"
-        runner.destroy_instance.assert_called_once()
+        cast("MagicMock", runner.destroy_instance).assert_called_once()
 
     def test_removes_from_live_runners(self) -> None:
         unit = Unit(key="u1", status="deployed", collect_ok=True)
@@ -729,7 +827,7 @@ class TestCleanupPhase:
         inst = _instance("i1")
         o._live_runners[unit.key] = (runner, inst, unit)
         o._cleanup_phase()
-        runner.destroy_instance.assert_called_once_with(inst)
+        cast("MagicMock", runner.destroy_instance).assert_called_once_with(inst)
 
     def test_clears_live_runners(self) -> None:
         unit = Unit(key="u1", status="deployed", instance_id="i1")
@@ -784,7 +882,7 @@ class TestSweepZombies:
         o = _orch(label_prefix="myproject", cleanup_policy=policy)
         killed = o._sweep_zombies()
         assert killed == 1
-        assert {c.instance_id for c in policy._test_destroy_invocations()} == {"i1"}
+        assert {c.instance_id for c in policy._test_destroy_invocations()} == {"i1"}  # type: ignore[attr-defined]
 
     def test_exception_returns_zero(self) -> None:
         """A raising ``list_instances_fn`` returns 0 (caught by the policy)."""

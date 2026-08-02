@@ -1,3 +1,4 @@
+# pyright: reportPrivateUsage=warning, reportMissingParameterType=warning, reportUnusedFunction=false, reportUnusedClass=false
 """End-to-end stress test infrastructure for the v4 BatchOrchestrator.
 
 These tests use a concrete ``StressOrchestrator`` (a real
@@ -37,11 +38,12 @@ import json
 import random
 import threading
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from unittest.mock import MagicMock
 
-from vastai_gpu_runner.batch import BatchOrchestrator, FailureVerdict
+from vastai_gpu_runner.batch import BatchOrchestrator, FailureVerdict, RunnerFactory
 from vastai_gpu_runner.cleanup_policy import (
     CleanupResult,
     CleanupVerdict,
@@ -51,6 +53,7 @@ from vastai_gpu_runner.cleanup_policy import (
 )
 from vastai_gpu_runner.runner import CloudRunner
 from vastai_gpu_runner.state import BatchState, ShardState
+from vastai_gpu_runner.storage.r2 import R2Sink
 from vastai_gpu_runner.types import CloudInstance, DeploymentResult
 
 # ---------------------------------------------------------------------------
@@ -88,6 +91,20 @@ class StressUnit:
 # ---------------------------------------------------------------------------
 
 
+def _noop_runner_factory() -> CloudRunner:
+    """Default runner factory — a MagicMock CloudRunner with no-op behavior."""
+    runner = MagicMock()
+    runner.run_full_cycle = MagicMock(
+        return_value=MagicMock(
+            success=True,
+            instance=CloudInstance(instance_id="noop"),
+        )
+    )
+    runner.check_progress = MagicMock(return_value={"running": True, "complete": False})
+    runner.destroy_instance = MagicMock(return_value=True)
+    return runner
+
+
 class StressOrchestrator(BatchOrchestrator[StressUnit]):
     """Real ``BatchOrchestrator[StressUnit]`` for stress scenarios.
 
@@ -102,9 +119,19 @@ class StressOrchestrator(BatchOrchestrator[StressUnit]):
         self,
         state: BatchState,
         *,
-        runner_factory: object,
+        runner_factory: RunnerFactory = _noop_runner_factory,
         cleanup_policy: ProviderCleanupPolicy,
-        **kwargs: object,
+        label_prefix: str = "stress",
+        workspace_dir: str = "/tmp/stress",
+        r2_sink: R2Sink | None = None,
+        r2_batch_id: str = "stress-batch",
+        budget_usd: float = 0.0,
+        max_retries: int = 2,
+        max_parallel_deploys: int = 1,
+        max_parallel_collects: int = 1,
+        poll_interval_seconds: int = 30,
+        zombie_sweep_every_n_cycles: int = 5,
+        poll_timeout_seconds: float = 0.0,
     ) -> None:
         # In-memory mirror of state.shards so the orchestrator sees
         # the same units the consumer's persistence layer would.
@@ -131,9 +158,19 @@ class StressOrchestrator(BatchOrchestrator[StressUnit]):
         # construction. Build a parallel map.
         self._outcomes: dict[int, str] = {}
         super().__init__(
-            runner_factory=runner_factory,  # type: ignore[arg-type]
+            runner_factory=runner_factory,
             cleanup_policy=cleanup_policy,
-            **kwargs,
+            label_prefix=label_prefix,
+            workspace_dir=workspace_dir,
+            r2_sink=r2_sink,
+            r2_batch_id=r2_batch_id,
+            budget_usd=budget_usd,
+            max_retries=max_retries,
+            max_parallel_deploys=max_parallel_deploys,
+            max_parallel_collects=max_parallel_collects,
+            poll_interval_seconds=poll_interval_seconds,
+            zombie_sweep_every_n_cycles=zombie_sweep_every_n_cycles,
+            poll_timeout_seconds=poll_timeout_seconds,
         )
         self._state = state
         self._state_saves: int = 0
@@ -313,7 +350,7 @@ class StressCloudRunner(CloudRunner):
             StressCloudRunner._id_counter += 1
             self._runner_id = f"runner-{StressCloudRunner._id_counter}"
 
-    def search_offers(self) -> list[dict[str, object]]:
+    def search_offers(self, **kwargs: object) -> list[dict[str, object]]:
         """Return a single deterministic cheap offer."""
         # Mimic a real Vast.ai RTX 3060 offer (cheapest available).
         return [
@@ -338,7 +375,7 @@ class StressCloudRunner(CloudRunner):
         local_output_dir: Path,
         *,
         max_retries: int = 3,
-        offers: list[dict[str, object]] | None = None,
+        offers: Sequence[Mapping[str, object]] | None = None,
         used_machine_ids: set[str] | None = None,
         machine_lock: threading.Lock | object | None = None,
     ) -> DeploymentResult:
@@ -431,7 +468,7 @@ class StressCloudRunner(CloudRunner):
 
 def make_runner_factory(
     behaviors: Sequence[StressBehavior],
-) -> object:
+) -> RunnerFactory:
     """Build a runner factory that hands out a fresh runner per call.
 
     Each call to the returned factory creates a runner with the

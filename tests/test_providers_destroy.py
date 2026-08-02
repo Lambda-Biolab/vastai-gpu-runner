@@ -1,3 +1,4 @@
+# pyright: reportPrivateUsage=warning, reportMissingParameterType=warning, reportUnusedFunction=false, reportUnusedClass=false
 """Tests for providers.destroy — belt-and-suspenders protocol."""
 
 from __future__ import annotations
