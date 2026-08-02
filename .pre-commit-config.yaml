@@ -47,14 +47,17 @@ repos:
     hooks:
       - id: pyright
         name: pyright (src/ only)
-        entry: uv run pyright src/
+        # scripts/_pre-commit-shim.sh adds ~/.local/bin to PATH
+        # so uv is found. pre-commit's language: system subshell
+        # doesn't source the user's shell profile.
+        entry: scripts/_pre-commit-shim.sh uv run pyright src/
         language: system
         pass_filenames: false
         types: [python]
 
       - id: complexipy
         name: complexipy (cognitive complexity <=10)
-        entry: uv run complexipy src/ --max-complexity-allowed 10
+        entry: scripts/_pre-commit-shim.sh uv run complexipy src/ --max-complexity-allowed 10
         language: system
         pass_filenames: false
         types: [python]

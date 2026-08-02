@@ -253,7 +253,7 @@ def _float_or_zero(value: object) -> float:
     """
     if isinstance(value, bool):
         return 0.0
-    if isinstance(value, (int, float)) and value == value:  # not NaN
+    if isinstance(value, int | float) and value == value:  # not NaN
         return float(value)
     return 0.0
 

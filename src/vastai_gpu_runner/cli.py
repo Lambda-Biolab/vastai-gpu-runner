@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
+from rich.table import Table
 
 from vastai_gpu_runner.cleanup_policy import (
     InstanceCandidate,
@@ -216,7 +217,9 @@ def instances(
 
 
 def _populate_candidates_table(
-    table: object, candidates: object, ownership: object
+    table: Table,
+    candidates: list[InstanceCandidate],
+    ownership: OwnershipPolicy,
 ) -> tuple[float, int]:
     """Add per-candidate rows to the rich table and return aggregates.
 
@@ -568,7 +571,7 @@ def _persisted_identity(existing: object) -> tuple[str | None, str | None]:
 
     if existing is None:
         return None, None
-    if not isinstance(existing, (BatchState, JobBatchState)):  # pyright: ignore[reportUnnecessaryIsInstance]
+    if not isinstance(existing, BatchState | JobBatchState):  # pyright: ignore[reportUnnecessaryIsInstance]
         raise typer.BadParameter(
             "persisted state has unexpected type; aborting",
             param_hint="--label",
@@ -625,7 +628,7 @@ def _build_or_update_state(
             requested_label_prefix=requested_prefix,
             schema_version=CURRENT_SCHEMA_VERSION,
         )
-    if not isinstance(existing, (BatchState, JobBatchState)):  # pyright: ignore[reportUnnecessaryIsInstance]
+    if not isinstance(existing, BatchState | JobBatchState):  # pyright: ignore[reportUnnecessaryIsInstance]
         raise typer.BadParameter(
             "persisted state has unexpected type; aborting",
             param_hint="--label",
