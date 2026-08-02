@@ -305,7 +305,7 @@ def _rename_to_archive(state_path: Path) -> bool:
     return True
 
 
-def _hydrate_nested_units(state: "T", data: dict) -> "T":
+def _hydrate_nested_units(state: T, data: dict) -> T:
     """Replace ``shards``/``jobs`` raw dicts with proper dataclass instances."""
     # Use ``__dict__`` to bypass the strict attribute-access typing on the
     # generic ``state: T`` parameter: this function operates on a
