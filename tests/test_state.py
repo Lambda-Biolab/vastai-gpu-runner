@@ -1,3 +1,4 @@
+# pyright: reportPrivateUsage=warning, reportMissingParameterType=warning
 """Tests for state module — batch state persistence and properties."""
 
 from __future__ import annotations

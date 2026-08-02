@@ -1,3 +1,4 @@
+# pyright: reportPrivateUsage=warning, reportMissingParameterType=warning
 """Tests for providers.vastai.build_vastai_cleanup_policy — v4 factory.
 
 Per docs/architecture-v4-cleanup-policy.md migration step 3d.

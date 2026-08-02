@@ -1,3 +1,4 @@
+# pyright: reportPrivateUsage=warning, reportMissingParameterType=warning
 """Tests for types module — enums and dataclasses."""
 
 from __future__ import annotations

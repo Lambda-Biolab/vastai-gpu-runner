@@ -1,3 +1,4 @@
+# pyright: reportPrivateUsage=warning, reportMissingParameterType=warning
 """Tests for estimator core module."""
 
 from __future__ import annotations

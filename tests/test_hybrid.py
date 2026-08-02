@@ -1,3 +1,4 @@
+# pyright: reportPrivateUsage=warning, reportMissingParameterType=warning
 """Tests for hybrid work splitting."""
 
 from __future__ import annotations

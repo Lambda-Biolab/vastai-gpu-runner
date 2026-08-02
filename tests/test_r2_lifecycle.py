@@ -1,3 +1,4 @@
+# pyright: reportPrivateUsage=warning, reportMissingParameterType=warning
 """Tests for ``vastai_gpu_runner.storage.r2_lifecycle``.
 
 All tests run against a mock boto3 S3 client — no live R2 calls. The

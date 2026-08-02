@@ -1,3 +1,4 @@
+# pyright: reportPrivateUsage=warning, reportMissingParameterType=warning
 """End-to-end v4 cleanup-policy integration tests.
 
 The 17 scenarios from the v4 architecture's migration checklist,

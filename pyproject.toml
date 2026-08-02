@@ -78,9 +78,13 @@ convention = "google"
 
 # --- Pyright ---
 [tool.pyright]
+# Tests are first-class code — type-check them here so the gate
+# (which runs `pyright src/ tests/`) and the in-repo config stay
+# in sync. Excluding tests/ hides real type errors that the v1.4.0
+# closeout for bioml-tools found in 66 places.
 pythonVersion = "3.11"
 typeCheckingMode = "strict"
-include = ["src"]
+include = ["src", "tests"]
 useLibraryCodeForTypes = false
 reportMissingTypeStubs = false
 reportUnknownMemberType = "none"
@@ -88,6 +92,7 @@ reportUnknownVariableType = "none"
 reportUnknownParameterType = "none"
 reportUnknownArgumentType = "none"
 reportUnknownLambdaType = "none"
+
 reportMissingTypeArgument = "none"
 
 # --- Complexipy ---

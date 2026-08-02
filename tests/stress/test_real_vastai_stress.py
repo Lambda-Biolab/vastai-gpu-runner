@@ -1,3 +1,4 @@
+# pyright: reportPrivateUsage=warning, reportMissingParameterType=warning
 """End-to-end real-Vast.ai stress test on the cheapest GPUs.
 
 Unlike the in-memory mock suite in ``test_orchestrator_stress.py``,

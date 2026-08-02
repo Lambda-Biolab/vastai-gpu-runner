@@ -1,3 +1,4 @@
+# pyright: reportPrivateUsage=warning, reportMissingParameterType=warning
 """Tests for BatchOrchestrator ABC.
 
 Uses a mock CloudRunner and a concrete in-memory orchestrator subclass.

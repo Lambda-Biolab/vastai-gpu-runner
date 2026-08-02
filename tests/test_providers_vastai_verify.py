@@ -1,3 +1,4 @@
+# pyright: reportPrivateUsage=warning, reportMissingParameterType=warning
 """Tests for providers.vastai.verify_instance_ownership — CLI-side ownership check.
 
 Per docs/architecture-v4-cleanup-policy.md migration step 3c.

@@ -1,3 +1,4 @@
+# pyright: reportPrivateUsage=warning, reportMissingParameterType=warning
 """Tests for worker base class and health checks."""
 
 from __future__ import annotations

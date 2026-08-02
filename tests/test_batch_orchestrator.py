@@ -1,3 +1,4 @@
+# pyright: reportPrivateUsage=warning, reportMissingParameterType=warning
 """Comprehensive tests for BatchOrchestrator ABC concrete methods.
 
 Covers the full lifecycle: instance-loss state machine, resume, deploy,

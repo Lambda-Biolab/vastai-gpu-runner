@@ -1,3 +1,4 @@
+# pyright: reportPrivateUsage=warning, reportMissingParameterType=warning
 """Tests for CloudRunner base class."""
 
 from __future__ import annotations

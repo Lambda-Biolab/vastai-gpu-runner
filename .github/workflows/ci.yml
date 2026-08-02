@@ -41,7 +41,10 @@ jobs:
           uv run ruff check src/ tests/
 
       - name: Type check with pyright
-        run: uv run pyright src/
+        # Tests are first-class code — caught here so the gate stays
+        # in sync with the opencode-config standard. [tool.pyright].include
+        # in pyproject.toml already includes "tests".
+        run: uv run pyright src/ tests/
 
       - name: Check complexity
         run: uv run complexipy src/ --max-complexity-allowed 10

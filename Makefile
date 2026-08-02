@@ -34,7 +34,7 @@ lint_fix:
 	$(PY) ruff check --fix src/ tests/
 
 type:
-	$(PY) pyright src/
+	$(PY) pyright src/ tests/
 
 complexity:
 	$(PY) complexipy src/

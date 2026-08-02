@@ -1,3 +1,4 @@
+# pyright: reportPrivateUsage=warning, reportMissingParameterType=warning
 """Tests for the v4 CLI composition roots.
 
 Pins the new ``--label`` validation, the empty / blank / padded

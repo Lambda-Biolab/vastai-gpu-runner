@@ -1,3 +1,4 @@
+# pyright: reportPrivateUsage=warning, reportMissingParameterType=warning
 """Tests for unit_lifecycle — per-cycle decision tree."""
 
 from __future__ import annotations
