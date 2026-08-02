@@ -69,7 +69,7 @@ class TestCloudRunner:
         ]
         result = runner.run_full_cycle({}, Path("/tmp/test"), offers=offers)
         assert result.success is True
-        cast("MagicMock", runner.destroy_instance).assert_called_once_with(inst1)
+        runner.destroy_instance.assert_called_once_with(inst1)
 
     def test_machine_dedup(self) -> None:
         """Skips machines already claimed by other threads."""

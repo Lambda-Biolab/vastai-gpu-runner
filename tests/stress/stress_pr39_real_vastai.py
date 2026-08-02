@@ -59,7 +59,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
@@ -158,7 +158,7 @@ def _make_config() -> DeploymentConfig:
     )
 
 
-def _r2_client() -> boto3.client:
+def _r2_client() -> "Any":
     """Real boto3 S3 client from R2_* env vars."""
     return boto3.client(
         "s3",
@@ -169,7 +169,7 @@ def _r2_client() -> boto3.client:
     )
 
 
-def _list_marker_objects(client: boto3.client, bucket: str, prefix: str) -> list[str]:
+def _list_marker_objects(client: "Any", bucket: str, prefix: str) -> list[str]:
     """List all objects under ``prefix`` that look like DONE markers."""
     paginator = client.get_paginator("list_objects_v2")
     keys: list[str] = []
@@ -179,7 +179,7 @@ def _list_marker_objects(client: boto3.client, bucket: str, prefix: str) -> list
     return keys
 
 
-def _delete_prefix(client: boto3.client, bucket: str, prefix: str) -> int:
+def _delete_prefix(client: "Any", bucket: str, prefix: str) -> int:
     """Delete every object under ``prefix``. Returns count."""
     paginator = client.get_paginator("list_objects_v2")
     keys: list[dict[str, str]] = []

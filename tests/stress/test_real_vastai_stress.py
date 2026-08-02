@@ -45,7 +45,7 @@ from vastai_gpu_runner.providers.destroy_adapters.vastai import (
 from vastai_gpu_runner.providers.vastai import (
     vastai_cmd,
 )
-from vastai_gpu_runner.types import CloudInstance, DeploymentResult
+from vastai_gpu_runner.types import CloudInstance, DeploymentConfig, DeploymentResult
 
 # Skip the entire module if VASTAI_API_KEY is not set; this is the
 # canonical "run me only when you mean it" gate.
@@ -94,7 +94,7 @@ def _teardown(instance: CloudInstance, *, label: str) -> None:
     """Best-effort destroy. Logs but never raises — tests must not
     leak instances even on assertion failure.
     """
-    if instance is None or not instance.instance_id:
+    if instance is None or not instance.instance_id:  # type: ignore[unnecessary-comparison]
         return
     try:
         from vastai_gpu_runner.providers.destroy import DestroyRefusal
@@ -351,7 +351,8 @@ def test_real_cheapest_rtx_3060_visible_to_v4_policy() -> None:
 # ---------------------------------------------------------------------------
 
 
-def make_deployment_config() -> object:
+def make_deployment_config() -> DeploymentConfig:
+
     """Build a minimal real ``DeploymentConfig`` for VastaiRunner.
 
     The v4 VastaiRunner requires a real ``DeploymentConfig`` (not a
@@ -366,8 +367,6 @@ def make_deployment_config() -> object:
     a higher retry count would spin up multiple instances and
     exceed the budget on a host that doesn't boot cleanly.
     """
-    from vastai_gpu_runner.types import DeploymentConfig
-
     return DeploymentConfig(
         gpu_model="RTX_3060",
         max_cost_per_hour=0.20,  # < the cheapest RTX 3060
