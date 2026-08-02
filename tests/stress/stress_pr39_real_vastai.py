@@ -425,6 +425,16 @@ def main() -> int:
     admin_creds_file.write_text(
         f'export R2_ADMIN_ENDPOINT="{os.environ["R2_ADMIN_ENDPOINT"]}"\n'
         f'export R2_ADMIN_ACCESS_KEY_ID="{os.environ["R2_ADMIN_ACCESS_KEY_ID"]}"\n'
+        # codeql[py/clear-text-storage-sensitive-data] ignore: the
+        # credential is read from $R2_ADMIN_SECRET_ACCESS_KEY at
+        # test invocation time, not hardcoded. Written to a
+        # per-invocation mkdtemp() dir (mode 700), used in-memory
+        # by the r2-lifecycle subprocess, and the file is not
+        # committed. The r2-lifecycle CLI's only auth option is a
+        # credentials file, so this is the minimal-friction way
+        # to pass the keys. (Belt-and-suspenders with the
+        # .codeqlignore entry at the repo root, in case the
+        # org-level CodeQL scan doesn't pick that up.)
         f'export R2_ADMIN_SECRET_ACCESS_KEY="{os.environ["R2_ADMIN_SECRET_ACCESS_KEY"]}"\n'
     )
 
