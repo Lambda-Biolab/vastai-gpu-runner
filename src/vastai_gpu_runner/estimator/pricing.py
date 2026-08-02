@@ -42,38 +42,57 @@ def query_vastai_pricing(
     if gpu_types is None:
         gpu_types = list(GPU_TYPES)
 
-    results: dict[str, PriceSummary] = {}
-
-    for gpu_type in gpu_types:
-        config = DeploymentConfig(
-            gpu_model=gpu_type,
+    return {
+        gpu_type: _query_one_gpu_type(
+            gpu_type,
             max_cost_per_hour=max_cost_per_hour,
             min_network_mbps=min_network_mbps,
             min_reliability=min_reliability,
         )
-        runner = VastaiRunner(config)
-        offers = runner.search_offers()
+        for gpu_type in gpu_types
+    }
 
-        if offers:
-            prices = [float(str(o.get("dph_total", 0.0))) for o in offers if o.get("dph_total")]
-            if prices:
-                results[gpu_type] = PriceSummary(
-                    gpu_type=gpu_type,
-                    available_count=len(prices),
-                    min_price_hr=min(prices),
-                    max_price_hr=max(prices),
-                    median_price_hr=statistics.median(prices),
-                )
-                continue
 
-        # Fallback to static prices
-        fb = FALLBACK_PRICES.get(gpu_type, 0.30)
-        results[gpu_type] = PriceSummary(
-            gpu_type=gpu_type,
-            available_count=0,
-            min_price_hr=fb,
-            max_price_hr=fb,
-            median_price_hr=fb,
-        )
+def _query_one_gpu_type(
+    gpu_type: str,
+    *,
+    max_cost_per_hour: float,
+    min_network_mbps: int,
+    min_reliability: float,
+) -> PriceSummary:
+    """Query live Vast.ai pricing for one GPU type, with fallback.
 
-    return results
+    Extracted from ``query_vastai_pricing`` to keep the public
+    function's complexity under the org threshold (10). The
+    fallback uses ``FALLBACK_PRICES`` when the live query returns
+    no offers (e.g. transient CLI failure or GPU type out of stock).
+    """
+    config = DeploymentConfig(
+        gpu_model=gpu_type,
+        max_cost_per_hour=max_cost_per_hour,
+        min_network_mbps=min_network_mbps,
+        min_reliability=min_reliability,
+    )
+    runner = VastaiRunner(config)
+    offers = runner.search_offers()
+
+    if offers:
+        prices = [float(str(o.get("dph_total", 0.0))) for o in offers if o.get("dph_total")]
+        if prices:
+            return PriceSummary(
+                gpu_type=gpu_type,
+                available_count=len(prices),
+                min_price_hr=min(prices),
+                max_price_hr=max(prices),
+                median_price_hr=statistics.median(prices),
+            )
+
+    # Fallback to static prices.
+    fb = FALLBACK_PRICES.get(gpu_type, 0.30)
+    return PriceSummary(
+        gpu_type=gpu_type,
+        available_count=0,
+        min_price_hr=fb,
+        max_price_hr=fb,
+        median_price_hr=fb,
+    )

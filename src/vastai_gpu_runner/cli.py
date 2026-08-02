@@ -209,6 +209,28 @@ def instances(
     table.add_column("$/hr", justify="right", style="green")
     table.add_column("Owned", justify="center")
 
+    total_hourly, running = _populate_candidates_table(
+        table, candidates, ownership
+    )
+
+    console.print(table)
+    console.print(
+        f"\nRunning: {running}/{len(candidates)}, "
+        f"Total: ${total_hourly:.2f}/hr"
+    )
+
+
+def _populate_candidates_table(
+    table: object, candidates: object, ownership: object
+) -> tuple[float, int]:
+    """Add per-candidate rows to the rich table and return aggregates.
+
+    Extracted from the ``instances`` Typer command to keep the
+    command's complexity under the org threshold (10). The
+    aggregate counters (total hourly cost, running count) are
+    computed in the same pass as the row rendering to avoid a
+    second iteration over the candidate list.
+    """
     total_hourly = 0.0
     running = 0
     for c in candidates:
@@ -224,9 +246,7 @@ def instances(
             f"${c.cost_per_hour:.3f}",
             "[green]yes[/green]" if owned else "[red]no[/red]",
         )
-
-    console.print(table)
-    console.print(f"\nRunning: {running}/{len(candidates)}, Total: ${total_hourly:.2f}/hr")
+    return total_hourly, running
 
 
 # ---------------------------------------------------------------------------

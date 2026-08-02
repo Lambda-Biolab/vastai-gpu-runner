@@ -44,7 +44,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import ClassVar, TypeVar
+from typing import ClassVar, TypeVar, cast
 
 T = TypeVar("T")
 
@@ -311,21 +311,51 @@ def _hydrate_nested_units(state: T, data: dict) -> T:
     # generic ``state: T`` parameter: this function operates on a
     # runtime instance of either BatchState or JobBatchState.
     state_dict = state.__dict__
-    if "shards" in state_dict and isinstance(data.get("shards"), list):
-        try:
-            state_dict["shards"] = [ShardState(**s) for s in data["shards"]]
-        except (TypeError, ValueError) as exc:
-            raise StateMigrationError(
-                f"could not deserialize {type(state).__name__}.shards: {exc}"
-            ) from exc
-    if "jobs" in state_dict and isinstance(data.get("jobs"), list):
-        try:
-            state_dict["jobs"] = [JobState(**j) for j in data["jobs"]]
-        except (TypeError, ValueError) as exc:
-            raise StateMigrationError(
-                f"could not deserialize {type(state).__name__}.jobs: {exc}"
-            ) from exc
+    _replace_nested_list(
+        state_dict,
+        data,
+        key="shards",
+        dataclass=ShardState,
+        owner_name=type(state).__name__,
+    )
+    _replace_nested_list(
+        state_dict,
+        data,
+        key="jobs",
+        dataclass=JobState,
+        owner_name=type(state).__name__,
+    )
     return state
+
+
+def _replace_nested_list(
+    state_dict: dict[str, object],
+    data: dict[str, object],
+    *,
+    key: str,
+    dataclass: type[object],
+    owner_name: str,
+) -> None:
+    """Replace one nested list on ``state_dict`` with dataclass instances.
+
+    Extracted from ``_hydrate_nested_units`` to keep the function's
+    complexity under the org threshold (10). The state has either
+    ``shards`` (BatchState) or ``jobs`` (JobBatchState); we rebuild
+    whichever one is present, fail-closed on bad data.
+    """
+    if key not in state_dict or not isinstance(data.get(key), list):
+        return
+    raw_list = data[key]
+    # Type narrowed by the isinstance check above (without the
+    # negation). Cast to satisfy the type checker: at this point
+    # raw_list is guaranteed to be a list[object].
+    raw_list_typed = cast("list[object]", raw_list)
+    try:
+        state_dict[key] = [dataclass(**item) for item in raw_list_typed]  # type: ignore[operator]
+    except (TypeError, ValueError) as exc:
+        raise StateMigrationError(
+            f"could not deserialize {owner_name}.{key}: {exc}"
+        ) from exc
 
 
 def load_batch_state(state_path: Path, *, state_cls: type[T]) -> T | None:
