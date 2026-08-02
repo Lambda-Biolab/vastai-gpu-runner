@@ -47,7 +47,7 @@ class CloudRunner:
         """Search for GPU offers matching the deployment config."""
         return []
 
-    def create_instance(self, offer: dict[str, object]) -> CloudInstance:
+    def create_instance(self, offer: Mapping[str, object]) -> CloudInstance:
         """Create a cloud instance from an offer."""
         raise NotImplementedError
 
@@ -199,7 +199,7 @@ class CloudRunner:
 
     def _try_one_offer(
         self,
-        offer: dict[str, object],
+        offer: Mapping[str, object],
         files: dict[str, Path],
         attempt: int,
     ) -> tuple[DeploymentResult | None, str]:

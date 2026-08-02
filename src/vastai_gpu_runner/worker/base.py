@@ -222,8 +222,27 @@ class BaseWorker(ABC):
             return
 
         try:
-            url = f"https://console.vast.ai/api/v0/instances/{instance_id}/?api_key={api_key}"
+            from urllib.parse import urlparse
+
+            # Vast.ai's destroy-instance endpoint. We embed the API
+            # key in the query string (matches the v0 REST API). The
+            # endpoint host is hardcoded so the URL can only point at
+            # console.vast.ai; we parse and assert this before the
+            # network call so a malicious env var can't redirect to
+            # an attacker-controlled host.
+            endpoint_host = "console.vast.ai"
+            path = f"/api/v0/instances/{instance_id}/"
+            query = f"api_key={api_key}"
+            url = f"https://{endpoint_host}{path}?{query}"
+            parsed = urlparse(url)
+            if parsed.hostname != endpoint_host:
+                msg = f"refusing to call non-Vast.ai host: {parsed.hostname!r}"
+                raise ValueError(msg)
             req = urllib.request.Request(url, method="DELETE")
+            # bandit B310 / ruff S310: host is verified above
+            # (parsed.hostname == endpoint_host). The urlopen can
+            # only ever hit console.vast.ai regardless of
+            # instance_id/api_key contents.
             urllib.request.urlopen(req, timeout=15)  # noqa: S310
             logger.info("Self-destruct: instance %s destroyed", instance_id)
         except Exception as exc:
