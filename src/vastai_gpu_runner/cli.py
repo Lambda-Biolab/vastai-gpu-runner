@@ -209,15 +209,10 @@ def instances(
     table.add_column("$/hr", justify="right", style="green")
     table.add_column("Owned", justify="center")
 
-    total_hourly, running = _populate_candidates_table(
-        table, candidates, ownership
-    )
+    total_hourly, running = _populate_candidates_table(table, candidates, ownership)
 
     console.print(table)
-    console.print(
-        f"\nRunning: {running}/{len(candidates)}, "
-        f"Total: ${total_hourly:.2f}/hr"
-    )
+    console.print(f"\nRunning: {running}/{len(candidates)}, Total: ${total_hourly:.2f}/hr")
 
 
 def _populate_candidates_table(

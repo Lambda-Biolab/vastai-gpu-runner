@@ -353,9 +353,7 @@ def _replace_nested_list(
     try:
         state_dict[key] = [dataclass(**item) for item in raw_list_typed]  # type: ignore[operator]
     except (TypeError, ValueError) as exc:
-        raise StateMigrationError(
-            f"could not deserialize {owner_name}.{key}: {exc}"
-        ) from exc
+        raise StateMigrationError(f"could not deserialize {owner_name}.{key}: {exc}") from exc
 
 
 def load_batch_state(state_path: Path, *, state_cls: type[T]) -> T | None:
