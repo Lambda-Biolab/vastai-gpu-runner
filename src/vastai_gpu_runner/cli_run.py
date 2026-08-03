@@ -16,6 +16,14 @@ from vastai_gpu_runner.types import CloudInstance, DeploymentConfig, Provider
 logger = logging.getLogger(__name__)
 
 
+def _setup_logging(verbose: bool) -> None:
+    """Configure stdlib logging for the local-run CLI invocation."""
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="%(message)s",
+    )
+
+
 def run(
     files: Annotated[
         list[Path] | None,
@@ -46,17 +54,14 @@ def run(
     ] = 300.0,
     poll_interval: Annotated[
         float,
-        typer.Option("--poll-interval", min=0.0, help="Seconds between progress checks."),
+        typer.Option("--poll-interval", min=0.001, help="Seconds between progress checks."),
     ] = 1.0,
     verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Show detailed logs.")] = False,
 ) -> None:
     """Run a worker locally without cloud credentials."""
     _validate_provider(provider)
     file_map = _build_payload_map(files, worker_script)
-    logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.INFO,
-        format="%(message)s",
-    )
+    _setup_logging(verbose)
     console = Console()
     runner = LocalRunner(DeploymentConfig(worker_script=worker_script))
     result = runner.run_full_cycle(

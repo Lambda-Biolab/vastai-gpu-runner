@@ -89,7 +89,28 @@ class LocalRunner(CloudRunner):
         files: dict[str, Path],
     ) -> bool:
         """Copy payload files into the local temporary workspace."""
+        if not files:
+            return True
         workspace = self._workspace(instance)
+        copied, failed = self._copy_payload_files(instance, workspace, files)
+        if failed:
+            return False
+        if not copied:
+            logger.error(
+                "deploy_files: no payload files existed for instance %s",
+                instance.instance_id,
+            )
+            return False
+        return True
+
+    def _copy_payload_files(
+        self,
+        instance: CloudInstance,
+        workspace: Path,
+        files: dict[str, Path],
+    ) -> tuple[int, bool]:
+        """Copy each payload file; return (count_copied, any_failure)."""
+        copied = 0
         for remote_name, local_path in files.items():
             if not local_path.exists():
                 logger.warning("Local file not found: %s", local_path)
@@ -100,8 +121,9 @@ class LocalRunner(CloudRunner):
                 shutil.copy(local_path, destination)
             except (OSError, ValueError) as exc:
                 logger.error("Failed to copy %s into %s: %s", local_path, workspace, exc)
-                return False
-        return True
+                return copied, True
+            copied += 1
+        return copied, False
 
     def setup_environment(self, instance: CloudInstance) -> bool:
         """Skip environment setup because execution is already local."""
@@ -168,7 +190,9 @@ class LocalRunner(CloudRunner):
         """List files in the local workspace as relative POSIX paths."""
         workspace = self._workspace(instance)
         return sorted(
-            str(path.relative_to(workspace)) for path in workspace.rglob("*") if path.is_file()
+            str(path.relative_to(workspace))
+            for path in workspace.rglob("*")
+            if path.is_file() and not path.is_symlink()
         )
 
     def download_file(
@@ -198,29 +222,42 @@ class LocalRunner(CloudRunner):
         critical_files: set[str] | None = None,
     ) -> list[str]:
         """Copy local workspace results without invoking rsync or SSH."""
-        workspace = self._workspace(instance)
-        if remote_subdir:
-            source_dir = self._workspace_path(instance, remote_subdir)
-        else:
-            source_dir = workspace
+        source_dir = self._source_directory(instance, remote_subdir)
         if not source_dir.is_dir():
             return []
         local_dir.mkdir(parents=True, exist_ok=True)
+        downloaded = self._collect_local_results(instance, source_dir, local_dir)
+        if critical_files and downloaded:
+            return self._verify_critical_files(downloaded, critical_files)
+        return downloaded
+
+    def _source_directory(self, instance: CloudInstance, remote_subdir: str) -> Path:
+        """Resolve the workspace directory or one nested subdirectory."""
+        if remote_subdir:
+            return self._workspace_path(instance, remote_subdir)
+        return self._workspace(instance)
+
+    def _collect_local_results(
+        self,
+        instance: CloudInstance,
+        source_dir: Path,
+        local_dir: Path,
+    ) -> list[str]:
+        """Copy every non-symlink file under *source_dir* into *local_dir*."""
+        workspace = self._workspace(instance)
         downloaded: list[str] = []
         for source in sorted(source_dir.rglob("*")):
-            if not source.is_file():
+            if source.is_symlink() or not source.is_file():
                 continue
             relative = source.relative_to(workspace)
             destination = local_dir / relative
             if self.download_file(instance, str(relative), destination):
                 downloaded.append(str(destination.relative_to(local_dir)))
-        if critical_files and downloaded:
-            downloaded = self._filter_critical(downloaded, critical_files)
         return downloaded
 
     @staticmethod
-    def _filter_critical(downloaded: list[str], critical_files: set[str]) -> list[str]:
-        """Return only downloads that satisfy every critical-file requirement."""
+    def _verify_critical_files(downloaded: list[str], critical_files: set[str]) -> list[str]:
+        """Return ``[]`` when any critical filename is missing from *downloaded*."""
         downloaded_names = {Path(path).name for path in downloaded}
         if critical_files - downloaded_names:
             return []

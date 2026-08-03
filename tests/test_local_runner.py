@@ -34,6 +34,8 @@ class _FakeProcess:
         self.returncode = -15
 
     def wait(self, timeout: float | None = None) -> int:
+        # The timeout → kill fallback is exercised by the real-subprocess
+        # integration test; the unit tests focus on happy-path destroy.
         del timeout
         return self.returncode if self.returncode is not None else 0
 
@@ -96,10 +98,19 @@ class TestLocalRunner:
     def test_deploy_files_skips_missing_sources(self, tmp_path: Path) -> None:
         runner = LocalRunner()
         instance = runner.create_instance({"machine_id": "local"})
+        present = tmp_path / "present.txt"
+        present.write_text("ok")
 
         try:
-            assert runner.deploy_files(instance, {"missing.txt": tmp_path / "missing.txt"}) is True
-            assert runner.list_remote_files(instance) == []
+            assert (
+                runner.deploy_files(
+                    instance,
+                    {"present.txt": present, "missing.txt": tmp_path / "missing.txt"},
+                )
+                is True
+            )
+            assert runner.list_remote_files(instance) == ["present.txt"]
+            assert runner.deploy_files(instance, {"missing.txt": tmp_path / "missing.txt"}) is False
         finally:
             runner.destroy_instance(instance)
 
