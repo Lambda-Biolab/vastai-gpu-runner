@@ -58,6 +58,22 @@ description = "general allowlist"
 # We allowlist specific test fixture files; not the whole tests/ tree.
 # The f-string rule still fires on the pattern, which is the right
 # signal even when the value is fake.
+#
+# paths: false-positive file locations. gitleaks reports paths with
+# the absolute path or just the file name depending on the source
+# mode. We anchor the regex so it matches both.
+paths = [
+  # SSH public key fingerprints from real Vast.ai test deployments.
+  # These are ED25519 fingerprints (high-entropy hex) that look like
+  # generic-api-key matches but are actually public keys, not secrets.
+  '(^|.*/)batch_diagnostics/.*',
+  # Internal AI-assistant handoff documents with UUIDs and broker
+  # keys that match generic-api-key but are not real secrets.
+  '(^|.*/)\.opencode/handoffs/.*',
+  # detect-secrets baseline file (contains SHA1-like hashes, not
+  # real secrets).
+  '(^|.*/)\.secrets\.baseline(\.new)?$',
+]
 regexes = [
     # The Vast.ai API key documentation example.
     '''VASTAI_API_KEY="topsecret"''',
