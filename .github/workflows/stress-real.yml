@@ -37,7 +37,7 @@ name: stress-real
 # only fails when the secrets ARE set AND a real cloud bug surfaces.
 # That way the cost is bounded to "we opted in to run this".
 
-on:
+"on":
   workflow_dispatch:
     inputs:
       max_budget_usd:
