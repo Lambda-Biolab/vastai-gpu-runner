@@ -6,7 +6,7 @@ requires-python = ">=3.11"
 authors = [{ name = "antomicblitz" }]
 
 dependencies = [
-    "boto3>=1.43.59",
+    "boto3>=1.43.62",
     "requests>=2.34.2",
     "typer>=0.27.0",
     "rich>=13.0",
@@ -17,7 +17,7 @@ vastai-gpu-runner = "vastai_gpu_runner.cli:app"
 
 [dependency-groups]
 dev = [
-    "ruff>=0.16.0",
+    "ruff>=0.16.1",
     "pyright>=1.1.411",
     "pytest>=9.1.1",
     "pytest-cov",
