@@ -94,7 +94,7 @@ See [docs/architecture.md](docs/architecture.md) for design decisions.
 git clone https://github.com/antomicblitz/vastai-gpu-runner.git
 cd vastai-gpu-runner
 uv sync
-uv run pytest          # 68 tests
+uv run pytest          # 623 tests
 uv run ruff check src/ # linting
 uv run pyright src/    # type checking
 ```
