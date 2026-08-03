@@ -17,3 +17,6 @@ batch_diagnostics/
 node_modules/
 package-lock.json
 package.json
+.playwright-mcp/
+.opencode/
+.opencode/handoffs/

@@ -1,0 +1,869 @@
+"""Batch orchestrator for cloud GPU workloads.
+
+``BatchOrchestrator`` is the template-method ABC that sits one layer above
+``CloudRunner``. Where ``CloudRunner`` handles the lifecycle of a *single*
+instance (search → create → boot → verify → deploy → launch → poll →
+download → destroy), ``BatchOrchestrator`` coordinates the lifecycle of
+*many* units in parallel — deploying, polling, classifying failures,
+handling instance loss, and resuming from a crash-recovery checkpoint.
+
+A "unit" is either a shard (``ShardState``, N items per GPU) or a job
+(``JobState``, 1 item per GPU). Consumers choose the shape by implementing
+the ``iter_*`` hook methods over their own batch-state type.
+
+Design principles:
+
+1. **No provider coupling.** The orchestrator talks to a ``CloudRunner``
+   factory exclusively. Vast.ai, RunPod, or a mock all work the same.
+
+2. **Consumer owns state.** The orchestrator drives *events*
+   (``on_unit_deployed``, ``on_unit_failed``, ``on_unit_completed``,
+   ``on_unit_preempted``); the consumer updates its own ``BatchState`` /
+   ``JobBatchState`` object and persists it via ``save_state``. Status
+   strings, field names, and retry accounting all live in consumer code.
+
+3. **Hooks are narrow.** The orchestrator asks the consumer:
+   - What units are pending / active / completed? (``iter_*``)
+   - What files does this unit need? (``build_unit_payload``)
+   - Can I reconstruct a live instance on resume? (``reconstruct_instance``)
+   - Where do I download results? (``collect_unit_results``)
+   - Is this unit already done in R2? (``unit_is_done_in_r2``)
+   - How do I label it in logs? (``unit_label``)
+   - Is this failure retryable? (``classify_failure``)
+
+4. **Drift-free symmetry.** Boltz-2 and OpenMM share exactly the same
+   orchestration loop via this class. Bug fixes land once.
+
+Usage sketch::
+
+    class MyOrch(BatchOrchestrator[ShardState]):
+        def __init__(self, state: BatchState, ...):
+            super().__init__(...)
+            self._state = state
+
+        def iter_pending_units(self):
+            return list(self._state.pending_shards)
+
+        def on_unit_deployed(self, unit, instance):
+            unit.instance_id = instance.instance_id
+            unit.ssh_host = instance.ssh_host
+            unit.ssh_port = instance.ssh_port
+            unit.cost_per_hour = instance.cost_per_hour
+            unit.status = "deployed"
+            self.save_state()
+
+        # ... etc
+
+The ABC does NOT handle: weight uploads, local GPU hybrid mode, shard input
+preparation. Those live in the consumer. The ABC handles only the cloud
+lifecycle loop.
+
+The v4 architecture delegates zombie cleanup to a
+:class:`vastai_gpu_runner.cleanup_policy.ProviderCleanupPolicy`. The
+policy is required; ``_sweep_zombies`` is policy-driven: enumerate via
+``policy.list_instances()``, filter by the exact delimited scope
+``f"{label_prefix}-"`` so adjacent scopes like ``f"{label_prefix}evil"``
+cannot match, exclude tracked IDs, call ``policy.destroy(candidate)`` per
+candidate, and log every non-``DESTROYED`` outcome at severity matching
+operational impact.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import logging
+import threading
+import time
+from abc import ABC, abstractmethod
+from collections.abc import Callable, Iterable
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import TYPE_CHECKING, Generic, Literal, Protocol, TypeVar
+
+from vastai_gpu_runner.orchestrator import check_budget
+from vastai_gpu_runner.state import validate_label_prefix
+from vastai_gpu_runner.unit_lifecycle import (
+    Complete,
+    Continue,
+    Preempt,
+    UnitAction,
+    decide_next_action,
+)
+
+if TYPE_CHECKING:
+    from vastai_gpu_runner.cleanup_policy import (
+        ProviderCleanupPolicy,
+    )
+    from vastai_gpu_runner.runner import CloudRunner
+    from vastai_gpu_runner.storage.r2 import R2Sink
+    from vastai_gpu_runner.types import CloudInstance
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Protocols
+# ---------------------------------------------------------------------------
+
+
+class BatchUnit(Protocol):
+    """Structural type for one unit of work in a batch.
+
+    Both ``state.ShardState`` and ``state.JobState`` satisfy this protocol.
+    """
+
+    instance_id: str
+    ssh_host: str
+    ssh_port: int
+    cost_per_hour: float
+    status: str
+    retry_count: int
+
+
+RunnerFactory = Callable[[], "CloudRunner"]
+"""Factory returning a fresh ``CloudRunner`` for one deploy attempt."""
+
+
+UnitT = TypeVar("UnitT", bound=BatchUnit)
+
+FailureVerdict = Literal["retry", "fatal"]
+
+
+# ---------------------------------------------------------------------------
+# BatchOrchestrator ABC
+# ---------------------------------------------------------------------------
+
+
+class BatchOrchestrator(ABC, Generic[UnitT]):
+    """Abstract batch orchestrator for cloud GPU workloads.
+
+    See module docstring for design overview. Generic over unit type
+    (``ShardState`` or ``JobState``).
+    """
+
+    def __init__(
+        self,
+        *,
+        runner_factory: RunnerFactory,
+        label_prefix: str,
+        cleanup_policy: ProviderCleanupPolicy,
+        workspace_dir: str = "/workspace",
+        r2_sink: R2Sink | None = None,
+        r2_batch_id: str = "",
+        budget_usd: float = 0.0,
+        max_retries: int = 2,
+        max_parallel_deploys: int = 16,
+        max_parallel_collects: int = 1,
+        poll_interval_seconds: int = 30,
+        zombie_sweep_every_n_cycles: int = 5,
+        poll_timeout_seconds: float = 0.0,
+    ) -> None:
+        """Initialise orchestrator state. See class docstring for argument meanings.
+
+        ``cleanup_policy`` is required (v4): ``_sweep_zombies`` delegates
+        enumeration + destruction to a ``ProviderCleanupPolicy``.
+
+        ``label_prefix`` is validated against ``validate_label_prefix``
+        before any provider call: empty, whitespace-only, or padded
+        values raise ``ValueError`` immediately.
+
+        ``max_parallel_collects`` controls how many terminal units are
+        finalised (``collect_unit_results`` + ``destroy_instance``)
+        concurrently within a single poll cycle. Default 1 preserves
+        sequential semantics. Raise it when many units complete around
+        the same wall-clock time and the download step is I/O-bound
+        (e.g. rsync over SSH); bandwidth-constrained environments should
+        leave it at 1 or 2.
+        """
+        if max_parallel_collects < 1:
+            msg = f"max_parallel_collects must be >= 1, got {max_parallel_collects}"
+            raise ValueError(msg)
+        self._runner_factory = runner_factory
+        self._label_prefix = validate_label_prefix(label_prefix)
+        self._cleanup_policy = cleanup_policy
+        self._workspace_dir = workspace_dir
+        self._r2_sink = r2_sink
+        self._r2_batch_id = r2_batch_id
+        self._budget_usd = budget_usd
+        self._max_retries = max_retries
+        self._max_parallel_deploys = max_parallel_deploys
+        self._max_parallel_collects = max_parallel_collects
+        self._poll_interval_seconds = poll_interval_seconds
+        self._zombie_sweep_every_n_cycles = zombie_sweep_every_n_cycles
+        self._poll_timeout_seconds = poll_timeout_seconds
+
+        # Live runner registry: unit_key → (runner, instance, unit)
+        self._live_runners: dict[str, tuple[CloudRunner, CloudInstance, UnitT]] = {}
+        self._state_lock = threading.Lock()
+        self._used_machine_ids: set[str] = set()
+
+    # -- Domain hooks (subclasses override) --------------------------------
+
+    @abstractmethod
+    def iter_pending_units(self) -> Iterable[UnitT]:
+        """Units that have not yet been deployed (status == pending)."""
+
+    @abstractmethod
+    def iter_active_units(self) -> Iterable[UnitT]:
+        """Units that are currently deployed or running (need polling)."""
+
+    @abstractmethod
+    def iter_failed_units(self) -> Iterable[UnitT]:
+        """Units that failed and may be eligible for re-deploy."""
+
+    @abstractmethod
+    def iter_completed_units(self) -> Iterable[UnitT]:
+        """Units whose results have been downloaded (terminal, skip)."""
+
+    @abstractmethod
+    def save_state(self) -> None:
+        """Persist batch state atomically. Called after every event."""
+
+    @abstractmethod
+    def unit_key(self, unit: UnitT) -> str:
+        """Stable unique identifier for this unit (shard_id, job_name, ...)."""
+
+    @abstractmethod
+    def unit_label(self, unit: UnitT) -> str:
+        """Human-readable identifier for logs."""
+
+    @abstractmethod
+    def build_unit_payload(self, unit: UnitT) -> dict[str, Path]:
+        """Files to upload for this unit. Maps remote relative path → local path."""
+
+    @abstractmethod
+    def reconstruct_instance(self, unit: UnitT) -> CloudInstance:
+        """Rebuild a ``CloudInstance`` from persisted unit fields (for resume)."""
+
+    @abstractmethod
+    def collect_unit_results(self, unit: UnitT, instance: CloudInstance) -> bool:
+        """Download artifacts for one completed unit. True on success."""
+
+    @abstractmethod
+    def unit_is_done_in_r2(self, unit: UnitT) -> bool:
+        """Whether this unit's results already exist in R2. False if no R2 sink."""
+
+    @abstractmethod
+    def classify_failure(self, unit: UnitT, error: str) -> FailureVerdict:
+        """Classify a failure as retryable or fatal."""
+
+    # -- Optional hooks (default-implemented, override when needed) --------
+
+    def capture_preempt_diagnostics(
+        self,
+        runner: CloudRunner,
+        instance: CloudInstance,
+        unit: UnitT,
+    ) -> None:
+        """Persist ``worker.log`` (and tail context) before the instance is destroyed.
+
+        Called from the preempted path on every silent worker death so the
+        next debugging session has real evidence instead of the single
+        "worker died silently" log line. The default implementation
+        SSH-cats ``{workspace}/worker.log`` and a short ``dmesg -T``
+        tail into
+        ``batch_diagnostics/{unit_key}_{instance_id}_{timestamp}.log``
+        under the current working directory. Subclasses can override to
+        redirect the capture into domain-specific paths (e.g. a
+        per-target results dir).
+
+        Swallows every exception — a diagnostic capture MUST NEVER
+        block destroy, because a leaked instance keeps burning dollars.
+        """
+        from vastai_gpu_runner.ssh import ssh_cmd
+
+        _ = runner  # reserved for subclass overrides that need runner state
+        try:
+            diag_dir = Path.cwd() / "batch_diagnostics"
+            diag_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+            unit_key = self.unit_key(unit)
+            iid = instance.instance_id or "unknown"
+            out_path = diag_dir / f"{unit_key}_{iid}_{timestamp}.log"
+
+            sections: list[str] = [
+                f"# preempt diagnostics for {self.unit_label(unit)}",
+                f"# instance_id: {iid}",
+                f"# ssh: {instance.ssh_user}@{instance.ssh_host}:{instance.ssh_port}",
+                f"# workspace: {self._workspace_dir}",
+                f"# captured_at: {timestamp}",
+                "",
+                "## worker.log (full) ##",
+            ]
+            rc, worker_log = ssh_cmd(instance, f"cat {self._workspace_dir}/worker.log", timeout=20)
+            sections.append(worker_log if rc == 0 else f"[ssh rc={rc}] {worker_log}")
+            sections.extend(("", "## worker.exitcode ##"))
+            rc2, exitcode = ssh_cmd(
+                instance, f"cat {self._workspace_dir}/worker.exitcode 2>/dev/null", timeout=10
+            )
+            sections.append(exitcode if rc2 == 0 else f"[ssh rc={rc2}] {exitcode}")
+            sections.extend(("", "## dmesg tail ##"))
+            rc3, dmesg = ssh_cmd(instance, "dmesg -T 2>&1 | tail -40", timeout=10)
+            sections.append(dmesg if rc3 == 0 else f"[ssh rc={rc3}] {dmesg}")
+
+            out_path.write_text("\n".join(sections) + "\n")
+            logger.info(
+                "Captured preempt diagnostics for %s → %s",
+                self.unit_label(unit),
+                out_path,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to capture preempt diagnostics for %s: %s",
+                self.unit_label(unit),
+                exc,
+            )
+
+    # -- State-mutation events (subclasses override) -----------------------
+
+    @abstractmethod
+    def on_unit_deployed(self, unit: UnitT, instance: CloudInstance) -> None:
+        """Consumer: set instance_id/ssh_*/cost_per_hour/status='deployed'; save_state."""
+
+    @abstractmethod
+    def on_unit_failed(self, unit: UnitT, reason: str) -> None:
+        """Consumer: set status='failed', failure_reason, bump retry_count; save_state."""
+
+    @abstractmethod
+    def on_unit_completed(self, unit: UnitT) -> None:
+        """Consumer: set status='downloaded' after collect_unit_results succeeded; save_state."""
+
+    @abstractmethod
+    def on_unit_preempted(self, unit: UnitT) -> None:
+        """Consumer: reset instance_id='', status='pending' for redeploy; save_state."""
+
+    # -- Concrete lifecycle (inherited) ------------------------------------
+
+    def run(self) -> None:
+        """Run the batch end-to-end: resume → deploy → poll → collect → cleanup."""
+        logger.info("BatchOrchestrator: starting batch %s", self._label_prefix)
+        self._resume_from_state()
+        self._deploy_phase()
+        self._sweep_zombies()
+        self._poll_phase()
+        self._collect_phase()
+        self._cleanup_phase()
+        logger.info("BatchOrchestrator: batch %s complete", self._label_prefix)
+
+    # -- Phase 1: resume ---------------------------------------------------
+
+    def _resume_from_state(self) -> None:
+        """Reconstruct live-runner map from already-active units."""
+        for unit in self.iter_active_units():
+            if not unit.instance_id:
+                continue
+            try:
+                instance = self.reconstruct_instance(unit)
+                runner = self._runner_factory()
+                self._live_runners[self.unit_key(unit)] = (runner, instance, unit)
+                logger.info(
+                    "Resume: reconnected to %s on instance %s",
+                    self.unit_label(unit),
+                    unit.instance_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Resume: failed to reconnect %s: %s — will re-deploy",
+                    self.unit_label(unit),
+                    exc,
+                )
+                self.on_unit_preempted(unit)
+
+    # -- Phase 2: deploy ---------------------------------------------------
+
+    def _deploy_phase(self) -> None:
+        """Parallel deploy of pending units via ThreadPoolExecutor."""
+        pending = [u for u in self.iter_pending_units() if not self.unit_is_done_in_r2(u)]
+        if not pending:
+            logger.info("Deploy phase: no pending units")
+            return
+        if not self._deploy_budget_ok(pending):
+            return
+
+        max_workers = min(self._max_parallel_deploys, len(pending))
+        logger.info("Deploy phase: %d unit(s) across %d worker(s)", len(pending), max_workers)
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(self._deploy_one, u): u for u in pending}
+            for fut in as_completed(futures):
+                self._handle_deploy_future(fut, futures[fut])
+
+    def _deploy_budget_ok(self, pending: list[UnitT]) -> bool:
+        """Pre-flight budget check. Marks all pending units failed if exceeded."""
+        if self._budget_usd <= 0 or check_budget(0.0, self._budget_usd):
+            return True
+        logger.error("Deploy phase: budget exceeded before deploy")
+        for unit in pending:
+            self.on_unit_failed(unit, "budget exceeded")
+        return False
+
+    def _handle_deploy_future(
+        self,
+        fut: Future[bool],
+        unit: UnitT,
+    ) -> None:
+        """Translate one deploy future into an event + log line."""
+        try:
+            ok = fut.result()
+        except Exception as exc:
+            logger.exception("Deploy %s raised: %s", self.unit_label(unit), exc)
+            with self._state_lock:
+                self.on_unit_failed(unit, f"deploy exception: {exc}")
+            return
+        if ok:
+            logger.info("Deploy %s: success", self.unit_label(unit))
+        else:
+            logger.warning("Deploy %s: failed", self.unit_label(unit))
+
+    def _deploy_one(self, unit: UnitT) -> bool:
+        """Deploy a single unit. Thread-safe via ``self._state_lock``."""
+        runner = self._runner_factory()
+        files = self.build_unit_payload(unit)
+
+        try:
+            # CloudRunner.run_full_cycle does boot, verify, deploy, setup, launch.
+            result = runner.run_full_cycle(
+                files=files,
+                local_output_dir=self._workspace_local_for(unit),
+                max_retries=3,
+                used_machine_ids=self._used_machine_ids,
+                machine_lock=self._state_lock,
+            )
+        except Exception as exc:
+            with self._state_lock:
+                self.on_unit_failed(unit, f"run_full_cycle exception: {exc}")
+            return False
+
+        with self._state_lock:
+            if result.success and result.instance is not None:
+                self._live_runners[self.unit_key(unit)] = (runner, result.instance, unit)
+                self.on_unit_deployed(unit, result.instance)
+                return True
+            self.on_unit_failed(unit, result.error or "deploy failed")
+            return False
+
+    def _workspace_local_for(self, unit: UnitT) -> Path:
+        """Default local workspace path. Override in subclass for custom layout."""
+        from pathlib import Path as _Path
+
+        return _Path.cwd() / "outputs" / self.unit_label(unit)
+
+    # -- Phase 3: poll -----------------------------------------------------
+
+    def _poll_phase(self) -> None:
+        """Poll until all live units terminal. Exponential backoff + R2-first."""
+        if not self._live_runners:
+            logger.info("Poll phase: no live runners")
+            return
+
+        base = self._poll_interval_seconds
+        cur_interval = min(base, 5)
+        max_interval = min(base * 2, 60)
+        deadline = self._compute_poll_deadline()
+        cycle = 0
+
+        while self._live_runners and time.time() < deadline:
+            cycle += 1
+            if not self._poll_pre_iteration(cycle):
+                break
+            any_progress = self._poll_cycle_once()
+            cur_interval = self._advance_poll_interval(
+                any_progress, cur_interval, base, max_interval
+            )
+
+        self._warn_on_poll_timeout(deadline)
+
+    def _poll_pre_iteration(self, cycle: int) -> bool:
+        """Run zombie sweep + budget check. Returns False to abort the loop."""
+        if cycle % self._zombie_sweep_every_n_cycles == 0:
+            self._sweep_zombies()
+        return self._poll_budget_ok()
+
+    @staticmethod
+    def _advance_poll_interval(
+        any_progress: bool,
+        cur_interval: int,
+        base: int,
+        max_interval: int,
+    ) -> int:
+        """Apply exponential backoff: reset on progress, else sleep + double up to cap."""
+        if any_progress:
+            return min(base, 5)
+        time.sleep(cur_interval)
+        return min(cur_interval * 2, max_interval)
+
+    def _warn_on_poll_timeout(self, deadline: float) -> None:
+        """Emit a warning if the poll loop exited on timeout with live units still active."""
+        if time.time() >= deadline and self._live_runners:
+            logger.warning(
+                "Poll phase: timeout after %.0fs with %d live units",
+                self._poll_timeout_seconds,
+                len(self._live_runners),
+            )
+
+    def _compute_poll_deadline(self) -> float:
+        """Absolute wall-clock deadline for the poll loop. ``inf`` when disabled."""
+        if self._poll_timeout_seconds > 0:
+            return time.time() + self._poll_timeout_seconds
+        return float("inf")
+
+    def _poll_budget_ok(self) -> bool:
+        """Check budget ceiling. Returns False if poll loop should abort."""
+        if self._budget_usd <= 0:
+            return True
+        if not check_budget(self._estimate_current_spend(), self._budget_usd):
+            logger.error("Poll phase: budget exceeded — aborting")
+            return False
+        return True
+
+    def _poll_cycle_once(self) -> bool:
+        """One sweep over live units. Returns True if any unit made progress.
+
+        Phase A classifies each live unit (pure, no side effects). Phase B
+        handles preempted units (serial — destroy + instance-loss bookkeeping
+        is cheap). Phase C finalises terminal units, optionally in parallel
+        via ``max_parallel_collects``.
+        """
+        terminal: list[tuple[str, CloudRunner, CloudInstance, UnitT]] = []
+        preempted: list[tuple[str, CloudRunner, CloudInstance, UnitT]] = []
+        for unit_key in list(self._live_runners.keys()):
+            entry = self._live_runners.get(unit_key)
+            if entry is None:
+                continue
+            runner, instance, unit = entry
+            action = decide_next_action(unit, runner, instance, self.unit_is_done_in_r2)
+            if isinstance(action, Complete):
+                terminal.append((unit_key, runner, instance, unit))
+            elif isinstance(action, Preempt):
+                preempted.append((unit_key, runner, instance, unit))
+
+        for unit_key, runner, instance, unit in preempted:
+            self._handle_preempted_unit(runner, instance, unit, unit_key)
+
+        if terminal:
+            self._finalise_terminal_units(terminal)
+
+        return bool(terminal or preempted)
+
+    def _handle_preempted_unit(
+        self,
+        runner: CloudRunner,
+        instance: CloudInstance,
+        unit: UnitT,
+        unit_key: str,
+    ) -> None:
+        """Side-effect handler for a Preempt action (shared by the two callers).
+
+        Captures preempt diagnostics, destroys the instance, and books
+        instance loss in state. Each side effect is independently
+        exception-suppressed so one failure cannot strand the rest.
+        """
+        with contextlib.suppress(Exception):
+            self.capture_preempt_diagnostics(runner, instance, unit)
+        with contextlib.suppress(Exception):
+            runner.destroy_instance(instance)
+        with self._state_lock:
+            self._handle_instance_loss(unit, unit_key, "worker died silently")
+
+    def _dispatch_unit_action(
+        self,
+        runner: CloudRunner,
+        instance: CloudInstance,
+        unit: UnitT,
+        action: UnitAction,
+    ) -> Literal["completed", "running", "preempted", "failed"]:
+        """Apply a ``UnitAction`` plan and return the legacy verdict string.
+
+        ``Continue`` is the no-op "still running" outcome. ``Preempt`` is
+        a side-effectful loss handling. ``Complete`` finalises (collect
+        + destroy) and reports ``completed``/``failed`` from the
+        finalise result.
+        """
+        if isinstance(action, Continue):
+            return "running"
+        if isinstance(action, Preempt):
+            self._handle_preempted_unit(runner, instance, unit, self.unit_key(unit))
+            return "preempted"
+        # Complete
+        return self._finalise_completed(runner, instance, unit, self.unit_key(unit))
+
+    def _check_unit(
+        self,
+        runner: CloudRunner,
+        instance: CloudInstance,
+        unit: UnitT,
+    ) -> Literal["completed", "running", "preempted", "failed"]:
+        """Single-unit poll cycle. Composes ``decide_next_action`` + dispatch.
+
+        Kept for backwards-compat with direct callers (unit tests, consumers
+        that prefer synchronous single-unit polling). The main loop uses
+        ``_poll_cycle_once`` which batches terminal units for parallel
+        finalise. Both paths share ``_dispatch_unit_action`` so the
+        terminal/preempt side effects cannot diverge.
+        """
+        action = decide_next_action(unit, runner, instance, self.unit_is_done_in_r2)
+        return self._dispatch_unit_action(runner, instance, unit, action)
+
+    def _finalise_terminal_units(
+        self,
+        terminal: list[tuple[str, CloudRunner, CloudInstance, UnitT]],
+    ) -> None:
+        """Finalise a batch of terminal units, optionally in parallel.
+
+        Each finalise does ``collect_unit_results`` (I/O-bound — the reason
+        we parallelise) then ``destroy_instance``. ``_finalise_completed``
+        already guards its state mutations with ``self._state_lock``, so
+        parallel execution is safe.
+        """
+        if self._max_parallel_collects <= 1 or len(terminal) == 1:
+            for unit_key, runner, instance, unit in terminal:
+                self._finalise_completed(runner, instance, unit, unit_key)
+            return
+
+        workers = min(self._max_parallel_collects, len(terminal))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [
+                pool.submit(self._finalise_completed, runner, instance, unit, unit_key)
+                for unit_key, runner, instance, unit in terminal
+            ]
+            for fut in as_completed(futures):
+                with contextlib.suppress(Exception):
+                    fut.result()
+
+    def _finalise_completed(
+        self,
+        runner: CloudRunner,
+        instance: CloudInstance,
+        unit: UnitT,
+        unit_key: str,
+    ) -> Literal["completed", "failed"]:
+        """Download results, call on_unit_completed, destroy instance."""
+        ok = False
+        try:
+            ok = self.collect_unit_results(unit, instance)
+        except Exception as exc:
+            logger.exception(
+                "Collect %s raised: %s",
+                self.unit_label(unit),
+                exc,
+            )
+        with self._state_lock:
+            if ok:
+                self.on_unit_completed(unit)
+            else:
+                self.on_unit_failed(unit, "collect_unit_results failed")
+            self._live_runners.pop(unit_key, None)
+        with contextlib.suppress(Exception):
+            runner.destroy_instance(instance)
+        return "completed" if ok else "failed"
+
+    # -- Phase 4: collect any stragglers (R2 recovery for failed units) ----
+
+    def _collect_phase(self) -> None:
+        """After poll, try R2 recovery for units that failed with uploaded results."""
+        if self._r2_sink is None:
+            return
+        for unit in list(self.iter_failed_units()):
+            if not self.unit_is_done_in_r2(unit):
+                continue
+            logger.info(
+                "R2 recovery: %s is done in R2 — collecting",
+                self.unit_label(unit),
+            )
+            try:
+                instance = self.reconstruct_instance(unit)
+            except Exception:
+                # No live instance — consumer's collect_unit_results must
+                # handle this path (e.g. download from R2 directly).
+                from vastai_gpu_runner.types import CloudInstance as _CloudInstance
+
+                instance = _CloudInstance()
+            try:
+                if self.collect_unit_results(unit, instance):
+                    with self._state_lock:
+                        self.on_unit_completed(unit)
+            except Exception as exc:
+                logger.warning(
+                    "R2 recovery collect failed for %s: %s",
+                    self.unit_label(unit),
+                    exc,
+                )
+
+    # -- Phase 5: cleanup --------------------------------------------------
+
+    def _cleanup_phase(self) -> None:
+        """Destroy any leftover live instances. Final zombie sweep."""
+        for runner, instance, unit in list(self._live_runners.values()):
+            logger.warning(
+                "Cleanup: destroying leftover instance for %s",
+                self.unit_label(unit),
+            )
+            with contextlib.suppress(Exception):
+                runner.destroy_instance(instance)
+        self._live_runners.clear()
+        self._sweep_zombies()
+
+    # -- Instance loss handling --------------------------------------------
+
+    def _handle_instance_loss(
+        self,
+        unit: UnitT,
+        unit_key: str,
+        reason: str,
+    ) -> bool:
+        """Mark unit preempted and remove from live map. Caller must hold lock.
+
+        Returns True if the unit is eligible for re-deploy (retry_count
+        under cap), False if it should be marked fatally failed. The
+        actual re-deploy happens in the next deploy_phase iteration
+        (not implemented as an in-poll redeploy in this ABC — the
+        consumer can call ``_deploy_phase`` again if desired).
+        """
+        self._live_runners.pop(unit_key, None)
+        if unit.retry_count >= self._max_retries:
+            self.on_unit_failed(unit, f"{reason} (retries exhausted)")
+            return False
+        verdict = self.classify_failure(unit, reason)
+        if verdict == "fatal":
+            self.on_unit_failed(unit, f"{reason} (fatal)")
+            return False
+        self.on_unit_preempted(unit)
+        return True
+
+    # -- Zombie sweep + budget --------------------------------------------
+
+    def _sweep_zombies(self) -> int:
+        """Destroy orphaned instances not tracked by ``_live_runners``.
+
+        Routes through the v4 cleanup policy:
+
+        1. Enumerate instances via ``policy.list_instances()`` (which
+           may short-circuit on EXPLICITLY_DISABLED).
+        2. Filter by the exact delimited label scope
+           ``f"{self._label_prefix}-"`` so adjacent scopes like
+           ``f"{label_prefix}evil"`` cannot match.
+        3. Exclude tracked IDs (the existing semantics).
+        4. For every remaining candidate, call ``policy.destroy(candidate)``.
+        5. Count ``verdict == DESTROYED`` outcomes.
+        6. Log every non-DESTROYED outcome with severity matching
+           operational impact.
+
+        Imported types (``CleanupVerdict``, ``CleanupRefusal``) are kept
+        inside the method via a local import so this module remains
+        decoupled from the ``cleanup_policy`` package at import time.
+        """
+        # Local imports keep the module top-level free of v4-only deps
+        # for any subclass that imports ``batch`` without a configured
+        # policy (legacy test fixtures).
+        from vastai_gpu_runner.cleanup_policy import (
+            CleanupVerdict,
+        )
+
+        with self._state_lock:
+            tracked_ids = {entry[1].instance_id for entry in self._live_runners.values()}
+        candidates = self._cleanup_policy.list_instances()
+        killed = 0
+        scope_prefix = f"{self._label_prefix}-"
+        for candidate in candidates:
+            if not candidate.label.startswith(scope_prefix):
+                continue
+            if candidate.instance_id in tracked_ids:
+                continue
+            result = self._cleanup_policy.destroy(candidate)
+            if result.verdict == CleanupVerdict.DESTROYED:
+                killed += 1
+                continue
+            self._log_cleanup_outcome(candidate.instance_id, result)
+        if killed:
+            logger.info("Zombie sweep: destroyed %d instance(s)", killed)
+        return killed
+
+    def _log_cleanup_outcome(self, instance_id: str, result: object) -> None:
+        """Log a non-DESTROYED cleanup outcome at severity matching operational impact.
+
+        Extracted from ``_sweep_zombies`` to keep the orchestrator's
+        cognitive complexity within the project gate. Imported enums
+        are local so this helper stays decoupled from the
+        ``cleanup_policy`` package at import time.
+        """
+        from vastai_gpu_runner.cleanup_policy import (
+            CleanupRefusal,
+            CleanupVerdict,
+        )
+
+        verdict = result.verdict  # type: ignore[attr-defined]
+        refusal = result.refusal  # type: ignore[attr-defined]
+        error = result.error  # type: ignore[attr-defined]
+        if verdict == CleanupVerdict.LEAKED:
+            logger.error(
+                "Zombie sweep: %s LEAKED — manual review required: %s",
+                instance_id,
+                error,
+            )
+            return
+        if verdict == CleanupVerdict.UNKNOWN:
+            logger.warning(
+                "Zombie sweep: %s outcome=UNKNOWN: %s",
+                instance_id,
+                error,
+            )
+            return
+        if verdict == CleanupVerdict.CLI_ATTEMPTED:
+            logger.warning(
+                "Zombie sweep: %s CLI fallback attempted (destruction not confirmed): %s",
+                instance_id,
+                error,
+            )
+            return
+        if verdict == CleanupVerdict.ALREADY_GONE:
+            # Verifier proved absence from a well-formed response;
+            # no destroy was performed. INFO because the desired
+            # end-state was already achieved — not an operational
+            # failure.
+            logger.info(
+                "Zombie sweep: %s already gone (CLI verifier proved absence)",
+                instance_id,
+            )
+            return
+        if refusal == CleanupRefusal.CREDENTIALS_DISABLED:
+            logger.warning(
+                "Zombie sweep: %s refused (credentials disabled): %s",
+                instance_id,
+                error,
+            )
+            return
+        if refusal == CleanupRefusal.NO_CREDENTIALS:
+            # Should not reach here — the factory's CLI fallback
+            # intercepts NO_CREDENTIALS. Logged at WARNING because
+            # it indicates the orphan was not cleaned up.
+            logger.warning(
+                "Zombie sweep: %s unexpectedly returned NO_CREDENTIALS after fallback handling: %s",
+                instance_id,
+                error,
+            )
+            return
+        if refusal in (
+            CleanupRefusal.OWNERSHIP,
+            CleanupRefusal.INELIGIBLE_STATE,
+            CleanupRefusal.PROVIDER_MISMATCH,
+        ):
+            logger.info(
+                "Zombie sweep: %s refused (%s): %s",
+                instance_id,
+                refusal.value,
+                error,
+            )
+            return
+        logger.error(
+            "Zombie sweep: %s returned unrecognized cleanup outcome: "
+            "verdict=%r refusal=%r error=%s",
+            instance_id,
+            verdict,
+            refusal,
+            error,
+        )
+
+    def _estimate_current_spend(self) -> float:
+        """Estimate current batch spend. Override for provider-specific tracking."""
+        # Default: no spend tracking. Subclasses can override to sum
+        # (now - start_time) * cost_per_hour across all units.
+        return 0.0

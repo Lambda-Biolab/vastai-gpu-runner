@@ -1,6 +1,6 @@
 name: "CodeQL"
 
-on:
+"on":
   push:
   schedule:
     - cron: "27 11 * * 0"
