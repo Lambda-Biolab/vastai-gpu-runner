@@ -19,6 +19,9 @@ class TestProvider:
     def test_runpod_value(self) -> None:
         assert Provider.RUNPOD.value == "runpod"
 
+    def test_local_value(self) -> None:
+        assert Provider.LOCAL.value == "local"
+
 
 class TestInstanceStatus:
     def test_lifecycle_values(self) -> None:

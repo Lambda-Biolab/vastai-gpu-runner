@@ -24,6 +24,7 @@ class Provider(enum.Enum):
 
     VASTAI = "vastai"
     RUNPOD = "runpod"
+    LOCAL = "local"
 
 
 class ComputeMode(enum.Enum):

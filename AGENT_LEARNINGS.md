@@ -158,3 +158,23 @@ description: Non-obvious patterns that prevent repeated mistakes across sprints
 - **Example**: `src/vastai_gpu_runner/storage/r2_lifecycle.py::remove`
   + `_delete_lifecycle`.
 - **References**: PR #39.
+
+### `run_full_cycle` deploys through launch only; callers poll, collect, destroy
+
+- **Context**: Any synchronous path that needs a worker's *result* —
+  the `run` CLI command and programmatic callers of `LocalRunner`
+  (or any `CloudRunner` backend).
+- **Problem**: The inherited `CloudRunner.run_full_cycle` name
+  suggests the whole lifecycle, but it stops after `launch_worker`:
+  it never polls for completion, downloads, or destroys. Code that
+  treats its return as "done" leaks the instance/process and misses
+  results.
+- **Solution**: Treat `run_full_cycle` as deploy-through-launch. The
+  caller must poll `check_progress` for the `DONE` marker (or worker
+  death), collect via `download_all_results` / `download_file`, and
+  destroy in a `finally` block. `cli_run.py` is the reference
+  implementation of this sequence.
+- **Example**: `src/vastai_gpu_runner/cli_run.py`;
+  `tests/integration/test_local_runner_integration.py`.
+- **References**: `docs/api.md` (Runner section), `docs/extending.md`
+  (programmatic local-run example).

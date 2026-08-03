@@ -89,6 +89,45 @@ runner = RunPodRunner(DeploymentConfig(gpu_model="RTX_4090"))
 result = runner.run_full_cycle(files, output_dir, max_retries=3)
 ```
 
+## Driving a local run programmatically
+
+`LocalRunner` runs the same `CloudRunner` lifecycle as a local subprocess — useful for development and CI without cloud credentials. `run_full_cycle` deploys through launch and returns; the loop below polls for the `DONE` marker (or worker death), downloads the results, and destroys in `finally`:
+
+```python
+import time
+from pathlib import Path
+
+from vastai_gpu_runner.providers.local import LocalRunner
+from vastai_gpu_runner.types import DeploymentConfig
+
+runner = LocalRunner(DeploymentConfig(worker_script="worker.sh"))
+result = runner.run_full_cycle(
+    files={"worker.sh": Path("worker.sh"), "input.json": Path("input.json")},
+    local_output_dir=Path("outputs/local"),
+    max_retries=1,
+)
+if not result.success or result.instance is None:
+    raise SystemExit(result.error)
+instance = result.instance
+
+try:
+    deadline = time.monotonic() + 300
+    while time.monotonic() < deadline:
+        progress = runner.check_progress(instance)
+        if progress.get("complete"):
+            break
+        if progress.get("worker_dead"):
+            raise SystemExit(f"worker exited without DONE: {progress.get('log_tail')}")
+        time.sleep(1)
+    else:
+        raise SystemExit("worker did not complete in time")
+    runner.download_all_results(instance, Path("outputs/local"), critical_files={"DONE"})
+finally:
+    runner.destroy_instance(instance)
+```
+
+The worker runs with `cwd` set to the temp workspace, so it can invoke `biolab-runners` workloads — but `LocalRunner` itself is orchestration-layer glue: it launches the script and manages the process and workspace, nothing more. The same poll/collect/destroy pattern applies to any `CloudRunner` backend; `LocalRunner` just needs no credentials.
+
 ## Custom storage backend
 
 Subclass `R2Sink` to add project-specific defaults or methods:

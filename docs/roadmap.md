@@ -6,7 +6,7 @@
 
 | # | Item | Rationale |
 |---|---|---|
-| 1 | `LocalRunner` (subprocess MVP) | Zero-cost CI + dev loop; proves `CloudRunner` ABC is genuinely provider-agnostic |
+| 1 | `LocalRunner` (subprocess MVP) — **implemented** | Zero-cost CI + dev loop; proved `CloudRunner` is genuinely provider-agnostic |
 | 2 | `RunPodRunner` | Second cloud backend; closest Vast.ai analogue (SSH + Docker + spot + per-second) |
 | 3 | `vastai_gpu_runner.inference` helper | OpenAI-compatible client (Groq / Cerebras / OpenRouter) callable from inside workers |
 
@@ -14,26 +14,31 @@ Order is prescriptive: item 1 first (no external dependency, validates ABC), the
 
 ---
 
-## Item 1 — `LocalRunner`
+## Item 1 — `LocalRunner` (implemented)
+
+**Status**: implemented — `src/vastai_gpu_runner/providers/local.py`, the
+`run` CLI command (`cli_run.py`), and the tests listed under Exit
+criteria. Changes are unreleased (see CHANGELOG).
 
 ### Scope
 
 - New module `vastai_gpu_runner/providers/local.py`
 - Subclass of `CloudRunner` that executes the full lifecycle on the host via `subprocess`
-- `search_offers` returns a synthetic single offer `{"machine_id": "local"}`
-- `create_instance` returns a `CloudInstance(provider=Provider.LOCAL, ssh_host="localhost", ...)` (fields kept as defaults; no SSH is actually used)
+- `search_offers` returns a synthetic single offer `{"machine_id": "local", "dph_total": 0.0}`
+- `create_instance` returns a `CloudInstance(provider=Provider.LOCAL, instance_id="local", ssh_host="localhost")` (no SSH is actually used)
 - `deploy_files` uses `shutil.copy` into a tempdir workspace
 - `launch_worker` uses `subprocess.Popen(["bash", "worker.sh"], cwd=workspace)`
 - `check_progress` polls PID liveness and a local `DONE` marker file
-- `destroy_instance` is a no-op returning `True`
+- `destroy_instance` terminates the worker process and removes the temp workspace
 - New `Provider.LOCAL` enum member in `types.py`
+- New `run` CLI command and `build_local_cleanup_policy()` (no cross-process candidates; the owning runner cleans up)
 
 ### Exit criteria
 
-- End-to-end run of an existing worker against `LocalRunner` with no cloud credentials present
-- Pytest suite covering each overridden method
-- One worked example in `docs/extending.md` or `docs/guide.md` showing a local dry run
-- No changes required to the `CloudRunner` ABC
+- [x] End-to-end run of an existing worker against `LocalRunner` with no cloud credentials present — `tests/integration/test_local_runner_integration.py`
+- [x] Pytest suite covering each overridden method — `tests/test_local_runner.py` (lifecycle + cleanup policy) and `tests/test_cli_run.py` (CLI)
+- [x] One worked example in `docs/extending.md` or `docs/guide.md` showing a local dry run — CLI dry run in `docs/guide.md`; programmatic lifecycle in `docs/extending.md`
+- [x] No changes required to the `CloudRunner` ABC — `runner.py` untouched
 
 ### Out of scope
 
