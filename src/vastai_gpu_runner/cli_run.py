@@ -16,6 +16,19 @@ from vastai_gpu_runner.types import CloudInstance, DeploymentConfig, Provider
 logger = logging.getLogger(__name__)
 
 
+class LocalRunValidationError(ValueError):
+    """Structured validation error for the local-run CLI inputs.
+
+    Carries the option name so the CLI layer can translate the failure
+    into a ``typer.BadParameter`` without string-matching rendered output.
+    """
+
+    def __init__(self, message: str, *, option: str) -> None:
+        """Initialize with a human-readable message and the offending option name."""
+        super().__init__(message)
+        self.option = option
+
+
 def _setup_logging(verbose: bool) -> None:
     """Configure stdlib logging for the local-run CLI invocation."""
     logging.basicConfig(
@@ -59,8 +72,12 @@ def run(
     verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Show detailed logs.")] = False,
 ) -> None:
     """Run a worker locally without cloud credentials."""
-    _validate_provider(provider)
-    file_map = _build_payload_map(files, worker_script)
+    try:
+        _validate_provider(provider)
+        file_map = _build_payload_map(files, worker_script)
+    except LocalRunValidationError as exc:
+        raise typer.BadParameter(str(exc), param_hint=exc.option) from exc
+
     _setup_logging(verbose)
     console = Console()
     runner = LocalRunner(DeploymentConfig(worker_script=worker_script))
@@ -103,9 +120,9 @@ def run(
 def _validate_provider(provider: str) -> None:
     """Reject provider values other than ``local`` until other backends ship."""
     if provider.lower() != Provider.LOCAL.value:
-        raise typer.BadParameter(
+        raise LocalRunValidationError(
             "the run command currently only supports --provider local",
-            param_hint="--provider",
+            option="--provider",
         )
 
 
@@ -113,26 +130,32 @@ def _build_payload_map(
     files: list[Path] | None,
     worker_script: str,
 ) -> dict[str, Path]:
-    """Validate payload filenames and ensure the worker script is present."""
+    """Validate payload filenames and ensure the worker script is present.
+
+    Pure function: raises :class:`LocalRunValidationError` on invalid input.
+    The CLI layer translates that to ``typer.BadParameter`` so callers see a
+    consistent CLI error surface, while tests can assert on the structured
+    error without depending on Typer's rendered output.
+    """
     script_path = Path(worker_script)
     if not worker_script or script_path.is_absolute() or ".." in script_path.parts:
-        raise typer.BadParameter(
+        raise LocalRunValidationError(
             "worker script must be a relative path inside the payload",
-            param_hint="--worker-script",
+            option="--worker-script",
         )
     payload = files or []
     file_map: dict[str, Path] = {}
     for path in payload:
         if path.name in file_map:
-            raise typer.BadParameter(
+            raise LocalRunValidationError(
                 f"duplicate payload filename: {path.name}",
-                param_hint="--file",
+                option="--file",
             )
         file_map[path.name] = path
     if worker_script not in file_map:
-        raise typer.BadParameter(
+        raise LocalRunValidationError(
             f"worker script {worker_script!r} must be supplied with --file",
-            param_hint="--file",
+            option="--file",
         )
     return file_map
 
@@ -157,4 +180,10 @@ def _wait_for_completion(
     return False, f"timed out after {timeout:g} seconds"
 
 
-__all__ = ["run"]
+__all__ = [
+    "LocalRunValidationError",
+    "_build_payload_map",
+    "_validate_provider",
+    "_wait_for_completion",
+    "run",
+]
