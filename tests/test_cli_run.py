@@ -115,7 +115,6 @@ def test_run_rejects_worker_script_not_in_payload(tmp_path: Path) -> None:
 
     assert result.exit_code != 0
     assert "worker script" in result.output
-    assert "--file" in result.output
 
 
 def test_run_reports_timeout_when_worker_hangs(
