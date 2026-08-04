@@ -47,6 +47,33 @@
   required-file failure, prediction failure omits DONE markers,
   DONE-marker failure, chunk flush failure, checkpoint mode
   stays best-effort.
+- **`providers/local.py` (`LocalRunner`)** — subprocess `CloudRunner`
+  backend for zero-cost local and CI runs. `search_offers` returns a
+  single synthetic offer `{"machine_id": "local", "dph_total": 0.0}`;
+  `create_instance` allocates a tempdir workspace; `verify_gpu` probes
+  `nvidia-smi` but proceeds on failure (CPU-only OK); `deploy_files`
+  copies payload files; `launch_worker` runs `bash worker.sh`;
+  `check_progress` polls PID liveness + `DONE` marker;
+  `destroy_instance` terminates the worker process and removes the
+  workspace. No SSH, cloud credentials, or Docker; single job per
+  runner. `build_local_cleanup_policy()` returns a `Provider.LOCAL`
+  policy with no cross-process candidates (the owning runner cleans
+  up). No changes to `runner.py`.
+- **`Provider.LOCAL`** enum member (`"local"`) in `types.py`.
+- **`run` CLI command** (`cli_run.py`) — `vastai-gpu-runner run
+  --provider local --file worker.sh [--file INPUT...] --output OUTPUT`.
+  Waits for a `DONE` marker (default timeout 300s, `--poll-interval`
+  1s), downloads the workspace into `--output`, and destroys the
+  runner in a `finally` block. Non-local `--provider` values are
+  rejected.
+- **Tests** — `tests/integration/test_local_runner_integration.py`
+  (end-to-end worker run), `tests/test_local_runner.py` (lifecycle
+  methods + cleanup policy), `tests/test_cli_run.py` (CLI `run`).
+- **Docs** — README features/CLI, `docs/api.md` (Local Provider +
+  `run` command), `docs/guide.md` (local dry run + lifecycle caveat),
+  `docs/extending.md` (programmatic local run),
+  `docs/architecture-v2.md` (LocalRunner implemented),
+  `docs/roadmap.md` (item 1 implemented).
 
 ### Changed
 

@@ -16,6 +16,7 @@ Cloud GPU orchestration framework for [Vast.ai](https://vast.ai) — batch deplo
 
 - **CloudRunner** — provider-agnostic lifecycle with retry and machine deduplication
 - **VastaiRunner** — hardened Vast.ai deployment with quality filters and ownership guards
+- **LocalRunner** — zero-cost local/CI backend: the same lifecycle as a subprocess, no cloud credentials
 - **R2Sink** — S3-compatible result storage with DONE markers and parallel downloads
 - **BaseWorker** — template method worker: GPU check, preflight gates, self-destruct
 - **BatchState** — atomic JSON persistence for crash-recoverable batch orchestration
@@ -58,6 +59,7 @@ vastai-gpu-runner check                  # Verify Vast.ai + R2 credentials
 vastai-gpu-runner instances              # List active instances
 vastai-gpu-runner estimate -w 10         # Scaling table for 10h of GPU work
 vastai-gpu-runner cleanup -l "myproject" # Destroy orphaned instances
+vastai-gpu-runner run --provider local --file worker.sh --output outputs/local  # Run locally, no cloud credentials
 ```
 
 ## Architecture

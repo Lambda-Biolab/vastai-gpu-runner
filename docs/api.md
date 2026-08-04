@@ -4,7 +4,7 @@
 
 | Class | Description |
 |-------|-------------|
-| `Provider` | Enum: `VASTAI`, `RUNPOD` |
+| `Provider` | Enum: `VASTAI`, `RUNPOD`, `LOCAL` |
 | `InstanceStatus` | Enum: `CREATING`, `BOOTING`, `RUNNING`, `FAILED`, `DESTROYED` |
 | `DeploymentConfig` | GPU model, cost limits, timeouts, workspace, reliability thresholds |
 | `CloudInstance` | Instance metadata: ID, SSH host/port, GPU model, cost, status |
@@ -40,7 +40,7 @@
 | `list_remote_files(instance)` | `list[str]` | List workspace files |
 | `download_file(instance, name, path)` | `bool` | Download single file via SCP |
 | `destroy_instance(instance)` | `bool` | Tear down instance |
-| `run_full_cycle(files, output_dir, ...)` | `DeploymentResult` | Full lifecycle with retry |
+| `run_full_cycle(files, output_dir, ...)` | `DeploymentResult` | Deploy through launch with retry; polling, download, and destroy are caller steps |
 | `download_all_results(instance, dir, ...)` | `list[str]` | Bulk rsync download |
 
 ### `run_full_cycle` parameters
@@ -48,7 +48,7 @@
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `files` | `dict[str, Path]` | required | Remote name -> local path mapping |
-| `local_output_dir` | `Path` | required | Where to download results |
+| `local_output_dir` | `Path` | required | Reserved (currently unused; download is a separate caller step) |
 | `max_retries` | `int` | `3` | Maximum deployment attempts |
 | `offers` | `list[dict] \| None` | `None` | Pre-fetched offers (avoids re-query) |
 | `used_machine_ids` | `set[str] \| None` | `None` | Machine IDs claimed by other threads |
@@ -63,6 +63,46 @@
 | `verify_instance_ownership(instance_id, allowed_images)` | Check instance belongs to project |
 | `GPU_NAME_MAP` | Dict mapping model IDs to Vast.ai GPU names |
 | `DEFAULT_IMAGE` | Default Docker image (`nvidia/cuda:12.4.0-devel-ubuntu22.04`) |
+
+## Local Provider (`vastai_gpu_runner.providers.local`)
+
+| Class/Function | Description |
+|----------------|-------------|
+| `LocalRunner(config)` | `CloudRunner` backend that runs the lifecycle as a local subprocess. No SSH, cloud credentials, or Docker; single job per runner. |
+| `build_local_cleanup_policy()` | Returns a `Provider.LOCAL` `ProviderCleanupPolicy` with no cross-process candidates — the owning `LocalRunner` cleans up via `destroy_instance` |
+
+Lifecycle overrides:
+
+| Method | Local behavior |
+|--------|----------------|
+| `search_offers` | Single synthetic offer `{"machine_id": "local", "dph_total": 0.0}` |
+| `create_instance` | Allocate a tempdir workspace; `CloudInstance(provider=Provider.LOCAL, instance_id="local", ssh_host="localhost")` |
+| `verify_gpu` | Probe `nvidia-smi`; log and proceed on failure (CPU-only OK) |
+| `deploy_files` | Copy payload files into the workspace |
+| `launch_worker` | `bash worker.sh` in the workspace via `subprocess.Popen`; persist PID |
+| `check_progress` | `DONE` marker, else PID liveness; reports `worker_dead` + log tail on premature exit |
+| `list_remote_files` / `download_file` / `download_all_results` | Copy files out of the workspace (no rsync/SSH) |
+| `destroy_instance` | Terminate (then kill) the worker process; remove the workspace |
+
+Like the base class, `run_full_cycle` deploys through launch and returns — polling, collection, and destruction are the caller's job.
+
+### CLI — `run` command
+
+```
+vastai-gpu-runner run --provider local --file worker.sh [--file INPUT...] --output OUTPUT
+```
+
+Waits for a `DONE` marker, downloads the workspace into `--output`, and destroys the runner. `--provider` values other than `local` are rejected.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--file` / `-f` | (required) | Payload file copied into the workspace; repeatable; must include the worker script |
+| `--output` / `-o` | `outputs/local` | Directory for files produced by the worker |
+| `--provider` | `local` | Execution provider; only `local` is supported |
+| `--worker-script` | `worker.sh` | Worker script filename inside the payload |
+| `--timeout` | `300.0` | Maximum seconds to wait for worker completion |
+| `--poll-interval` | `1.0` | Seconds between progress checks |
+| `--verbose` / `-v` | `False` | Show detailed logs |
 
 ## SSH (`vastai_gpu_runner.ssh`)
 

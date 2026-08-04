@@ -1,6 +1,6 @@
 # Architecture v2 (target)
 
-This doc describes the **target architecture** after roadmap items 1–3 land. For the current-state architecture (today's code) see `architecture.md`. For scope and sequencing see `roadmap.md`.
+This doc describes the **target architecture** for roadmap items 1–3. Item 1 (`LocalRunner`) is implemented; items 2–3 remain target. For the current-state architecture (today's code) see `architecture.md`. For scope and sequencing see `roadmap.md`.
 
 ## What changes vs v1
 
@@ -27,7 +27,7 @@ Full `CloudRunner` ABC implementation. Lifecycle: search → create → wait →
 | Provider | Module | Status |
 |---|---|---|
 | Vast.ai | `providers/vastai.py` | Shipped |
-| Local (subprocess) | `providers/local.py` | Roadmap item 1 |
+| Local (subprocess) | `providers/local.py` | Implemented |
 | RunPod | `providers/runpod.py` | Roadmap item 2 |
 | TensorDock / Lambda Labs / CoreWeave / Crusoe / Paperspace | — | Deferred |
 
@@ -75,7 +75,7 @@ Lane B (ServerlessRunner ABC) — deferred, not drawn.
 
 ## `LocalRunner` shape
 
-Each ABC method's local-subprocess override. All run on the host; no SSH, no network.
+Each ABC method's local-subprocess override. All run on the host; no SSH, no network. Shipped as `providers/local.py`.
 
 | ABC method | `LocalRunner` behavior |
 |---|---|
@@ -87,12 +87,12 @@ Each ABC method's local-subprocess override. All run on the host; no SSH, no net
 | `setup_environment` | Return `True` (no-op) |
 | `launch_worker` | `subprocess.Popen(["bash", "worker.sh"], cwd=workspace)`; persist PID |
 | `check_progress` | Poll PID liveness + presence of a `DONE` marker in the workspace |
-| `list_remote_files` | `os.listdir(workspace)` |
+| `list_remote_files` | Recursively list workspace files as relative paths |
 | `download_file` | `shutil.copy(workspace/name, local_path)` |
 | `destroy_instance` | Kill process if alive; remove workspace; return `True` |
 | `capture_deploy_failure_diagnostics` | Inherited no-op (nothing to capture) |
 
-The `CloudInstance.ssh_host`/`ssh_port`/`ssh_user` fields remain at defaults; nothing in `LocalRunner` invokes `ssh.py`. No ABC change.
+The local `CloudInstance` uses `provider=Provider.LOCAL`, `instance_id="local"`, `ssh_host="localhost"`; `ssh_port`/`ssh_user` remain at defaults. Nothing in `LocalRunner` invokes `ssh.py`. No ABC change.
 
 ## `RunPodRunner` shape
 

@@ -19,7 +19,7 @@ runner = VastaiRunner(
     allowed_images=frozenset({"my-org/my-gpu-image:latest"}),
 )
 
-# Full lifecycle with retry
+# Deploys through launch; poll/download/destroy are separate (see below)
 result = runner.run_full_cycle(
     files={"worker.sh": local_script_path, "input.tar": local_data_path},
     local_output_dir=output_path,
@@ -29,6 +29,18 @@ result = runner.run_full_cycle(
 if result.success:
     print(f"Deployed on instance {result.instance.instance_id}")
 ```
+
+## Run a worker locally (dry run)
+
+The `run` command executes a worker as a local subprocess — no cloud credentials, SSH, or Docker:
+
+```bash
+vastai-gpu-runner run --provider local --file worker.sh --file input.json --output outputs/local
+```
+
+It copies the payload into a temp workspace, waits for a `DONE` marker, downloads the results into `--output`, then removes the workspace. Only `--provider local` is supported for now. Tuning options: `--worker-script`, `--timeout`, `--poll-interval`, `--verbose`.
+
+**Lifecycle caveat**: programmatic callers of `run_full_cycle` get the instance back after the worker *launches* — the method does not wait for completion. Poll `check_progress` for the `DONE` marker (or worker death), collect with `download_all_results`, and call `destroy_instance` in a `finally`; the CLI `run` command does all three. See [docs/extending.md](extending.md) for the worked programmatic example.
 
 ## Build a custom worker
 

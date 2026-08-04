@@ -5,7 +5,10 @@ Usage::
     vastai-gpu-runner check       # Verify Vast.ai + R2 credentials
     vastai-gpu-runner instances    # List active instances with ownership info
     vastai-gpu-runner estimate     # Cost/time scaling table
-    vastai-gpu-runner cleanup      # Destroy orphaned instances
+     vastai-gpu-runner cleanup      # Destroy orphaned instances
+     vastai-gpu-runner batch        # Compose a batch execution
+     vastai-gpu-runner run         # Run a worker locally without cloud credentials
+
 
 The v4 architecture routes every composition root through the canonical
 v4 types — ``VastaiProviderConfig``, ``VastaiRunner.from_config``,
@@ -30,6 +33,7 @@ from vastai_gpu_runner.cleanup_policy import (
     OwnershipPolicy,
     ProviderCleanupPolicy,
 )
+from vastai_gpu_runner.cli_run import run as run_command
 from vastai_gpu_runner.providers.destroy_adapters.vastai import CredentialResolution
 
 app = typer.Typer(
@@ -37,6 +41,7 @@ app = typer.Typer(
     help="Cloud GPU orchestration for Vast.ai — credentials, instances, cost estimation.",
     no_args_is_help=True,
 )
+app.command("run")(run_command)
 
 logger = logging.getLogger(__name__)
 
