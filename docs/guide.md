@@ -28,7 +28,7 @@ result = runner.run_full_cycle(
 
 if result.success:
     print(f"Deployed on instance {result.instance.instance_id}")
-```
+```text
 
 ## Run a worker locally (dry run)
 
@@ -36,7 +36,7 @@ The `run` command executes a worker as a local subprocess — no cloud credentia
 
 ```bash
 vastai-gpu-runner run --provider local --file worker.sh --file input.json --output outputs/local
-```
+```text
 
 It copies the payload into a temp workspace, waits for a `DONE` marker, downloads the results into `--output`, then removes the workspace. Only `--provider local` is supported for now. Tuning options: `--worker-script`, `--timeout`, `--poll-interval`, `--verbose`.
 
@@ -64,20 +64,20 @@ class TrainingWorker(BaseWorker):
 # On the cloud instance:
 worker = TrainingWorker(workspace=Path("/workspace/training"))
 exit_code = worker.main()
-```
+```text
 
 ### Worker lifecycle
 
 `BaseWorker.main()` executes this sequence:
 
-```
+```text
 1. write_pid()          — Write worker.pid for process detection
 2. check_gpu()          — nvidia-smi temp/ECC check (abort if GPU unhealthy)
 3. preflight_gates()    — R2 connectivity + custom gates (abort if any fail)
 4. run_workload()       — YOUR CODE — return 0 for success
 5. upload_results()     — Call r2_upload.py --done (if script exists)
 6. self_destruct()      — DELETE via Vast.ai REST API (if env vars set)
-```
+```text
 
 Override any step by defining the method in your subclass:
 
@@ -102,13 +102,14 @@ class MyWorker(BaseWorker):
     def upload_results(self):
         """Custom upload with progress tracking."""
         # ... your upload logic ...
-```
+```text
 
 ## Track batch state
 
 Two state models for different workload patterns:
 
 **Sharded batches** (N items split across M GPUs):
+
 ```python
 from vastai_gpu_runner.state import BatchState, ShardState
 
@@ -122,9 +123,10 @@ state.save(Path("batch_state.json"))  # Atomic write (tmp + rename)
 # Resume after crash
 state = BatchState.load(Path("batch_state.json"))
 print(f"Active: {len(state.active_shards)}, Failed: {len(state.failed_shards)}")
-```
+```text
 
 **Job-based batches** (1 job = 1 GPU instance):
+
 ```python
 from vastai_gpu_runner.state import JobBatchState, JobState
 
@@ -134,7 +136,7 @@ state = JobBatchState(
 )
 state.save(Path("md_batch_state.json"))
 print(f"Total cost: ${state.total_cost:.2f}")
-```
+```text
 
 ## Use R2 storage
 
@@ -152,7 +154,7 @@ files = sink.download_shard("batch-001", shard_id=0, local_dir=Path("./results")
 
 # Generate upload script for cloud workers
 script = sink.generate_upload_script("batch-001", shard_id=0, workspace="/workspace")
-```
+```text
 
 ## Estimate costs
 
@@ -174,7 +176,7 @@ rows = build_scaling_table(
 
 for row in rows:
     print(f"{row.cloud_gpus} GPUs: {row.wall_time_human}, {row.cost_display}")
-```
+```text
 
 ## R2 bucket lifecycle administration
 
@@ -200,7 +202,7 @@ object-level read/write. Create a separate credentials file:
 export R2_ADMIN_ENDPOINT="https://<accountid>.r2.cloudflarestorage.com"
 export R2_ADMIN_ACCESS_KEY_ID="<admin-access-key>"
 export R2_ADMIN_SECRET_ACCESS_KEY="<admin-secret-key>"
-```
+```text
 
 The CLI **requires** `R2_ADMIN_*` keys — the worker-style `R2_*`
 keys are explicitly rejected so the worker's object-write
@@ -215,7 +217,7 @@ vastai-gpu-runner r2-lifecycle show \
     --bucket my-bucket \
     --prefix project/batches/ \
     --credentials-file ~/.cloud-credentials.r2-admin
-```
+```text
 
 Prints the current managed-rule state and the bucket's source
 fingerprint. Non-mutating, non-interactive.
@@ -235,7 +237,7 @@ vastai-gpu-runner r2-lifecycle apply \
     --credentials-file ~/.cloud-credentials.r2-admin \
     --expire-after-days 30 \
     --yes              # mutate; requires --yes when stdin is not a TTY
-```
+```text
 
 The CLI prompts for confirmation unless `--yes` is supplied on a
 non-interactive stdin. After applying, the CLI re-reads the bucket
@@ -259,7 +261,7 @@ vastai-gpu-runner r2-lifecycle remove \
     --prefix project/batches/ \
     --credentials-file ~/.cloud-credentials.r2-admin \
     --yes
-```
+```text
 
 The managed rule is identified by a deterministic rule ID derived
 from the bucket and prefix. Removing the rule does not affect

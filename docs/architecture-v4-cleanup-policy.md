@@ -434,7 +434,7 @@ RunPod adapter (roadmap item 2).
 
 ## Layered design (v4)
 
-```
+```text
 ┌─────────────────────────────────────────────────┐
 │  CLI (cli.py)                                   │  User-facing commands
 │    └── builds OwnershipPolicy +                 │
@@ -475,7 +475,7 @@ RunPod adapter (roadmap item 2).
 ├──────────────┬──────────────┬───────────────────┤
 │ VastaiRunner │ RunPodRunner │ LocalRunner       │  Lane A implementations
 └──────────────┴──────────────┴───────────────────┘
-```
+```text
 
 ## `cleanup_policy.py` — full module
 
@@ -1029,7 +1029,7 @@ class ProviderCleanupPolicy:
                 verdict=CleanupVerdict.UNKNOWN,
                 error=f"{type(exc).__name__}: {exc}",
             )
-```
+```text
 
 ## `providers/destroy_adapters/vastai.py` — v4 amendments (patch-style excerpt)
 
@@ -1228,7 +1228,7 @@ def destroy_vastai_instance(
     # from providers/destroy.py, with the v3 policy. The runner
     # and the cleanup adapter both delegate to this entry point
     # via this function — they do NOT have inline REST logic.
-```
+```text
 
 ## `providers/vastai.py` — full module updates
 
@@ -2122,7 +2122,7 @@ def build_vastai_cleanup_policy(
         list_instances_fn=_list_instances,
         destroy_fn=_destroy,
     )
-```
+```text
 
 ## Orchestrator wiring
 
@@ -2557,7 +2557,7 @@ def _sweep_zombies(self) -> int:
     if killed:
         logger.info("Zombie sweep: destroyed %d instance(s)", killed)
     return killed
-```
+```text
 
 The orchestrator's `__init__` requires `cleanup_policy: ProviderCleanupPolicy`
 and `runner_factory: RunnerFactory`.
@@ -2668,7 +2668,7 @@ def batch(
         label_prefix=label_scope,
     )
     orch.run()
-```
+```text
 
 The existing `cli.py:cleanup` command migrates to use the new API.
 Empty `--allowed-images` is **fail-closed**:
@@ -2809,7 +2809,7 @@ def cleanup(
         f"\nDestroyed: {destroyed}; already gone: {already_gone}; "
         f"unresolved: {unresolved} (of {len(matches)} instance(s))."
     )
-```
+```text
 
 The `cli.py:instances` command migrates to use `list_vastai_instances`
 and the v4 `OwnershipPolicy.matches()` for the "Owned" column. The
@@ -2886,7 +2886,7 @@ def instances(
 
     console.print(table)
     console.print(f"\nRunning: {running}/{len(candidates)}, Total: ${total_hourly:.2f}/hr")
-```
+```text
 
 ## Migration checklist
 

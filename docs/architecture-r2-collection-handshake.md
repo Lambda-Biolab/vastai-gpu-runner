@@ -42,13 +42,13 @@ handshake that closes both failure modes.
 Each shard / job moves through the following states during its
 teardown sequence:
 
-```
+```text
 WORKLOAD_RUNNING ──► WORKLOAD_COMPLETE ──► TRANSFER_PENDING
                                               │
                                               ├─► R2_COMMITTED ──► COLLECTED ──► DESTROYED
                                               │
                                               └─► RSYNC_REQUIRED ──► COLLECTED ──► DESTROYED
-```
+```text
 
 | State | Owner | Description |
 |-------|-------|-------------|
@@ -106,7 +106,7 @@ manifest object to R2 alongside the artifacts:
     {"name": "outputs/pred_b.txt", "size_bytes": 67890, "sha256": "..."}
   ]
 }
-```
+```text
 
 The orchestrator reads this manifest, then verifies each artifact
 against the listed size and checksum. Manifest mismatch ⇒

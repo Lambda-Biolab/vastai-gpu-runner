@@ -88,9 +88,9 @@ Like the base class, `run_full_cycle` deploys through launch and returns — pol
 
 ### CLI — `run` command
 
-```
+```text
 vastai-gpu-runner run --provider local --file worker.sh [--file INPUT...] --output OUTPUT
-```
+```text
 
 Waits for a `DONE` marker, downloads the workspace into `--output`, and destroys the runner. `--provider` values other than `local` are rejected.
 
@@ -271,11 +271,11 @@ not invoked from worker code.
 
 ## CLI — `r2-lifecycle` sub-app
 
-```
+```text
 vastai-gpu-runner r2-lifecycle show   --bucket B --prefix P/ --credentials-file F
 vastai-gpu-runner r2-lifecycle apply  --bucket B --prefix P/ --credentials-file F --expire-after-days N [--dry-run] [--yes]
 vastai-gpu-runner r2-lifecycle remove --bucket B --prefix P/ --credentials-file F [--dry-run] [--yes]
-```
+```text
 
 Exit codes:
 

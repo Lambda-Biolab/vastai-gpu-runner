@@ -47,7 +47,7 @@ Lives in `vastai_gpu_runner.inference` and is **imported by workers**, not orche
 
 ## Layered design (v2)
 
-```
+```text
 ┌─────────────────────────────────────────────────┐
 │  CLI (cli.py)                                   │  User-facing commands
 ├─────────────────────────────────────────────────┤
@@ -71,7 +71,7 @@ Lives in `vastai_gpu_runner.inference` and is **imported by workers**, not orche
 └─────────────────────────────────────────────────┘
 
 Lane B (ServerlessRunner ABC) — deferred, not drawn.
-```
+```text
 
 ## `LocalRunner` shape
 
@@ -117,12 +117,12 @@ Credentials: `RUNPOD_API_KEY` env var or `~/.cloud-credentials`. Image whitelist
 
 ## Inference module shape
 
-```
+```text
 inference/
     __init__.py          # Re-exports InferenceClient, InferenceProvider
     providers.py         # Enum + base URL + auth env var per provider
     client.py            # Thin OpenAI SDK wrapper
-```
+```text
 
 Minimal public surface:
 
@@ -134,7 +134,7 @@ reply = client.chat(
     messages=[{"role": "user", "content": "hello"}],
     model="llama-3.3-70b-versatile",
 )
-```
+```text
 
 Under the hood, each provider entry is `(base_url, auth_env_var)`. Adding a new OpenAI-compatible provider is one line. Non-OpenAI-compatible providers (Replicate, Fal.ai) are out of scope.
 
