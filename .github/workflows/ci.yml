@@ -1,5 +1,4 @@
-name: CI Main
-# re-resolve on 2026-08-05
+name: CI
 
 "on":
   push:
