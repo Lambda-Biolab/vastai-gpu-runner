@@ -1,13 +1,33 @@
-name: "CodeQL"
+# Reusable CodeQL workflow for Python projects in the org.
+#
+# This is the single source of truth for the CodeQL gate. The
+# `build-mode: none` is the canonical mode for interpreted
+# languages (Python) — CodeQL parses source files directly.
+# The autobuild step is removed (it fails on uv-managed projects).
+#
+# The workflow_call-only trigger is intentional: this reusable
+# workflow is invoked by every calling workflow's `on: pull_request:`
+# trigger, which IS the way CodeQL gets gated to PRs org-wide.
+# The historical concern about "merge-ref SHA races merge-protection
+# check" applied to top-level `pull_request` triggers on the
+# reusable file itself (pre-2023 GitHub Actions behavior). For
+# `workflow_call` invocations, the calling workflow owns the
+# PR trigger and passes the merge-ref SHA correctly.
+#
+# Callers MUST include `pull_request: branches: [main]` in their
+# own `on:` triggers (the python-repo template does this). The
+# caller MAY add an `if:` filter to its codeql job to gate by
+# event_name (e.g., "not on schedule"); it MUST NOT filter out
+# `pull_request`.
+name: "CodeQL (reusable)"
 
 "on":
   push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
   schedule:
     - cron: "27 11 * * 0"
-  workflow_dispatch:
-
-# DO NOT add `pull_request` — its merge-ref SHA races GitHub's merge-protection check.
-
 jobs:
   analyze:
     name: Analyze
@@ -17,50 +37,17 @@ jobs:
       contents: read
       security-events: write
     steps:
-      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
-      - uses: github/codeql-action/init@1cd4d01d58f636bbdbffbfd3c121b3446d07e9f3 # v4
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@f205ea1c3313d32999d8d6a48b4f6530d4437b38 # v4.37.4
         with:
-          # `build-mode: none` is the canonical mode for interpreted
-          # languages (Python, Ruby, JavaScript/TypeScript) —
-          # CodeQL parses the source files directly and builds the
-          # call graph without executing or compiling anything.
-          # See https://docs.github.com/en/code-security/code-scanning/automatically-scanning-your-code-for-vulnerabilities-and-errors/customizing-code-scanning
-          # § "Specifying directories to scan".
-          #
-          # We explicitly opt out of the `autobuild` heuristic for
-          # two reasons documented in biolab-runners' CodeQL
-          # workflow:
-          #
-          #   1. VERSION-PINNED CLI BIAS — the GitHub-hosted
-          #      runner's pre-installed CodeQL CLI is the
-          #      4.36.2 CLI that refused to honour a newer
-          #      manifest ("Loaded a configuration file for
-          #      version '4.37.1', but running version '4.36.2'").
-          #
-          #   2. AUTO-DETECT FAILURE — on uv-managed Python
-          #      projects, the autobuild heuristics didn't
-          #      recognise `uv.lock` + `pyproject.toml` and emitted
-          #      "We were unable to automatically build your code.
-          #      Please replace the call to the autobuild action
-          #      with your custom build steps."
-          #
-          # Per the docs (same page, § "Specifying directories to
-          # scan"), the recommended config for interpreted languages
-          # is `build-mode: none`. CodeQL scans the source tree
-          # directly — pure-Python project, no native build step.
-          languages: python
+          languages: ${{ inputs.languages }}
           build-mode: none
 
       - name: Perform CodeQL Analysis
         id: analyze
-        uses: github/codeql-action/analyze@1cd4d01d58f636bbdbffbfd3c121b3446d07e9f3 # v4
+        uses: github/codeql-action/analyze@f205ea1c3313d32999d8d6a48b4f6530d4437b38 # v4.37.4
         with:
           output: sarif-results
 
-      - uses: advanced-security/dismiss-alerts@53ab66d01eabb3b66427375ce77ba78180b6c008 # v2.0.3
-        with:
-          sarif-id: ${{ steps.analyze.outputs.sarif-id }}
-          sarif-file: sarif-results
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
