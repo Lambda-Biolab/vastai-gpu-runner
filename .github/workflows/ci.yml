@@ -67,7 +67,7 @@ jobs:
         run: uv run pytest -q --cov --cov-branch --cov-report=term-missing
 
   codeql:
-    uses: antomicblitz/opencode-config/.github/workflows/codeql.yml@a798dfeb88b0db1da49443b77ec1798e8526b82f # v1.1.0
+    uses: antomicblitz/opencode-config/.github/workflows/codeql.yml@v1
 
   sbom:
     name: Generate SBOM
@@ -83,4 +83,4 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
   links:
-    uses: antomicblitz/opencode-config/.github/workflows/links.yml@a798dfeb88b0db1da49443b77ec1798e8526b82f # v1.1.0
+    uses: antomicblitz/opencode-config/.github/workflows/links.yml@v1
