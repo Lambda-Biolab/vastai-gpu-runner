@@ -67,7 +67,7 @@ jobs:
         run: uv run pytest -q --cov --cov-branch --cov-report=term-missing
 
   codeql:
-    uses: antomicblitz/opencode-config/.github/workflows/codeql.yml@v1  # updated tag v1 to b02c085 for opencode-config#57
+    uses: antomicblitz/opencode-config/.github/workflows/codeql.yml@v1
 
   sbom:
     name: Generate SBOM
