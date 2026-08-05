@@ -1,11 +1,65 @@
-name: CI Minimal
-on:
+name: CI
+
+"on":
+  push:
+    branches: [main]
+    tags: ["v*"]
   pull_request:
     branches: [main]
+  schedule:
+    - cron: "27 11 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Standard Python project CI bundle, vastai-gpu-runner flavor.
+# Mirrors templates/python-repo/.github/workflows/ci.yml.
+# - codeql, links use the opencode-config reusable workflows
+# - mutation testing is local-only (pre-push `make mutate-changed`)
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
+  lint-type-test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
     steps:
-      - run: echo "hello"
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+      - name: Install uv
+        uses: astral-sh/setup-uv@7e7e21ddc30bd66316c7b9889405f485b5022c96 # v9.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      - run: uv sync --frozen --dev
+      - run: uv run ruff format --check src/ tests/
+      - run: uv run ruff check src/ tests/
+      - run: uv run pyright src/ tests/
+      - run: uv run complexipy src/ --max-complexity-allowed 10
+      - run: uv run pytest -q --cov --cov-branch --cov-report=term-missing
+
   codeql:
     uses: antomicblitz/opencode-config/.github/workflows/codeql.yml@v1
+
+  sbom:
+    name: Generate SBOM
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+      - uses: qte77/gha-sbom-action@cd873b1278a6793a99cfe199c01d603d72cca717 # v0.1.1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+  links:
+    uses: antomicblitz/opencode-config/.github/workflows/links.yml@v1
