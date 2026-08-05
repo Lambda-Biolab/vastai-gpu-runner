@@ -80,14 +80,14 @@ class RunPodRunner(CloudRunner):
         runpod.terminate_pod(instance.instance_id)
         instance.status = InstanceStatus.DESTROYED
         return True
-```
+```text
 
 Usage is identical to `VastaiRunner`:
 
 ```python
 runner = RunPodRunner(DeploymentConfig(gpu_model="RTX_4090"))
 result = runner.run_full_cycle(files, output_dir, max_retries=3)
-```
+```text
 
 ## Driving a local run programmatically
 
@@ -124,7 +124,7 @@ try:
     runner.download_all_results(instance, Path("outputs/local"), critical_files={"DONE"})
 finally:
     runner.destroy_instance(instance)
-```
+```text
 
 The worker runs with `cwd` set to the temp workspace, so it can invoke `biolab-runners` workloads — but `LocalRunner` itself is orchestration-layer glue: it launches the script and manages the process and workspace, nothing more. The same poll/collect/destroy pattern applies to any `CloudRunner` backend; `LocalRunner` just needs no credentials.
 
@@ -149,7 +149,7 @@ class MyProjectSink(R2SinkBase):
     def download_tensorboard(self, batch_id, local_dir):
         """Custom: download TensorBoard logs."""
         return self.download_job(batch_id, "tensorboard", local_dir)
-```
+```text
 
 For a completely different storage backend (e.g. GCS, plain S3), you'd implement the same interface from scratch rather than subclassing — `R2Sink` is tightly coupled to boto3's S3 API.
 
@@ -197,7 +197,7 @@ class InferenceWorker(BaseWorker):
                 ["python", str(r2_script), "--done"],
                 timeout=300, check=False,
             )
-```
+```text
 
 ## Building a batch orchestrator
 
@@ -317,7 +317,7 @@ class MyShardOrchestrator(BatchOrchestrator[ShardState]):
         unit.status = "pending"
         unit.retry_count += 1
         self.save_state()
-```
+```text
 
 Call `orch.run()` to drive the full lifecycle. Everything else — parallel deploys, exponential-backoff polling, zombie sweeps, budget enforcement, R2-first completion checks, silent-crash detection, `max_retries` enforcement — is inherited.
 

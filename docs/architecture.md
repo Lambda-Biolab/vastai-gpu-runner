@@ -2,7 +2,7 @@
 
 ## Module layout
 
-```
+```text
 vastai_gpu_runner/
     __init__.py           # Public API re-exports
     cli.py                # CLI: check, instances, estimate, cleanup
@@ -22,11 +22,11 @@ vastai_gpu_runner/
     estimator/
         core.py           # GPU_SPEED_FACTOR, build_scaling_table, ScalingRow
         pricing.py        # query_vastai_pricing — live marketplace query
-```
+```text
 
 ## Layered design
 
-```
+```text
 ┌─────────────────────────────────────────────────┐
 │  CLI (cli.py)                                   │  User-facing commands
 ├─────────────────────────────────────────────────┤
@@ -46,7 +46,7 @@ vastai_gpu_runner/
 ├─────────────────────────────────────────────────┤
 │  State (state.py)                               │  Crash recovery
 └─────────────────────────────────────────────────┘
-```
+```text
 
 ## Design decisions
 
@@ -62,7 +62,7 @@ Bucket and prefix are constructor params, not hardcoded. Projects subclass `R2Si
 class MyR2Sink(R2Sink):
     def __init__(self):
         super().__init__(bucket="my-bucket", prefix="my-project/batches")
-```
+```text
 
 ### Template method workers
 
@@ -83,6 +83,7 @@ When an R2 sink is configured, the poll loop checks `unit_is_done_in_r2` *before
 ### SSH hardening
 
 All SSH commands use:
+
 - `StrictHostKeyChecking=no` — Vast.ai IPs are ephemeral
 - `UserKnownHostsFile=/dev/null` — no stale host key warnings
 - `stdin=DEVNULL` — prevents stdin stealing (production incident from UTI-project)
@@ -91,6 +92,7 @@ All SSH commands use:
 ### Belt-and-suspenders destroy
 
 `destroy_instance()` uses 4 mechanisms in sequence because Vast.ai instances sometimes resurrect after a single DELETE:
+
 1. CLI `vastai destroy instance`
 2. REST API PUT `state=stopped` (kills Docker pull on booting instances)
 3. REST API DELETE (up to 3 retries)

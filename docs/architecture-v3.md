@@ -53,7 +53,7 @@ The RunPod adapter lands separately when `RunPodRunner` ships (roadmap item 2). 
 
 ## Layered design (v3)
 
-```
+```text
 ┌─────────────────────────────────────────────────┐
 │  CLI (cli.py)                                   │  User-facing commands
 ├─────────────────────────────────────────────────┤
@@ -82,7 +82,7 @@ The RunPod adapter lands separately when `RunPodRunner` ships (roadmap item 2). 
 ├─────────────────────────────────────────────────┤
 │  State (state.py)                               │  Crash recovery
 └─────────────────────────────────────────────────┘
-```
+```text
 
 ## `unit_lifecycle` shape
 
@@ -197,7 +197,7 @@ def decide_next_action(
             return Continue()
         return Preempt(cause=PreemptCause.WORKER_DIED, detail=progress.log_tail)
     return Continue()
-```
+```text
 
 See the full implementation at `src/vastai_gpu_runner/unit_lifecycle.py` in the implementation PR (not in this design doc; the design doc is the contract, not the code).
 
@@ -268,13 +268,14 @@ class DestroyPolicy:
         if self.verify_delay_s < 0: raise ValueError(...)
         if self.retry_delay_s < 0: raise ValueError(...)
         if self.max_delete_attempts < 1: raise ValueError(...)
-```
+```text
 
 `belt_and_suspenders` accepts callbacks and a `DestroyPolicy`, returns a `DestroyResult`. The Vast.ai adapter registers REST callbacks and the Vast.ai-discovered policy.
 
 ## Vast.ai adapter shape
 
 The adapter wraps the protocol with pre-protocol refusals:
+
 - `OWNERSHIP` — image allowlist rejected the instance (fail-closed)
 - `NO_CREDENTIALS` — no API key configured (CLI fallback permitted)
 - `CREDENTIALS_DISABLED` — `VASTAI_API_KEY=""` (CLI fallback forbidden)

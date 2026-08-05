@@ -25,7 +25,7 @@ Cloud GPU orchestration framework for [Vast.ai](https://vast.ai) — batch deplo
 
 ```bash
 uv add "vastai-gpu-runner @ git+https://github.com/antomicblitz/vastai-gpu-runner.git"
-```
+```text
 
 Requires Python >= 3.11, `vastai` CLI (`pip install vastai`), and R2 credentials in `~/.cloud-credentials`.
 
@@ -46,7 +46,7 @@ result = runner.run_full_cycle(
     local_output_dir=output_path,
     max_retries=3,
 )
-```
+```text
 
 See [docs/guide.md](docs/guide.md) for workers, batch state, R2 storage, and cost estimation examples.
 
@@ -58,11 +58,11 @@ vastai-gpu-runner instances              # List active instances
 vastai-gpu-runner estimate -w 10         # Scaling table for 10h of GPU work
 vastai-gpu-runner cleanup -l "myproject" # Destroy orphaned instances
 vastai-gpu-runner run --provider local --file worker.sh --output outputs/local  # Run locally, no cloud credentials
-```
+```text
 
 ## Architecture
 
-```
+```text
 vastai_gpu_runner/
     types.py              # Enums and dataclasses
     runner.py             # CloudRunner ABC
@@ -76,7 +76,7 @@ vastai_gpu_runner/
     worker/health.py      # GPU + R2 health checks
     estimator/core.py     # Scaling tables, GPU speed factors
     estimator/pricing.py  # Live Vast.ai pricing
-```
+```text
 
 See [docs/architecture.md](docs/architecture.md) for design decisions.
 
@@ -97,7 +97,7 @@ uv sync
 uv run pytest          # 623 tests
 uv run ruff check src/ # linting
 uv run pyright src/    # type checking
-```
+```text
 
 ## License
 
