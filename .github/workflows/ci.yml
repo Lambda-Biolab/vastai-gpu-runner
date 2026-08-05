@@ -25,7 +25,10 @@ permissions:
 #   via workflow_dispatch or 'stress:run' PR label — costs real
 #   money so it must NEVER run automatically).
 # - concurrency: cancel-in-progress for the same ref
-# - skip codeql on PR (merge-ref SHA race)
+# - codeql, links use the opencode-config reusable workflows (the
+#   standalone codeql.yml was removed; this ci.yml no longer
+#   inlines codeql or links jobs to avoid duplicate runs)
+# - mutation testing is local-only (pre-push `make mutate-changed`)
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -64,43 +67,7 @@ jobs:
         run: uv run pytest -q --cov --cov-branch --cov-report=term-missing
 
   codeql:
-    name: CodeQL
-    # CodeQL MUST run on every PR so security findings block the
-    # merge instead of showing up post-merge. The hosting workflow's
-    # `on: pull_request:` trigger (set at the top of this file)
-    # already defines the PR event — the old `if:` filter dropped it,
-    # which downgraded CodeQL to post-merge advisory. Mirroring the
-    # org rule documented in
-    # antomicblitz/opencode-config/templates/python-repo/.github/workflows/ci.yml.
-    runs-on: ubuntu-latest
-    permissions:
-      actions: read
-      contents: read
-      security-events: write
-    steps:
-      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
-      - uses: github/codeql-action/init@f205ea1c3313d32999d8d6a48b4f6530d4437b38 # v4.37.4
-        with:
-          languages: python
-          build-mode: none
-      - name: Perform CodeQL Analysis
-        id: analyze
-        uses: github/codeql-action/analyze@f205ea1c3313d32999d8d6a48b4f6530d4437b38 # v4.37.4
-        with:
-          output: sarif-results
-
-  mutation:
-    name: Weekly Mutation Testing
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
-      - uses: astral-sh/setup-uv@7e7e21ddc30bd66316c7b9889405f485b5022c96 # v9.0.0
-      - run: uv python install 3.12
-      - run: uv sync --frozen --dev
-      - run: uv pip install mutmut
-      - run: uv run mutmut run --max-children=4
+    uses: antomicblitz/opencode-config/.github/workflows/codeql.yml@a798dfeb88b0db1da49443b77ec1798e8526b82f # v1.1.0
 
   sbom:
     name: Generate SBOM
@@ -110,21 +77,10 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bb5fb8327a7b17cc85c0 # v7.0.1
       - uses: qte77/gha-sbom-action@cd873b1278a6793a99cfe199c01d603d72cca717 # v0.1.1
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
   links:
-    name: Link Checker
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      issues: write
-    steps:
-      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
-      - uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
-        with:
-          args: "--config .lychee.toml ."
-          fail: true
+    uses: antomicblitz/opencode-config/.github/workflows/links.yml@a798dfeb88b0db1da49443b77ec1798e8526b82f # v1.1.0
