@@ -77,7 +77,7 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - uses: actions/checkout@f548e57e544e1ff5a4c46bb5fb8327a7b17cc85c0 # v7.0.1
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
       - uses: qte77/gha-sbom-action@cd873b1278a6793a99cfe199c01d603d72cca717 # v0.1.1
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
