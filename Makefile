@@ -44,7 +44,12 @@ TEST_DIR := $(if $(wildcard tests),tests,test)
 PYTHON := uv run python
 UV := uv
 
-.PHONY: help setup_dev install_tools lint format type_check complexity test \ ci-local update update-bump
+.PHONY: help setup_dev install_tools lint format type_check complexity test \
+	ci-local update update-bump \
+	validate validate-branch quick_validate pre-push-validate \
+	secrets bandit \
+	mutate mutate-changed mutate-stats mutate-score _mutate-prepare \
+	propagate-makefile clean
 
 # Pinned dev/test tools. Match pyproject.toml dev/test groups exactly so
 # `uv sync --frozen` fetches a deterministic version. Local and CI must
@@ -59,11 +64,6 @@ UV := uv
 RUFF_VERSION := 0.15.10
 PYTEST_VERSION := 8.3.4
 PYTEST_COV_VERSION := 5.0.0
-
-        validate validate-branch quick_validate pre-push-validate \
-        secrets bandit \
-        mutate mutate-changed mutate-stats mutate-score _mutate-prepare \
-        propagate-makefile clean
 
 # Show the detected source layout (debug aid)
 debug-layout:
