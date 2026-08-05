@@ -6,8 +6,6 @@
 [![CI](https://github.com/Lambda-Biolab/vastai-gpu-runner/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Lambda-Biolab/vastai-gpu-runner/actions/workflows/ci.yml)
 [![Dependabot Updates](https://github.com/Lambda-Biolab/vastai-gpu-runner/actions/workflows/dependabot/dependabot-updates/badge.svg?branch=main)](https://github.com/Lambda-Biolab/vastai-gpu-runner/actions/workflows/dependabot/dependabot-updates)
 [![CodeQL](https://github.com/Lambda-Biolab/vastai-gpu-runner/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/Lambda-Biolab/vastai-gpu-runner/actions/workflows/codeql.yml)
-[![CodeFactor](https://www.codefactor.io/repository/github/lambda-biolab/vastai-gpu-runner/badge/main)](https://www.codefactor.io/repository/github/lambda-biolab/vastai-gpu-runner)
-
 ![vastai-gpu-runner — Cloud GPU batches for Vast.ai.](.github/social-preview.png)
 
 Cloud GPU orchestration framework for [Vast.ai](https://vast.ai) — batch deployment, R2 storage, worker lifecycle, crash recovery.
