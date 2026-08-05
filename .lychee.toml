@@ -15,4 +15,6 @@ exclude = [
     "^https://en\\.wikipedia\\.org",
     "^https://hub\\.docker\\.com",
     "^https://pypi\\.org",
+    # Internal Lambda-Biolab org repos — private, 404 to anonymous clients
+    "^https://github\\.com/Lambda-Biolab",
 ]

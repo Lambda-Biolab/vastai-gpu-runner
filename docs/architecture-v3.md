@@ -2,10 +2,7 @@
 
 This doc describes the **target architecture** after the unit-lifecycle decision tree and belt-and-suspenders destroy refactor land. For the current-state architecture (today's code) see
 [`architecture.md`](architecture.md). For the next-step target see
-[`architecture-v2.md`](architecture-v2.md). For the architectural review that
-motivated this doc see the [HTML report][review].
-
-[review]: file:///tmp/architecture-review.Jxytgw/vastai-gpu-runner-review.html
+[`architecture-v2.md`](architecture-v2.md).
 
 ## What changes vs v2
 
