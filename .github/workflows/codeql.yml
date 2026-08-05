@@ -2,11 +2,19 @@ name: "CodeQL"
 
 "on":
   push:
+    branches: [main]
+  pull_request:
+    branches: [main]
   schedule:
     - cron: "27 11 * * 0"
   workflow_dispatch:
 
-# DO NOT add `pull_request` — its merge-ref SHA races GitHub's merge-protection check.
+# This file is also called by the inline `codeql` job in
+# .github/workflows/ci.yml when the workflow's pull_request trigger
+# fires. CodeQL MUST run on every PR so security findings block the
+# merge instead of showing up post-merge. Mirroring the org rule
+# documented in
+# antomicblitz/opencode-config/templates/python-repo/.github/workflows/ci.yml.
 
 jobs:
   analyze:

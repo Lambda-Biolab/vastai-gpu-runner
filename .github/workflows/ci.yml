@@ -65,7 +65,13 @@ jobs:
 
   codeql:
     name: CodeQL
-    if: github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # CodeQL MUST run on every PR so security findings block the
+    # merge instead of showing up post-merge. The hosting workflow's
+    # `on: pull_request:` trigger (set at the top of this file)
+    # already defines the PR event — the old `if:` filter dropped it,
+    # which downgraded CodeQL to post-merge advisory. Mirroring the
+    # org rule documented in
+    # antomicblitz/opencode-config/templates/python-repo/.github/workflows/ci.yml.
     runs-on: ubuntu-latest
     permissions:
       actions: read
