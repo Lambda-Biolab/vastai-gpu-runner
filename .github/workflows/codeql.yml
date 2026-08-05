@@ -1,0 +1,53 @@
+# Reusable CodeQL workflow for Python projects in the org.
+#
+# This is the single source of truth for the CodeQL gate. The
+# `build-mode: none` is the canonical mode for interpreted
+# languages (Python) — CodeQL parses source files directly.
+# The autobuild step is removed (it fails on uv-managed projects).
+#
+# The workflow_call-only trigger is intentional: this reusable
+# workflow is invoked by every calling workflow's `on: pull_request:`
+# trigger, which IS the way CodeQL gets gated to PRs org-wide.
+# The historical concern about "merge-ref SHA races merge-protection
+# check" applied to top-level `pull_request` triggers on the
+# reusable file itself (pre-2023 GitHub Actions behavior). For
+# `workflow_call` invocations, the calling workflow owns the
+# PR trigger and passes the merge-ref SHA correctly.
+#
+# Callers MUST include `pull_request: branches: [main]` in their
+# own `on:` triggers (the python-repo template does this). The
+# caller MAY add an `if:` filter to its codeql job to gate by
+# event_name (e.g., "not on schedule"); it MUST NOT filter out
+# `pull_request`.
+name: "CodeQL (reusable)"
+
+"on":
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  schedule:
+    - cron: "27 11 * * 0"
+jobs:
+  analyze:
+    name: Analyze
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@f205ea1c3313d32999d8d6a48b4f6530d4437b38 # v4.37.4
+        with:
+          languages: ${{ inputs.languages }}
+          build-mode: none
+
+      - name: Perform CodeQL Analysis
+        id: analyze
+        uses: github/codeql-action/analyze@f205ea1c3313d32999d8d6a48b4f6530d4437b38 # v4.37.4
+        with:
+          output: sarif-results
+

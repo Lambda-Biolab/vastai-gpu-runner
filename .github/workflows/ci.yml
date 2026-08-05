@@ -47,7 +47,35 @@ jobs:
       - run: uv run pytest -q --cov --cov-branch --cov-report=term-missing
 
   codeql:
-    uses: Lambda-Biolab/opencode-config/.github/workflows/codeql.yml@9486776943e2  # v1
+    name: CodeQL
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@f205ea1c3313d32999d8d6a48b4f6530d4437b38 # v4.37.4
+        with:
+          languages: python
+          build-mode: none
+
+      - name: Perform CodeQL Analysis
+        id: analyze
+        uses: github/codeql-action/analyze@f205ea1c3313d32999d8d6a48b4f6530d4437b38 # v4.37.4
+        with:
+          output: sarif-results
+
+      - name: Dismiss alerts with inline suppression comments
+        if: always()
+        uses: advanced-security/dismiss-alerts@a18f986bdb40edba0dd7a74382c15d4a3d50a1c8 # v2.0.3
+        with:
+          sarif-id: ${{ steps.analyze.outputs.sarif-id }}
+          sarif-file: sarif-results
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   sbom:
     name: Generate SBOM
@@ -63,4 +91,4 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
   links:
-    uses: Lambda-Biolab/opencode-config/.github/workflows/links.yml@9486776943e2  # v1
+    uses: Lambda-Biolab/opencode-config/.github/workflows/links.yml@v1
