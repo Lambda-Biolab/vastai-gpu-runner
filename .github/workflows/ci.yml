@@ -46,7 +46,7 @@ jobs:
       - run: uv run pytest -q --cov --cov-branch --cov-report=term-missing
 
   codeql:
-    uses: Lambda-Biolab/opencode-config/.github/workflows/codeql.yml@a3fad039724c523cbb4c534f6496a4beb00c5f4f  # v1
+    uses: Lambda-Biolab/opencode-config/.github/workflows/codeql.yml@9486776943e2  # v1
 
   sbom:
     name: Generate SBOM
@@ -62,4 +62,4 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
   links:
-    uses: Lambda-Biolab/opencode-config/.github/workflows/links.yml@a3fad039724c523cbb4c534f6496a4beb00c5f4f  # v1
+    uses: Lambda-Biolab/opencode-config/.github/workflows/links.yml@9486776943e2  # v1
