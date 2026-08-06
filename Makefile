@@ -47,7 +47,7 @@ UV := uv
 .PHONY: help setup_dev install_tools lint format type_check complexity test \
 	ci-local update update-bump \
 	validate validate-branch quick_validate pre-push-validate \
-	secrets bandit \
+	secrets bandit actionlint \
 	mutate mutate-changed mutate-stats mutate-score _mutate-prepare \
 	propagate-makefile clean
 
@@ -155,10 +155,29 @@ bandit:
 	@command -v uv >/dev/null 2>&1 || { echo "uv not installed"; exit 2; }
 	@$(UV) run --active bandit -r $(SRC) -ll -ii
 
-# --- Install tools (gitleaks binary; bandit is a dev dep) ---
-# gitleaks is shipped as a standalone binary; bandit is a dev dependency
-# in pyproject.toml and doesn't need a separate install step.
-# Version is 8.30.1 \u2014 must match GITLEAKS_VERSION in .github/workflows/secrets.yml.
+# --- actionlint (GitHub Actions workflow linter) ---
+# Lints every workflow in .github/workflows/ for syntax errors, context
+# availability (e.g. hashFiles() at job-level if:), and unknown runner
+# labels. Install via `make install_tools`. The .github/actionlint.yaml
+# config whitelists any custom self-hosted runner labels.
+actionlint:  ## Lint .github/workflows/*.yml (catches context, runner-label, syntax bugs)
+	@command -v actionlint >/dev/null 2>&1 || { echo "actionlint not installed \u2014 run 'make install_tools'"; exit 2; }
+	@if [ -d .github/workflows ]; then \
+		actionlint -color; \
+	else \
+		echo "no .github/workflows/ directory \u2014 skipping actionlint"; \
+	fi
+
+# --- Install tools (gitleaks + actionlint binaries; bandit is a dev dep) ---
+# gitleaks and actionlint are shipped as standalone binaries; bandit is a dev
+# dependency in pyproject.toml and doesn't need a separate install step.
+# 
+# Version pins are single source of truth:
+#   - gitleaks 8.30.1 — must match GITLEAKS_VERSION in .github/workflows/secrets.yml
+#   - actionlint 1.7.12 — must match the install-actionlint.sh default
+ACTIONLINT_VERSION := 1.7.12
+install_tools:
+	@echo "Installing gitleaks 8.30.1..."
 install_tools:
 	@echo "Installing gitleaks 8.30.1..."
 	@if ! command -v gitleaks >/dev/null 2>&1; then \
@@ -171,16 +190,24 @@ install_tools:
 		echo "  gitleaks already present at $$(command -v gitleaks)"; \
 	fi
 	@echo "Bandit is a dev dependency in pyproject.toml (run 'uv sync --all-groups')."
+	@echo "Installing actionlint $(ACTIONLINT_VERSION)..."
+	@if ! command -v actionlint >/dev/null 2>&1; then \
+		mkdir -p $(HOME)/.local/bin; \
+		bash $(CURDIR)/scripts/install-actionlint.sh; \
+		echo "  installed to $(HOME)/.local/bin/actionlint"; \
+	else \
+		echo "  actionlint already present at $$(command -v actionlint)"; \
+	fi
 
 # --- Top-level gates ---
 # validate: fast read-only quality gates. Mirrors what CI runs.
 # pre-push-validate: validate + branch coverage on changed files + mutation
 # testing on changed tracked functions. Called by scripts/git-hooks/pre-push.
 # validate does NOT include mutation testing (too slow for CI).
-quick_validate: lint type_check complexity  ## Fast iteration: skip tests
+quick_validate: lint type_check complexity actionlint  ## Fast iteration: skip tests
 	@echo "quick validate passed"
 
-validate: lint type_check complexity test secrets bandit  markdownlint ## Full pre-push gate: lint + types + complexity + tests + secrets + bandit (mirrors CI)
+validate: lint type_check complexity test secrets bandit actionlint markdownlint ## Full pre-push gate: lint + types + complexity + tests + secrets + bandit (mirrors CI)
 
 # The mandatory pre-push gate. Runs validate (fast quality gates) PLUS
 # branch coverage on changed files PLUS mutation testing on changed
