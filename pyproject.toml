@@ -12,6 +12,16 @@ dependencies = [
     "rich>=13.0",
 ]
 
+[project.optional-dependencies]
+gcp = [
+    "google-cloud-batch>=0.17.0",
+    "google-cloud-storage>=3.0.0",
+    "google-cloud-logging>=3.10.0",
+]
+all = [
+    "vastai-gpu-runner[gcp]",
+]
+
 [project.scripts]
 vastai-gpu-runner = "vastai_gpu_runner.cli:app"
 
