@@ -473,7 +473,7 @@ class FakeGcsClient:
     def __init__(self) -> None:
         """Initialise an empty in-memory GCS namespace."""
         self.buckets: dict[str, dict[str, bytes]] = {}
-        self.uploads: list[tuple[str, str, bytes]] = []
+        self.uploads: list[tuple[str, str, bytes, str | None]] = []
         self.downloads: list[tuple[str, str]] = []
 
     def bucket(self, name: str) -> FakeGcsBucket:
@@ -507,8 +507,17 @@ class FakeGcsBucket:
         """Return a fake blob handle for ``key``."""
         return FakeGcsBlob(self._client, self._name, key)
 
-    def exists(self, key: str) -> bool:
-        """Return True if ``key`` exists in this bucket."""
+    def exists(self, key: str = "") -> bool:
+        """Return True if ``key`` exists in this bucket.
+
+        With no ``key`` argument, the real :class:`google.cloud.storage.bucket.Bucket`
+        reports whether the bucket itself exists. The GcsSink only ever
+        asks about keys, so the default-argument form keeps the fake
+        compatible with both the sink and any future bucket-level
+        existence checks.
+        """
+        if not key:
+            return self._name in self._client.buckets
         return key in self._client.buckets[self._name]
 
 
@@ -523,13 +532,17 @@ class FakeGcsBlob:
 
     def upload_from_string(self, data: bytes, content_type: str | None = None) -> None:
         """Store ``data`` in the in-memory bucket."""
-        self._client.uploads.append((self._bucket, self._key, data))
+        self._client.uploads.append((self._bucket, self._key, data, content_type))
         self._client.buckets.setdefault(self._bucket, {})[self._key] = data
 
     def download_as_bytes(self) -> bytes:
         """Return the previously stored bytes, or empty bytes."""
         self._client.downloads.append((self._bucket, self._key))
         return self._client.buckets.get(self._bucket, {}).get(self._key, b"")
+
+    def exists(self) -> bool:
+        """Return True if this blob is in the in-memory bucket."""
+        return self._key in self._client.buckets.get(self._bucket, {})
 
     def delete(self) -> None:
         """Remove the blob from the in-memory bucket."""

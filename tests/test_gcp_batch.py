@@ -210,47 +210,17 @@ def test_submit_persists_state() -> None:
 
 
 class FakeGcsClientForSink:
-    """In-memory GCS client implementing only what :class:`GcsSink` uses."""
+    """Thin shim around the shared fake GCS client in gcp_batch.py."""
 
     def __init__(self) -> None:
-        self.buckets: dict[str, dict[str, bytes]] = {"campaign": {}}
-        self.uploads: list[tuple[str, str, bytes, str | None]] = []
+        from vastai_gpu_runner.managed_jobs.gcp_batch import FakeGcsClient
 
-    def bucket(self, name: str) -> FakeBucket:
-        return FakeBucket(self, name)
+        self._impl = FakeGcsClient()
+        self._impl.create_bucket("campaign")
+        self.uploads = self._impl.uploads
 
-
-class FakeBucket:
-    def __init__(self, client: FakeGcsClientForSink, name: str) -> None:
-        self._client = client
-        self._name = name
-
-    def exists(self) -> bool:
-        return self._name in self._client.buckets
-
-    def blob(self, key: str) -> FakeBlob:
-        return FakeBlob(self._client, self._name, key)
-
-
-class FakeBlob:
-    def __init__(self, client: FakeGcsClientForSink, bucket: str, key: str) -> None:
-        self._client = client
-        self._bucket = bucket
-        self._key = key
-        self.chunk_size = 0
-
-    def upload_from_string(self, data: bytes, content_type: str | None = None) -> None:
-        self._client.uploads.append((self._bucket, self._key, data, content_type))
-        self._client.buckets.setdefault(self._bucket, {})[self._key] = data
-
-    def download_as_bytes(self) -> bytes:
-        return self._client.buckets.get(self._bucket, {}).get(self._key, b"")
-
-    def exists(self) -> bool:
-        return self._key in self._client.buckets.get(self._bucket, {})
-
-    def delete(self) -> None:
-        self._client.buckets.setdefault(self._bucket, {}).pop(self._key, None)
+    def bucket(self, name: str) -> Any:
+        return self._impl.bucket(name)
 
 
 def test_gcs_sink_upload_and_download_bytes() -> None:
@@ -264,7 +234,6 @@ def test_gcs_sink_upload_and_download_bytes() -> None:
 
 def test_gcs_sink_missing_bucket_raises() -> None:
     client = FakeGcsClientForSink()
-    client.buckets.clear()
     sink = GcsSink(bucket_name="absent", client=client)  # type: ignore[arg-type]
     with pytest.raises(KeyError):
         sink.upload_bytes("foo", b"x")
