@@ -1,10 +1,10 @@
 # vastai-gpu-runner
 
-[![Version](https://img.shields.io/badge/version-0.4.0-8A2BE2)](pyproject.toml)
+[![Version](https://img.shields.io/badge/version-0.6.0-8A2BE2)](pyproject.toml)
 [![License](https://img.shields.io/badge/license-Apache_2.0-blue)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11%2B-58f4c2.svg)](https://www.python.org/)
 [![CI](https://github.com/Lambda-Biolab/vastai-gpu-runner/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Lambda-Biolab/vastai-gpu-runner/actions/workflows/ci.yml)
-[![Dependabot Updates](https://github.com/Lambda-Biolab/vastai-gpu-runner/actions/workflows/dependabot/dependabot-updates/badge.svg?branch=main)](https://github.com/Lambda-Biolab/vastai-gpu-runner/actions/workflows/dependabot/dependabot-updates)
+[![Dependabot Updates](https://github.com/Lambda-Biolab/vastai-gpu-runner/actions/actions/dependabot-updates/badge.svg?branch=main)](https://github.com/Lambda-Biolab/vastai-gpu-runner/actions/workflows/dependabot/dependabot-updates)
 [![CodeQL](https://github.com/Lambda-Biolab/vastai-gpu-runner/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/Lambda-Biolab/vastai-gpu-runner/actions/workflows/codeql.yml)
 ![vastai-gpu-runner — Cloud GPU batches for Vast.ai.](.github/social-preview.png)
 
@@ -15,6 +15,9 @@ Cloud GPU orchestration framework for [Vast.ai](https://vast.ai) — batch deplo
 - **CloudRunner** — provider-agnostic lifecycle with retry and machine deduplication
 - **VastaiRunner** — hardened Vast.ai deployment with quality filters and ownership guards
 - **LocalRunner** — zero-cost local/CI backend: the same lifecycle as a subprocess, no cloud credentials
+- **ManagedJobRunner** (Protocol) — provider-neutral interface for cloud batch workloads; the contract behind `VastaiRunner` and `GcpBatchRunner`.
+- **GcpBatchRunner** — Google Cloud Batch backend for managed job submission + status polling.
+- **GcsSink** — Google Cloud Storage artifact sink sharing the same DONE-marker contract as `R2Sink`.
 - **R2Sink** — S3-compatible result storage with DONE markers and parallel downloads
 - **BaseWorker** — template method worker: GPU check, preflight gates, self-destruct
 - **BatchState** — atomic JSON persistence for crash-recoverable batch orchestration
