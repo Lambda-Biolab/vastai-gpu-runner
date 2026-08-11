@@ -39,5 +39,14 @@
   "MD060": false,
   "MD024": { "siblings_only": true },
   "MD041": { "front_matter_title": "^\\s*title\\s*[:=]" },
-  "MD045": false
+  "MD045": false,
+
+  // Ignore session-local and tooling artifacts. These are gitignored but
+  // markdownlint runs on the working tree so untracked .opencode/handoffs
+  // and .secrets.baseline still get scanned.
+  "ignore": [
+    ".opencode/",
+    ".secrets.baseline",
+    "mutants/"
+  ]
 }
