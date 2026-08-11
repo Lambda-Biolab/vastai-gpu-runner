@@ -4,6 +4,13 @@ Mirrors the surface of :class:`~vastai_gpu_runner.storage.r2.R2Sink`
 so a consumer can swap artifact stores without changing the
 orchestrator. Implementations live behind the optional ``gcp``
 extra and the Google SDK is imported lazily.
+
+Atomic uploads use ``upload_atomic_json`` (temp-then-rename). Plain
+``upload_bytes`` / ``upload_file`` rely on the consumer to compose
+the destination key deterministically and accept eventual overwrite;
+they do not currently set ``if_generation_match`` on the underlying
+blob because most consumers use the atomic-json helper for
+versioned writes.
 """
 
 from __future__ import annotations
@@ -61,8 +68,14 @@ class GcsSink:
 
     def _bucket(self) -> Any:
         client = self._require_client()
-        bucket = client.bucket(self._bucket_name)
-        if not getattr(bucket, "exists", lambda: True)():
+        try:
+            bucket = client.bucket(self._bucket_name)
+        except LookupError as exc:
+            raise KeyError(f"GCS bucket not found: {self._bucket_name}") from exc
+        bucket_exists = getattr(bucket, "exists", None)
+        if bucket_exists is None:
+            raise KeyError(f"GCS bucket not found: {self._bucket_name}")
+        if not bucket_exists():
             raise KeyError(f"GCS bucket not found: {self._bucket_name}")
         return bucket
 
