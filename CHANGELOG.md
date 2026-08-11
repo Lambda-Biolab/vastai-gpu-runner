@@ -123,6 +123,52 @@
   sections, plus CLI sub-app reference and full exit-code table
   (0, 1, 2, 3, 4, 5, 6, 7, 8, 9).
 
+## 0.6.0 (2026-08-09) — managed-jobs architecture
+
+### Added
+
+- **`ManagedJobRunner` Protocol + `ManagedJob`/`BatchStatus` types**
+  (`jobs/runner.py`) — provider-neutral interface for cloud batch
+  workload submission: `submit_job(manifest) -> ManagedJob`,
+  `poll_status(job) -> BatchStatus` (with `PENDING | RUNNING |
+  SUCCEEDED | FAILED | CANCELLED`), `fetch_results(job, sink)`,
+  `cancel_job(job)`. The Protocol separates the *contract*
+  (what every provider must implement) from the *backend* (Vastai
+  vs GCP Batch vs Local). An `is_terminal_status()` helper
+  classifies SUCCEEDED / FAILED / CANCELLED.
+- **`GcpBatchRunner`** (`jobs/gcp.py`) — Google Cloud Batch backend
+  implementing `ManagedJobRunner`. Submits jobs via
+  `google-cloud-batch` v0.17+, polls via the Batch v1 API,
+  downloads log + output artifacts into a `ManagedArtifactSink`.
+  Honors a 30-minute default poll timeout and `--poll-interval`
+  for status checks. Unit-tested against `google.cloud.batch_v1`
+  stub clients.
+- **`GcsSink`** (`jobs/gcs.py`) — Google Cloud Storage artifact
+  sink sharing the same DONE-marker contract as `R2Sink`:
+  upload outputs, then write a sentinel object keyed by SHA-256
+  of the artifact list. `download` is a stream-from-GCS-byte
+  range fetch with parallel parts via `Blob.chunked_download`.
+- **`tests/test_gcp_batch.py`** — 14 unit tests for the GCP Batch
+  runner (manifest submission, status polling, terminal-status
+  detection, cancellation, error paths via stubbed
+  `BatchServiceClient`).
+- **`tests/test_gcs.py`** + **`tests/test_gcs_sink.py`** — 22
+  unit tests covering the GCS sink contract (single-object
+  upload, multi-part parallel upload, DONE-marker placement,
+  missing-marker detection on download).
+- **`tests/test_fake_gcp_clients.py`** — in-memory `FakeGcsClient`
+  + `FakeBatchClient` test doubles for downstream test isolation;
+  they satisfy the same protocols as the real clients but operate
+  on `dict` storage.
+
+### Changed
+
+- **`docs/extending.md`** — new "Adding a `ManagedJobRunner`
+  backend" walkthrough showing how to implement the Protocol
+  for a new cloud provider.
+- **`docs/api.md`** — `ManagedJobRunner` Protocol reference,
+  `ManagedJob` / `BatchStatus` type definitions.
+
 ## 0.4.0 (2026-07-27) — v4 cleanup-policy architecture
 
 ### Added
