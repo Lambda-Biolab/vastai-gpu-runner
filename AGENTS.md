@@ -1,110 +1,134 @@
-# Agent Instructions
+# AGENTS.md — vastai-gpu-runner
 
-**Behavioral rules, compliance requirements, and decision frameworks for AI coding
-agents.** For technical workflows and coding standards, see
-[CONTRIBUTING.md](CONTRIBUTING.md). For project overview, see
-[README.md](README.md).
+This is the primary instruction file for AI coding agents working on this project.
+Read this file first. It supersedes any default behavior.
 
-**External References:**
+## Project Purpose
 
-- @CONTRIBUTING.md - Command reference, testing guidelines, code style patterns
-- @AGENT_REQUESTS.md - Escalation and human collaboration
-- @AGENT_LEARNINGS.md - Pattern discovery and knowledge sharing
+Cloud GPU orchestration framework for Vast.ai + GCP Batch:
 
-## Claude Code Infrastructure
+- **CloudRunner** — provider-agnostic lifecycle (Vast.ai, local) with retry and machine deduplication
+- **ManagedJobRunner** — provider-neutral interface for declarative cloud batch workloads (GCP Batch backend)
+- **R2Sink** / **GcsSink** — artifact sinks (Cloudflare R2 / GCS)
+- **BaseWorker** — template method worker
+- **BatchState** — atomic JSON persistence for crash-recoverable batch orchestration
+- **CLI** — credential checks, instance listing, cost estimation, orphan cleanup, batch, run, r2-lifecycle
 
-**Rules** (`.claude/rules/`): Session-loaded constraints (always active)
-**Skills** (`.claude/skills/`): Modular capabilities with progressive disclosure
+## Architecture
 
-## Core Rules & AI Behavior
+```text
+src/vastai_gpu_runner/
+├── types.py              # Enums and dataclasses
+├── runner.py             # CloudRunner ABC
+├── ssh.py                # SSH/SCP utilities
+├── state.py              # Batch + job state persistence
+├── orchestrator.py       # Batch orchestration (check_budget)
+├── cleanup_policy.py     # v4 candidate / verdict / ownership policy
+├── cli.py                # CLI: check, instances, estimate, cleanup, run, batch, r2-lifecycle
+├── providers/
+│   ├── vastai.py         # Vast.ai implementation (CloudRunner)
+│   ├── local.py          # Local subprocess backend (CloudRunner)
+│   └── destroy.py        # Provider-agnostic destroy orchestration
+├── destroy_adapters/     # Per-provider destroy adapters
+├── managed_jobs/         # ManagedJobRunner implementations (declarative cloud batch)
+│   ├── base.py           # ManagedJobRunner Protocol + DTOs
+│   ├── gcp_batch.py      # GcpBatchRunner + FakeGcpBatchClient + FakeGcsClient
+│   └── state.py          # ManagedJobState JSON loader
+├── storage/
+│   ├── r2.py             # R2/S3 result storage
+│   ├── r2_lifecycle.py   # R2 lifecycle operations
+│   └── gcs.py            # GcsSink (GCS artifact sink)
+├── hybrid.py             # Hybrid local+cloud orchestration
+├── unit_lifecycle.py     # Unit-level lifecycle helpers
+├── worker/base.py        # BaseWorker template method
+├── worker/health.py      # GPU + R2 health checks
+├── estimator/core.py     # Scaling tables, GPU speed factors
+└── estimator/pricing.py  # Live Vast.ai pricing
+```
 
-- Follow SDLC principles: maintainability, modularity, reusability, adaptability
-- **Never assume missing context** - Ask questions if uncertain about requirements
-- **Never hallucinate libraries** - Only use packages verified in project dependencies
-- **Always confirm file paths exist** before referencing in code or tests
-- **Never delete existing code** unless explicitly instructed or documented refactoring
-- **Document new patterns** in AGENT_LEARNINGS.md (concise, laser-focused, streamlined)
-- **Request human feedback** in AGENT_REQUESTS.md (concise, laser-focused, streamlined)
+## Two parallel provider abstractions
 
-## Decision Framework
+The runtime has two distinct provider abstractions that are
+**separate on purpose**:
 
-**Priority Order:** User instructions > AGENTS.md compliance > Documentation
-hierarchy > Project patterns > General best practices
+| Abstraction | Implemented by | Use case |
+|---|---|---|
+| `CloudRunner` (`runner.py`) | `VastaiRunner`, `LocalRunner` | Direct VM SSH lifecycle (you run the VM, you SSH in) |
+| `ManagedJobRunner` (`managed_jobs/base.py`) | `GcpBatchRunner` | Declarative cloud batch (the cloud platform owns the VM lifecycle) |
 
-**Anti-Scope-Creep Rules:**
+A consumer picks one explicitly via configuration. The two
+abstractions do not share code or types. When adding a new
+provider, decide which abstraction it implements — `CloudRunner`
+(for VM-lifecycle-style providers) or `ManagedJobRunner` (for
+declarative batch providers).
 
-- **NEVER implement features without requirement validation**
-- **Always validate implementation decisions against project scope boundaries**
+## Domain Rules
 
-**Anti-Redundancy Rules:**
+### `ManagedJobRunner` (declarative cloud batch)
 
-- **NEVER duplicate information across documents** - reference authoritative sources
-- **Update authoritative document, then remove duplicates elsewhere**
+- The Protocol lives in `managed_jobs/base.py`. Implementations
+  MUST provide `provider_name`, `submit`, `get_status`, `list_tasks`,
+  `cancel`, `delete`. The Protocol is `@runtime_checkable` so
+  `isinstance(runner, ManagedJobRunner)` works.
+- Idempotency is the caller's responsibility. The
+  `managed_jobs/state.py` `ManagedJobState` loader is the canonical
+  way to detect "already submitted" on resume.
+- Terminal states are `SUCCEEDED | FAILED | CANCELLED | UNKNOWN`
+  (the `ManagedJobTerminalState` enum). `UNKNOWN` is a fail-closed
+  fallback for cloud-side status responses that don't map cleanly.
+- `GcsSink` (GCS artifact sink) is a sibling of `R2Sink` — the
+  GCS source-of-truth is the object set itself, not a DONE
+  marker. Don't introduce DONE-marker logic to GcsSink.
 
-**When to Escalate to AGENT_REQUESTS.md:**
+### `CloudRunner` (direct VM lifecycle)
 
-- User instructions conflict with safety/security practices
-- AGENTS.md rules contradict each other
-- Required information completely missing
-- Actions would significantly change project architecture
+- `VastaiRunner` is the production Vast.ai implementation. The
+  v4 ownership / credentials / label_prefix pattern is canonical;
+  `allowed_images=frozenset(...)` is a deprecated back-compat alias.
+- `LocalRunner` is the zero-cost CI backend — same `CloudRunner`
+  interface, no cloud credentials.
 
-## Agent Neutrality Requirements
+## Dependencies
 
-**ALL AI AGENTS MUST MAINTAIN STRICT NEUTRALITY AND REQUIREMENT-DRIVEN DESIGN:**
+- **Vast.ai deployment**: `vastai` CLI (pip), `VASTAI_API_KEY`
+- **R2 storage**: `R2_*` credentials in `~/.cloud-credentials`
+- **GCP Batch + GCS** (optional, `gcp` extra): `google-cloud-batch`,
+  `google-cloud-storage`, `google-cloud-logging`; `GOOGLE_*`
+  auth via `gcloud auth application-default login`
 
-1. **Extract requirements from specified documents ONLY**
-   - Read provided task descriptions or reference materials
-   - Do NOT make assumptions about unstated requirements
-   - Do NOT add functionality not explicitly requested
+## How to Add a New Provider
 
-2. **Request clarification for ambiguous scope**
-   - If task boundaries are unclear, ASK for clarification
-   - If complexity level is not specified, ASK for target complexity
-   - Do NOT assume scope or make architectural decisions without validation
+1. Decide which abstraction it implements: `CloudRunner` (VM
+   lifecycle) or `ManagedJobRunner` (declarative batch).
+2. Place the implementation in the matching subpackage:
+   - `providers/<name>.py` for `CloudRunner` (mirroring
+     `vastai.py` / `local.py`)
+   - `managed_jobs/<name>.py` for `ManagedJobRunner` (mirroring
+     `gcp_batch.py`)
+3. Define config + result dataclasses
+4. Implement the runner class with `run()` (or `submit` + `get_status`),
+   idempotency, logging
+5. Add tests in `tests/` using mocks (no real cloud APIs)
+6. Add optional extras in `pyproject.toml`
+7. Export from `__init__.py`
 
-3. **Design to stated requirements exactly**
-   - Match the complexity level requested
-   - Follow "minimal," "streamlined," or "focused" guidance literally
-   - Do NOT over-engineer solutions beyond stated needs
+## Quality Assurance
 
-## Compliance Requirements
+```bash
+make validate       # Full gate: ruff → pyright → complexipy → bandit → pytest
+make quick_validate # Fast gate: ruff + pyright
+make lint           # Check linting and formatting
+make test           # Run tests only
+```
 
-1. **Command Execution**: Use project make recipes or standard tooling
-2. **Quality Validation**: Run validation before task completion; fix ALL issues
-3. **Coding Style**: Follow existing project patterns and conventions
-4. **Documentation Updates**: Update docs when introducing new patterns
-5. **Testing**: Create tests for new functionality
-6. **Code Standards**: Use absolute imports, add `# Reason:` comments for complex logic
+CI workflow: `.github/workflows/ci.yml` (lint → type → complexity →
+test, Python 3.11 + 3.12). The CI test job installs with
+`uv sync --frozen --all-extras --group dev` so pyright can resolve
+`google.cloud.batch_v1` / `storage` symbols.
 
-## Quality Thresholds
+## Other Governance Docs
 
-**Before starting any task, ensure:**
-
-- **Context**: 8/10 - Understand requirements, codebase patterns, dependencies
-- **Clarity**: 7/10 - Clear implementation path and expected outcomes
-- **Alignment**: 8/10 - Follows project patterns and architectural decisions
-- **Success**: 7/10 - Confident in completing task correctly
-
-### Below Threshold Action
-
-Gather more context or escalate to AGENT_REQUESTS.md
-
-## Agent Quick Reference
-
-**Pre-Task:**
-
-- Read AGENTS.md > CONTRIBUTING.md for technical details
-- Verify quality thresholds met
-
-**During Task:**
-
-- Use project commands (document deviations)
-- Follow existing patterns and conventions
-- Update documentation when learning patterns
-
-**Post-Task:**
-
-- Run validation - must pass all checks (code tasks only)
-- Update CHANGELOG.md for non-trivial changes
-- Document new patterns in AGENT_LEARNINGS.md (concise, laser-focused, streamlined)
-- Escalate to AGENT_REQUESTS.md if blocked
+- [CONTRIBUTING.md](CONTRIBUTING.md) — contributor workflow, code style
+- [AGENT_REQUESTS.md](AGENT_REQUESTS.md) — escalation to humans
+- [AGENT_LEARNINGS.md](AGENT_LEARNINGS.md) — pattern discovery
+- [CHANGELOG.md](CHANGELOG.md) — version history

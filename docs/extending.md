@@ -151,7 +151,7 @@ class MyProjectSink(R2SinkBase):
         return self.download_job(batch_id, "tensorboard", local_dir)
 ```text
 
-For a completely different storage backend (e.g. GCS, plain S3), you'd implement the same interface from scratch rather than subclassing — `R2Sink` is tightly coupled to boto3's S3 API.
+For a completely different storage backend (e.g. plain S3, Azure Blob), you'd implement the same interface from scratch rather than subclassing — `R2Sink` is tightly coupled to boto3's S3 API. The GCS backend is provided out-of-the-box as `GcsSink` (`vastai_gpu_runner.storage.gcs`); use it instead of writing your own GCS sink.
 
 ## Custom worker with extra preflight gates
 

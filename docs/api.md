@@ -221,6 +221,58 @@ Status flow: `pending` -> `deploying` -> `running` -> `completed` -> `downloaded
 
 The v3 `sweep_zombie_instances`, `load_vastai_api_key`, `ensure_detached`, and `poll_instance_progress` are deleted (v4 step 7). Zombie sweep is policy-driven from `batch._sweep_zombies`; ownership keys are read via the v3 destroy adapter's `read_vastai_api_key`; long-running shell detachment and progress polling live in the consumer's worker module.
 
+## Managed jobs (`vastai_gpu_runner.managed_jobs`)
+
+Provider-neutral interface for declarative cloud-job providers (where the cloud platform owns the underlying VM lifecycle — e.g. GCP Batch, AWS Batch, Azure Batch). Separate from `CloudRunner` (direct VM SSH lifecycle); the two abstractions do not share code or types.
+
+### Protocol — `vastai_gpu_runner.managed_jobs.base`
+
+```python
+class ManagedJobRunner(Protocol):
+    @property
+    def provider_name(self) -> str: ...
+
+    def submit(self, spec: ManagedJobSpec) -> ManagedJobHandle: ...
+    def get_status(self, handle: ManagedJobHandle) -> ManagedJobStatus: ...
+    def list_tasks(self, handle: ManagedJobHandle) -> Iterable[ManagedTaskStatus]: ...
+    def cancel(self, handle: ManagedJobHandle) -> None: ...
+    def delete(self, handle: ManagedJobHandle) -> None: ...
+```
+
+`@runtime_checkable` — `isinstance(runner, ManagedJobRunner)` works.
+
+### Provider-neutral DTOs
+
+| Class | Description |
+|---|---|
+| `ManagedJobSpec` | name, task_count, parallelism, image, command, environment, labels, gcs_mounts, timeout_seconds, retry_on_preempt, region |
+| `ManagedJobHandle` | opaque (provider, resource_name, location) |
+| `ManagedJobStatus` | handle, state, task_count, message, create_time, update_time |
+| `ManagedTaskStatus` | per-task snapshot (task_index, state, exit_code, message) |
+| `ManagedJobTerminalState` | enum: SUCCEEDED, FAILED, CANCELLED, UNKNOWN |
+
+### Implementations
+
+| Provider | Class | Backend |
+|---|---|---|
+| GCP Batch | `GcpBatchRunner` (`managed_jobs/gcp_batch.py`) | `google-cloud-batch` v0.17+ |
+
+### `GcsSink` (`vastai_gpu_runner.storage.gcs`)
+
+Google Cloud Storage artifact sink. Mirrors the surface of `R2Sink`
+(upload / download / list) but uses `google-cloud-storage` v3.0+.
+The GCS source-of-truth is the object set itself, not a DONE-marker
+sentinel — don't introduce DONE-marker logic to GcsSink.
+
+### Test doubles
+
+| Class | Module | Purpose |
+|---|---|---|
+| `FakeGcpBatchClient` | `managed_jobs/gcp_batch.py` (private) | In-memory `BatchServiceClient`; tests preset `statuses` to drive transitions |
+| `FakeGcsClient` | `managed_jobs/gcp_batch.py` (private) | In-memory `Client`; bucket/blob round-trip keyed by name |
+
+Semantics pinned by `tests/test_fake_gcp_clients.py`.
+
 ## Estimator (`vastai_gpu_runner.estimator`)
 
 ### Core (`vastai_gpu_runner.estimator.core`)

@@ -28,18 +28,17 @@ logger = logging.getLogger(__name__)
 
 
 class GcsSink:
-    """Upload / download campaign artifacts to a GCS bucket.
+    """Upload / download artifacts to a GCS bucket.
 
     All file writes use conditional generation preconditions
     (``if_generation_match=0``) so a retry never silently overwrites
-    a sibling's output. Consumers must compose paths deterministically
-    (per-candidate IDs from
-    :func:`activin_e_pipeline.contracts.campaign_candidate_id`); the
-    sink never auto-creates bucket keys.
+    a sibling's output. Consumers must compose bucket keys
+    deterministically (the sink never auto-creates them); the
+    per-candidate id-scheme is the consumer's responsibility.
 
     Operations on a missing bucket raise :class:`KeyError`; the
-    caller is responsible for ensuring the bucket exists (the
-    ``AEP-INFRA-001`` Terraform provisions it).
+    caller is responsible for ensuring the bucket exists
+    (Terraform / `gcloud buckets create` / equivalent).
     """
 
     def __init__(

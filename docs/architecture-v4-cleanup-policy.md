@@ -8,11 +8,12 @@ policy.
 For the current-state architecture (today's code) see
 [`architecture.md`](architecture.md). For the v2 history see
 [`architecture-v2.md`](architecture-v2.md). For the v3 design (now
-merged but **not yet implemented**) see [`architecture-v3.md`](architecture-v3.md).
-The v3 doc's "Known limitation" section flagged this design as the
-next step. Issue #19's fifth-pass review recommended Option B
-(canonical config) over Option A (per-runner `destroy_zombie`) — the
-v4 design implements Option B.
+**implemented** as v0.4.0 — `cleanup_policy.py` exists, `unit_lifecycle.py`
+exists, `providers/destroy.py` and `destroy_adapters/` exist) see
+[`architecture-v3.md`](architecture-v3.md). The v3 doc's "Known limitation"
+section flagged this design as the next step. Issue #19's fifth-pass
+review recommended Option B (canonical config) over Option A (per-runner
+`destroy_zombie`) — the v4 design implements Option B.
 
 The v4 design **does not redefine any v3 types**. The v3 module
 `providers/destroy.py` is a hard prerequisite: it owns

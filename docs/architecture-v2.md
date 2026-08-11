@@ -1,10 +1,10 @@
 # Architecture v2 (target)
 
-This doc describes the **target architecture** for roadmap items 1–3. Item 1 (`LocalRunner`) is implemented; items 2–3 remain target. For the current-state architecture (today's code) see `architecture.md`. For scope and sequencing see `roadmap.md`.
+This doc describes the **target architecture** for roadmap items 1–3. Item 1 (`LocalRunner`) is implemented (v0.5.0); items 2–3 partly implemented — item 2 became `GcpBatchRunner` (a `ManagedJobRunner` backend, not a `CloudRunner` sibling, on the v0.6.0 landed) and item 3 (`vastai_gpu_runner.inference` helper) remains target. For the current-state architecture (today's code) see `architecture.md`. For scope and sequencing see `roadmap.md`.
 
 ## What changes vs v1
 
-In one paragraph: `CloudRunner` stays as the single ABC for SSH-lifecycle providers and gains two siblings — `LocalRunner` (subprocess) and `RunPodRunner`. A new `vastai_gpu_runner.inference` module appears alongside `storage/` as a worker-side capability, not a runner. Serverless-GPU providers (Modal, Beam, Replicate) are explicitly out of scope for `CloudRunner` and flagged as needing a second ABC — deferred.
+In one paragraph: `CloudRunner` stays as the single ABC for SSH-lifecycle providers and gains one sibling — `LocalRunner` (subprocess). A second ABC, `ManagedJobRunner`, was added for declarative cloud batch providers (the cloud platform owns the VM lifecycle); `GcpBatchRunner` is the first concrete implementation. A `RunPodRunner` (third `CloudRunner` backend) is on the deferred list. A new `vastai_gpu_runner.inference` module would appear alongside `storage/` as a worker-side capability, not a runner. Serverless-GPU providers (Modal, Beam, Replicate) are explicitly out of scope for `CloudRunner` and flagged as needing a third ABC — deferred.
 
 Diff vs v1:
 
