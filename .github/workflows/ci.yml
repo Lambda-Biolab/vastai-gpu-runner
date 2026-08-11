@@ -58,7 +58,17 @@ jobs:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
       - name: Install dependencies
-        run: uv sync --frozen --dev
+        # `--all-extras` is required so pyright can resolve the
+        # `google.cloud.batch_v1` / `google.cloud.storage` symbols
+        # imported by src/vastai_gpu_runner/managed_jobs/gcp_batch.py
+        # and src/vastai_gpu_runner/storage/gcs.py. Without the `gcp`
+        # extra installed, the lint-type-test step fails with
+        # `"batch_v1" is unknown import symbol`. Pre-existing CI gap
+        # surfaced during the v0.6.0 lockfile sync PR.
+        # `--group dev` replaces the legacy `--dev` flag (this project
+        # uses [dependency-groups] per PEP 735, not the deprecated
+        # [project.optional-dependencies] dev extra).
+        run: uv sync --frozen --all-extras --group dev
       - name: Format check
         run: uv run ruff format --check src/ tests/
       - name: Lint
