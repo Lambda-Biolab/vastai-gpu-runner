@@ -123,51 +123,96 @@
   sections, plus CLI sub-app reference and full exit-code table
   (0, 1, 2, 3, 4, 5, 6, 7, 8, 9).
 
-## 0.6.0 (2026-08-09) — managed-jobs architecture
+## 0.6.0 (2026-08-09) — managed-jobs GCP Batch backend
 
 ### Added
 
-- **`ManagedJobRunner` Protocol + `ManagedJob`/`BatchStatus` types**
-  (`jobs/runner.py`) — provider-neutral interface for cloud batch
-  workload submission: `submit_job(manifest) -> ManagedJob`,
-  `poll_status(job) -> BatchStatus` (with `PENDING | RUNNING |
-  SUCCEEDED | FAILED | CANCELLED`), `fetch_results(job, sink)`,
-  `cancel_job(job)`. The Protocol separates the *contract*
-  (what every provider must implement) from the *backend* (Vastai
-  vs GCP Batch vs Local). An `is_terminal_status()` helper
-  classifies SUCCEEDED / FAILED / CANCELLED.
-- **`GcpBatchRunner`** (`jobs/gcp.py`) — Google Cloud Batch backend
-  implementing `ManagedJobRunner`. Submits jobs via
-  `google-cloud-batch` v0.17+, polls via the Batch v1 API,
-  downloads log + output artifacts into a `ManagedArtifactSink`.
-  Honors a 30-minute default poll timeout and `--poll-interval`
-  for status checks. Unit-tested against `google.cloud.batch_v1`
-  stub clients.
-- **`GcsSink`** (`jobs/gcs.py`) — Google Cloud Storage artifact
-  sink sharing the same DONE-marker contract as `R2Sink`:
-  upload outputs, then write a sentinel object keyed by SHA-256
-  of the artifact list. `download` is a stream-from-GCS-byte
-  range fetch with parallel parts via `Blob.chunked_download`.
-- **`tests/test_gcp_batch.py`** — 14 unit tests for the GCP Batch
-  runner (manifest submission, status polling, terminal-status
-  detection, cancellation, error paths via stubbed
-  `BatchServiceClient`).
-- **`tests/test_gcs.py`** + **`tests/test_gcs_sink.py`** — 22
-  unit tests covering the GCS sink contract (single-object
-  upload, multi-part parallel upload, DONE-marker placement,
-  missing-marker detection on download).
-- **`tests/test_fake_gcp_clients.py`** — in-memory `FakeGcsClient`
-  + `FakeBatchClient` test doubles for downstream test isolation;
-  they satisfy the same protocols as the real clients but operate
-  on `dict` storage.
+- **`GcpBatchRunner`** (`src/vastai_gpu_runner/managed_jobs/gcp_batch.py`) —
+  concrete implementation of `ManagedJobRunner` (protocol) backed by
+  Google Cloud Batch. Submits jobs via `google-cloud-batch` v0.17+,
+  polls job status via the Batch v1 API, downloads log + output
+  artifacts via the shared `ArtifactSink` interface. Instantiated
+  via `GcpBatchRunner(project_id=..., location=..., gcs_bucket=...)`.
+- **`GcsSink`** (`src/vastai_gpu_runner/storage/gcs.py`) — Google
+  Cloud Storage artifact sink. Mirrors the surface of `R2Sink`
+  (upload / download / list) but uses `google-cloud-storage`
+  v3.0+. No DONE-marker / sentinel logic — the GCS source-of-truth
+  is the object set itself, not a marker file.
+- **`FakeGcpBatchClient`** + **`FakeGcsClient`** (private to
+  `managed_jobs/gcp_batch.py`) — in-memory stand-ins for
+  `batch_v1.BatchServiceClient` and `google.cloud.storage.Client`
+  for unit-test isolation. Tests can preset status transitions
+  via `FakeGcpBatchClient.statuses`; the fake GCS client supports
+  bucket/blob round-trip keyed by name.
+- **`tests/test_gcp_batch.py`** — 14 unit tests for `GcpBatchRunner`
+  (manifest submission, status polling, terminal-status detection,
+  cancellation, error paths via the stub `FakeGcpBatchClient`).
+- **`tests/test_fake_gcp_clients.py`** — 3 unit tests that pin the
+  semantics of `FakeGcsClient` (bucket lookup, blob round-trip,
+  exists() / create_bucket() / bucket().exists() / bucket().blob())
+  so the fakes don't silently drift from the subset of the Google
+  SDK surface they claim to support.
+- **`src/vastai_gpu_runner/managed_jobs/state.py`** — JSON state
+  loader for `ManagedJobState` records with a fail-closed
+  schema-version loader. Idempotency: the canonical way to detect
+  "already submitted" on resume.
 
 ### Changed
 
-- **`docs/extending.md`** — new "Adding a `ManagedJobRunner`
-  backend" walkthrough showing how to implement the Protocol
-  for a new cloud provider.
-- **`docs/api.md`** — `ManagedJobRunner` Protocol reference,
-  `ManagedJob` / `BatchStatus` type definitions.
+- **`pyproject.toml`** — new `[gcp]` extra provides
+  `google-cloud-batch>=0.17.0`, `google-cloud-storage>=3.0.0`,
+  `google-cloud-logging>=3.10.0`. CI workflow now installs with
+  `uv sync --frozen --all-extras --group dev` so pyright can
+  resolve `google.cloud.batch_v1` / `storage` symbols.
+- **`src/vastai_gpu_runner/managed_jobs/__init__.py`** — exports
+  `ManagedJobRunner`, `ManagedJobSpec`, `ManagedJobHandle`,
+  `ManagedJobStatus`, `ManagedTaskStatus`, `ManagedJobTerminalState`.
+
+### Note
+
+This release ships the GCP Batch backend. The `ManagedJobRunner`
+**protocol** (the contract) landed in v0.5.0; v0.6.0 is the first
+concrete backend (`GcpBatchRunner`) plus the `GcsSink` it depends
+on. `VastaiRunner` does **not** implement `ManagedJobRunner` — it
+implements the orthogonal `CloudRunner` interface (direct VM SSH
+lifecycle). The two abstractions do not share code or types; a
+consumer selects one explicitly via configuration.
+
+## 0.5.0 (2026-08-05) — managed-jobs protocol
+
+### Added
+
+- **`ManagedJobRunner` Protocol** (`src/vastai_gpu_runner/managed_jobs/base.py`) —
+  provider-neutral interface for declarative cloud-job providers
+  (where the cloud platform owns the underlying VM lifecycle —
+  e.g. GCP Batch, AWS Batch, Azure Batch). Methods:
+  - `provider_name` (property) — short provider identifier
+  - `submit(spec: ManagedJobSpec) -> ManagedJobHandle`
+  - `get_status(handle: ManagedJobHandle) -> ManagedJobStatus`
+  - `list_tasks(handle: ManagedJobHandle) -> Iterable[ManagedTaskStatus]`
+  - `cancel(handle: ManagedJobHandle) -> None`
+  - `delete(handle: ManagedJobHandle) -> None`
+- **Provider-neutral DTOs** (`managed_jobs/base.py`):
+  - `ManagedJobSpec` — name, task_count, parallelism, image,
+    command, environment, labels, gcs_mounts, timeout_seconds,
+    retry_on_preempt, region
+  - `ManagedJobHandle` — opaque (provider, resource_name, location)
+  - `ManagedJobStatus` — handle, state, task_count, message,
+    create_time, update_time
+  - `ManagedTaskStatus` — per-task snapshot (task_index, state,
+    exit_code, message)
+  - `ManagedJobTerminalState` enum — `SUCCEEDED | FAILED |
+    CANCELLED | UNKNOWN`
+- **`tests/test_managed_jobs.py`** — 12 unit tests pinning the
+  Provider-neutral DTO behavior (to_dict round-trip, default
+  factories, frozen-dataclass semantics).
+
+### Note
+
+`VastaiRunner` does **not** implement `ManagedJobRunner` — it
+implements the orthogonal `CloudRunner` interface (direct VM SSH
+lifecycle). The two abstractions are deliberately separate: a
+consumer selects one explicitly via configuration.
 
 ## 0.4.0 (2026-07-27) — v4 cleanup-policy architecture
 

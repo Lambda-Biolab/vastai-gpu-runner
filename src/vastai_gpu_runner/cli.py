@@ -1,14 +1,14 @@
-"""CLI for vastai-gpu-runner — credential checks, instance management, cost estimation.
+"""CLI for vastai-gpu-runner — credentials, instances, cost, batch, run, r2-lifecycle.
 
 Usage::
 
     vastai-gpu-runner check       # Verify Vast.ai + R2 credentials
     vastai-gpu-runner instances    # List active instances with ownership info
     vastai-gpu-runner estimate     # Cost/time scaling table
-     vastai-gpu-runner cleanup      # Destroy orphaned instances
-     vastai-gpu-runner batch        # Compose a batch execution
-     vastai-gpu-runner run         # Run a worker locally without cloud credentials
-
+    vastai-gpu-runner cleanup      # Destroy orphaned instances
+    vastai-gpu-runner batch        # Compose a batch execution
+    vastai-gpu-runner run         # Run a worker locally
+    vastai-gpu-runner r2-lifecycle # R2 lifecycle operations
 
 The v4 architecture routes every composition root through the canonical
 v4 types — ``VastaiProviderConfig``, ``VastaiRunner.from_config``,

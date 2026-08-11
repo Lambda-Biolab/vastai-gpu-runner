@@ -126,7 +126,7 @@ validate-branch:
 		echo "pre-push: checking branch coverage on changed files:"; \
 		echo "$$CHANGED" | sed 's/^/  /'; \
 		$(UV) run pytest $(TEST_DIR) -m "not slow" --no-header -q \
-			--cov=$$(echo "$$CHANGED" | tr '\n' ',' | sed 's/,\$$//' | sed 's|/|.|g;s|\.py\$$||g') \
+			--cov=$(SRC) \
 			--cov-branch --cov-fail-under=80 2>&1 | tail -20 || \
 			(echo ""; \
 			echo "Branch coverage < 80% on a changed file. Add a test that"; \
@@ -171,7 +171,7 @@ actionlint:  ## Lint .github/workflows/*.yml (catches context, runner-label, syn
 # --- Install tools (gitleaks + actionlint binaries; bandit is a dev dep) ---
 # gitleaks and actionlint are shipped as standalone binaries; bandit is a dev
 # dependency in pyproject.toml and doesn't need a separate install step.
-# 
+#
 # Version pins are single source of truth:
 #   - gitleaks 8.30.1 — must match GITLEAKS_VERSION in .github/workflows/secrets.yml
 #   - actionlint 1.7.12 — must match the install-actionlint.sh default

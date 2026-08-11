@@ -6,8 +6,8 @@
 
 | # | Item | Rationale |
 |---|---|---|
-| 1 | `LocalRunner` (subprocess MVP) — **implemented** | Zero-cost CI + dev loop; proved `CloudRunner` is genuinely provider-agnostic |
-| 2 | `RunPodRunner` | Second cloud backend; closest Vast.ai analogue (SSH + Docker + spot + per-second) |
+| 1 | `LocalRunner` (subprocess MVP) — **implemented (v0.5.0)** | Zero-cost CI + dev loop; proved `CloudRunner` is genuinely provider-agnostic |
+| 2 | `GcpBatchRunner` + `GcsSink` (managed jobs) — **implemented (v0.6.0)** | Second cloud backend; declarative-batch analogue (cloud-platform-owned VM lifecycle). Adds a parallel provider abstraction (`ManagedJobRunner`) to the existing `CloudRunner`. |
 | 3 | `vastai_gpu_runner.inference` helper | OpenAI-compatible client (Groq / Cerebras / OpenRouter) callable from inside workers |
 
 Order is prescriptive: item 1 first (no external dependency, validates ABC), then item 2 (second provider, proves portability), then item 3 (orthogonal, worker-side capability).
