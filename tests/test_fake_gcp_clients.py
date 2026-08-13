@@ -32,7 +32,7 @@ def test_fake_gcs_client_blob_round_trip() -> None:
     assert blob.exists() is True
     assert blob.download_as_bytes() == b"hello"
     assert client.bucket("alpha").exists("data/file.txt") is True
-    assert client.uploads[-1] == ("alpha", "data/file.txt", b"hello", "text/plain")
+    assert client.uploads[-1] == ("alpha", "data/file.txt", b"hello", "text/plain", None)
 
 
 def test_fake_gcs_client_blob_delete_and_exists() -> None:

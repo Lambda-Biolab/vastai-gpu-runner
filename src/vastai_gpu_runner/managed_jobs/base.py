@@ -11,6 +11,12 @@ diagnostics when the provider supports it.
 The ABC is intentionally minimal — provider-specific fields live on
 subclasses — so a fake implementation can be used in tests without
 touching the real cloud SDKs.
+
+Resource fields are provider-neutral typed dataclasses
+(:class:`BootDisk`, :class:`GpuAccelerator`, :class:`MachineResource`,
+:class:`ServiceAccount`, :class:`NetworkConfig`). Providers map them
+onto their native representations; consumers compose specs without
+touching cloud-specific types.
 """
 
 from __future__ import annotations
@@ -35,6 +41,106 @@ def _empty_str_tuple() -> tuple[str, ...]:
 
 
 @dataclass(frozen=True)
+class BootDisk:
+    """Provider-neutral boot disk descriptor.
+
+    Attributes:
+        image: Optional VM image override. Empty string = use the default.
+        size_gb: Boot disk size in GB. Provider picks a default when 0.
+        type_: Disk type / family hint (e.g. ``"pd-ssd"``). Empty = default.
+    """
+
+    image: str = ""
+    size_gb: int = 0
+    type_: str = ""
+
+
+@dataclass(frozen=True)
+class GpuAccelerator:
+    """Provider-neutral GPU accelerator descriptor.
+
+    Attributes:
+        type_: Accelerator model identifier (e.g. ``"nvidia-tesla-a100"``).
+        count: Number of GPUs to attach.
+        driver_version: Optional driver version override. Empty = default.
+        install_gpu_drivers: When True, the provider installs GPU drivers.
+    """
+
+    type_: str = ""
+    count: int = 0
+    driver_version: str = ""
+    install_gpu_drivers: bool = False
+
+
+@dataclass(frozen=True)
+class MachineResource:
+    """Provider-neutral VM shape + accelerators + boot disk.
+
+    Used to populate the provider's allocation policy (GCP Batch
+    ``AllocationPolicy.InstancePolicy``). All fields are optional;
+    unset fields fall back to the provider's defaults.
+
+    Attributes:
+        machine_type: VM shape, e.g. ``"n1-standard-4"``. Empty = auto.
+        boot_disk: Optional boot disk override.
+        accelerators: GPUs to attach. Empty tuple = none.
+        min_cpu_platform: Minimum CPU platform hint. Empty = provider default.
+    """
+
+    machine_type: str = ""
+    boot_disk: BootDisk | None = None
+    accelerators: tuple[GpuAccelerator, ...] = ()
+    min_cpu_platform: str = ""
+
+
+@dataclass(frozen=True)
+class ComputeResource:
+    """Provider-neutral per-task compute limits.
+
+    Maps to GCP Batch ``TaskSpec.compute_resource`` (CPU in millicores,
+    memory in MiB, boot disk in MiB). All fields are optional; unset
+    fields fall back to the provider's defaults.
+
+    Attributes:
+        cpu_milli: CPU in millicores (1000 = 1 vCPU).
+        memory_mib: Memory in MiB.
+        boot_disk_mib: Boot disk in MiB.
+    """
+
+    cpu_milli: int = 0
+    memory_mib: int = 0
+    boot_disk_mib: int = 0
+
+
+@dataclass(frozen=True)
+class ServiceAccount:
+    """Provider-neutral service account descriptor.
+
+    Attributes:
+        email: Service account email. Empty = use the default.
+        scopes: OAuth scopes to attach. Empty tuple = default scopes.
+    """
+
+    email: str = ""
+    scopes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class NetworkConfig:
+    """Provider-neutral network configuration.
+
+    Attributes:
+        network: Network resource URI (full or short). Empty = default.
+        subnetwork: Subnetwork resource URI. Empty = default.
+        no_external_ip_address: When True, the VM has no external IP.
+    """
+
+    network: str = ""
+    subnetwork: str = ""
+    no_external_ip_address: bool = False
+
+
+@dataclass(frozen=True)
 class ManagedJobSpec:
     """Provider-neutral description of a unit of managed-job work.
 
@@ -42,6 +148,22 @@ class ManagedJobSpec:
     ``labels`` mapping is opaque to the provider-neutral layer; it is
     carried through to status, log, and state payloads so consumers
     can correlate jobs across stages.
+
+    Resource fields are typed (:class:`MachineResource`,
+    :class:`ComputeResource`, :class:`ServiceAccount`,
+    :class:`NetworkConfig`). The provider-specific ``environment``
+    mapping is a free-form ``str→str`` dict for ad-hoc key/value
+    transport (kept for compatibility; new code should prefer typed
+    fields).
+
+    Attributes:
+        gcs_mounts: Tuple of GCS mount URIs (``gs://bucket/path``).
+            Each entry maps to a single Cloud Volume. Multiple mounts
+            are supported where the SDK permits.
+        allowed_locations: Allowed regions/zones for the job
+            (e.g. ``("regions/us-central1",)``). Validated against
+            ``region`` at submit time when non-empty.
+        spot: When True, the job runs on Spot/preemptible VMs.
     """
 
     name: str
@@ -55,9 +177,19 @@ class ManagedJobSpec:
     timeout_seconds: int | None = None
     retry_on_preempt: bool = True
     region: str = ""
+    machine_resource: MachineResource | None = None
+    compute_resource: ComputeResource | None = None
+    service_account: ServiceAccount | None = None
+    network: NetworkConfig | None = None
+    allowed_locations: tuple[str, ...] = ()
+    spot: bool = False
 
     def to_dict(self) -> dict[str, object]:
         """Serialize the spec into a JSON-safe dictionary."""
+        machine = self.machine_resource
+        compute = self.compute_resource
+        sa = self.service_account
+        net = self.network
         return {
             "name": self.name,
             "task_count": self.task_count,
@@ -70,6 +202,55 @@ class ManagedJobSpec:
             "timeout_seconds": self.timeout_seconds,
             "retry_on_preempt": self.retry_on_preempt,
             "region": self.region,
+            "machine_resource": (
+                {
+                    "machine_type": machine.machine_type,
+                    "boot_disk": (
+                        {
+                            "image": machine.boot_disk.image,
+                            "size_gb": machine.boot_disk.size_gb,
+                            "type": machine.boot_disk.type_,
+                        }
+                        if machine.boot_disk is not None
+                        else None
+                    ),
+                    "accelerators": [
+                        {
+                            "type": acc.type_,
+                            "count": acc.count,
+                            "driver_version": acc.driver_version,
+                            "install_gpu_drivers": acc.install_gpu_drivers,
+                        }
+                        for acc in machine.accelerators
+                    ],
+                    "min_cpu_platform": machine.min_cpu_platform,
+                }
+                if machine is not None
+                else None
+            ),
+            "compute_resource": (
+                {
+                    "cpu_milli": compute.cpu_milli,
+                    "memory_mib": compute.memory_mib,
+                    "boot_disk_mib": compute.boot_disk_mib,
+                }
+                if compute is not None
+                else None
+            ),
+            "service_account": (
+                {"email": sa.email, "scopes": list(sa.scopes)} if sa is not None else None
+            ),
+            "network": (
+                {
+                    "network": net.network,
+                    "subnetwork": net.subnetwork,
+                    "no_external_ip_address": net.no_external_ip_address,
+                }
+                if net is not None
+                else None
+            ),
+            "allowed_locations": list(self.allowed_locations),
+            "spot": self.spot,
         }
 
 
