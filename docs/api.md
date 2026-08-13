@@ -245,9 +245,15 @@ class ManagedJobRunner(Protocol):
 
 | Class | Description |
 |---|---|
-| `ManagedJobSpec` | name, task_count, parallelism, image, command, environment, labels, gcs_mounts, timeout_seconds, retry_on_preempt, region |
+| `ManagedJobSpec` | name, task_count, parallelism, image, command, environment, labels, gcs_mounts, timeout_seconds, retry_on_preempt, region, machine_resource, compute_resource, service_account, network, allowed_locations, spot |
+| `BootDisk` | typed boot disk (image, size_gb, type_) |
+| `GpuAccelerator` | typed GPU accelerator (type_, count, driver_version, install_gpu_drivers) |
+| `MachineResource` | typed VM shape + accelerators + boot disk (machine_type, boot_disk, accelerators, min_cpu_platform) |
+| `ComputeResource` | typed per-task compute (cpu_milli, memory_mib, boot_disk_mib) |
+| `ServiceAccount` | typed service account (email, scopes) |
+| `NetworkConfig` | typed network (network, subnetwork, no_external_ip_address) |
 | `ManagedJobHandle` | opaque (provider, resource_name, location) |
-| `ManagedJobStatus` | handle, state, task_count, message, create_time, update_time |
+| `ManagedJobStatus` | handle, state, succeeded_tasks, failed_tasks, total_tasks, message, raw_events |
 | `ManagedTaskStatus` | per-task snapshot (task_index, state, exit_code, message) |
 | `ManagedJobTerminalState` | enum: SUCCEEDED, FAILED, CANCELLED, UNKNOWN |
 

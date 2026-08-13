@@ -14,12 +14,18 @@ JSON file with a fail-closed schema-version loader.
 from __future__ import annotations
 
 from vastai_gpu_runner.managed_jobs.base import (
+    BootDisk,
+    ComputeResource,
+    GpuAccelerator,
+    MachineResource,
     ManagedJobHandle,
     ManagedJobRunner,
     ManagedJobSpec,
     ManagedJobStatus,
     ManagedJobTerminalState,
     ManagedTaskStatus,
+    NetworkConfig,
+    ServiceAccount,
 )
 from vastai_gpu_runner.managed_jobs.state import (
     CURRENT_MANAGED_JOB_SCHEMA,
@@ -32,6 +38,10 @@ from vastai_gpu_runner.managed_jobs.state import (
 
 __all__ = [
     "CURRENT_MANAGED_JOB_SCHEMA",
+    "BootDisk",
+    "ComputeResource",
+    "GpuAccelerator",
+    "MachineResource",
     "ManagedJobHandle",
     "ManagedJobRunner",
     "ManagedJobSpec",
@@ -40,6 +50,8 @@ __all__ = [
     "ManagedJobStatus",
     "ManagedJobTerminalState",
     "ManagedTaskStatus",
+    "NetworkConfig",
+    "ServiceAccount",
     "load_managed_job_state",
     "load_or_none",
     "save_managed_job_state",
