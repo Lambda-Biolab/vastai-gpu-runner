@@ -146,7 +146,7 @@ def test_get_status_maps_provider_not_found() -> None:
     from google.api_core.exceptions import NotFound
 
     class MissingClient:
-        def get_job(self, view: Any, name: str) -> Any:
+        def get_job(self, request: Any) -> Any:
             raise NotFound("gone")
 
     runner = GcpBatchRunner(
@@ -160,6 +160,31 @@ def test_get_status_maps_provider_not_found() -> None:
         runner.get_status(handle)
 
     assert isinstance(exc_info.value.__cause__, NotFound)
+
+
+def test_get_status_passes_get_job_request_object() -> None:
+    class RequestOnlyClient:
+        def get_job(self, request: Any) -> Any:
+            assert request.name == "projects/p/locations/us-central1/jobs/job"
+            return google_cloud_batch.Job(
+                name=request.name,
+                status=_status(google_cloud_batch.JobStatus.State.SUCCEEDED),
+            )
+
+    runner = GcpBatchRunner(
+        project_id="p",
+        region="us-central1",
+        client=RequestOnlyClient(),  # type: ignore[arg-type]
+    )
+
+    result = runner.get_status(
+        ManagedJobHandle(
+            provider="gcp-batch",
+            resource_name="projects/p/locations/us-central1/jobs/job",
+        )
+    )
+
+    assert result.state == ManagedJobLifecycleState.SUCCEEDED
 
 
 def test_submit_with_spot_retry_when_requested() -> None:
@@ -275,6 +300,29 @@ def test_list_tasks_yields_status() -> None:
     listed = list(runner.list_tasks(handle))
     assert listed[0].task_index == 2
     assert listed[0].state == "SUCCEEDED"
+
+
+def test_list_tasks_maps_pager_iteration_not_found() -> None:
+    from google.api_core.exceptions import NotFound
+
+    class FailingPager:
+        def __iter__(self) -> Any:
+            raise NotFound("gone while iterating")
+
+    class PagerClient:
+        def list_tasks(self, parent: str) -> Any:
+            return FailingPager()
+
+    runner = GcpBatchRunner(
+        project_id="p",
+        region="us-central1",
+        client=PagerClient(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(ManagedJobNotFoundError) as exc_info:
+        list(runner.list_tasks(ManagedJobHandle(provider="gcp-batch", resource_name="job")))
+
+    assert isinstance(exc_info.value.__cause__, NotFound)
 
 
 def test_cancel_and_delete_track_calls() -> None:
@@ -891,6 +939,23 @@ def test_gcs_sink_cas_write_success_and_conflict() -> None:
         sink.upload_cas_write("snap", b"v3", expected_generation=1)
     # The failed CAS must not overwrite the live value.
     assert sink.read_cas("snap") == (b"v2", 2)
+
+
+def test_gcs_sink_cas_uses_upload_generation_without_reload() -> None:
+    sink, _client = _make_sink()
+
+    original_reload = FakeGcsBlob.reload
+
+    def _reload_must_not_run(self: Any) -> None:
+        raise OSError("metadata reload unavailable")
+
+    FakeGcsBlob.reload = _reload_must_not_run  # type: ignore[assignment]
+    try:
+        generation = sink.upload_cas_write("snap", b"v1", expected_generation=0)
+    finally:
+        FakeGcsBlob.reload = original_reload  # type: ignore[assignment]
+
+    assert generation == 1
 
 
 def test_gcs_sink_cas_write_first_wins_on_none() -> None:

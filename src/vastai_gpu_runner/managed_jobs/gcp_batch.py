@@ -191,7 +191,7 @@ class GcpBatchRunner(ManagedJobRunner):
         client = self._require_client()
         view = self._build_view_request(handle)
         try:
-            job = client.get_job(view=view, name=handle.resource_name)
+            job = client.get_job(request=view)
         except Exception as exc:  # pragma: no cover - depends on real GCP response
             logger.exception("GCP Batch get_job failed for %s", handle.resource_name)
             raise map_gcp_exception(exc, operation="GCP Batch get_status") from exc
@@ -211,11 +211,11 @@ class GcpBatchRunner(ManagedJobRunner):
         client = self._require_client()
         try:
             tasks = client.list_tasks(parent=self._task_parent(handle))
+            for task in tasks:
+                yield self._translate_task(task)
         except Exception as exc:  # pragma: no cover - depends on real GCP response
             logger.exception("GCP Batch list_tasks failed for %s", handle.resource_name)
             raise map_gcp_exception(exc, operation="GCP Batch list_tasks") from exc
-        for task in tasks:
-            yield self._translate_task(task)
 
     def cancel(self, handle: ManagedJobHandle) -> None:
         """Request cancellation of the job. Idempotent."""
@@ -950,8 +950,13 @@ class FakeGcpBatchClient:
             status_events=self.events[resource_name],
         )
 
-    def get_job(self, view: Any, name: str) -> Any:
+    def get_job(self, request: Any) -> Any:
         """Return the most recent job record, augmented with current status."""
+        name = getattr(request, "name", None)
+        if name is None and isinstance(request, dict):
+            name = request.get("name")
+        if not name:
+            raise ValueError("get_job request must include name")
         if name not in self.jobs:
             raise _not_found(f"job not found: {name}")
         job = self.jobs[name]
@@ -969,14 +974,14 @@ class FakeGcpBatchClient:
     def cancel_job(self, name: str) -> None:
         """Record the cancellation call and mark the job as cancelling."""
         if name not in self.jobs:
-            return
+            raise _not_found(f"job not found: {name}")
         self.cancel_calls.append(name)
         self.statuses[name] = _make_job_status("CANCELLATION_IN_PROGRESS")
 
     def delete_job(self, name: str) -> None:
         """Record the deletion call and drop the cached job state."""
         if name not in self.jobs:
-            return
+            raise _not_found(f"job not found: {name}")
         self.delete_calls.append(name)
         self.jobs.pop(name, None)
         self.statuses.pop(name, None)

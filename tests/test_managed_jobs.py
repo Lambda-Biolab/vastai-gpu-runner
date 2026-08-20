@@ -137,6 +137,28 @@ def test_spec_storage_mount_is_json_safe() -> None:
     ]
 
 
+def test_spec_preserves_legacy_positional_constructor_order() -> None:
+    spec = ManagedJobSpec(
+        "legacy",
+        2,
+        2,
+        "image",
+        ("run",),
+        {"ENV": "value"},
+        {"label": "value"},
+        ("gs://bucket/input",),
+        60,
+        False,
+        "us-central1",
+    )
+
+    assert spec.gcs_mounts == ("gs://bucket/input",)
+    assert spec.timeout_seconds == 60
+    assert spec.retry_on_preempt is False
+    assert spec.region == "us-central1"
+    assert spec.storage_mounts == ()
+
+
 def test_fake_runner_submit_and_poll() -> None:
     runner = FakeRunner()
     spec = ManagedJobSpec(name="a", task_count=2)
@@ -177,6 +199,31 @@ def test_state_round_trip(tmp_path: Path) -> None:
     assert loaded.resource_name == "projects/x/jobs/y"
     assert loaded.task_count == 5
     assert loaded.state == "RUNNING"
+
+
+def test_state_preserves_legacy_positional_constructor_order() -> None:
+    state = ManagedJobState(
+        1,
+        "fake-batch",
+        "projects/x/jobs/y",
+        "us-central1",
+        5,
+        "RUNNING",
+        3,
+        0,
+        0,
+        "demo",
+        "backbone",
+        {"owner": "test"},
+    )
+
+    assert state.campaign_id == "demo"
+    assert state.stage_id == "backbone"
+    assert state.extra == {"owner": "test"}
+    assert state.correlation_metadata == {
+        "campaign_id": "demo",
+        "stage_id": "backbone",
+    }
 
 
 def test_state_atomic_write_leaves_no_tmp(tmp_path: Path) -> None:
@@ -249,6 +296,54 @@ def test_v1_state_migrates_correlation_without_losing_legacy_fields(tmp_path: Pa
     }
     assert loaded.campaign_id == "legacy-campaign"
     assert loaded.stage_id == "legacy-stage"
+
+
+def test_current_state_backfills_correlation_from_legacy_aliases(tmp_path: Path) -> None:
+    payload = {
+        "schema_version": CURRENT_MANAGED_JOB_SCHEMA,
+        "provider": "fake-batch",
+        "resource_name": "r",
+        "state": "RUNNING",
+        "campaign_id": "legacy-campaign",
+        "stage_id": "legacy-stage",
+    }
+    target = tmp_path / "current.json"
+    target.write_text(json.dumps(payload))
+
+    loaded = load_managed_job_state(target)
+
+    assert loaded.correlation_metadata == {
+        "campaign_id": "legacy-campaign",
+        "stage_id": "legacy-stage",
+    }
+
+
+@pytest.mark.parametrize("metadata_key", ["correlation_metadata", "correlation", "extra"])
+def test_state_rejects_non_mapping_metadata_as_typed_error(
+    tmp_path: Path, metadata_key: str
+) -> None:
+    payload = {
+        "schema_version": CURRENT_MANAGED_JOB_SCHEMA,
+        "provider": "fake-batch",
+        "resource_name": "r",
+        "state": "RUNNING",
+        metadata_key: [],
+    }
+    target = tmp_path / f"invalid-{metadata_key}.json"
+    target.write_text(json.dumps(payload))
+
+    with pytest.raises(ManagedJobStateError):
+        load_managed_job_state(target)
+    assert load_or_none(target) is None
+
+
+def test_state_rejects_non_object_json_root_as_typed_error(tmp_path: Path) -> None:
+    target = tmp_path / "null.json"
+    target.write_text("null")
+
+    with pytest.raises(ManagedJobStateError):
+        load_managed_job_state(target)
+    assert load_or_none(target) is None
 
 
 def test_load_or_none_swallows_errors(tmp_path: Path) -> None:

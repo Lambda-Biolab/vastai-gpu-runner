@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,18 @@ class ManagedJobStateError(RuntimeError):
 
 def _empty_object_dict() -> dict[str, Any]:
     return {}
+
+
+def _normalise_mapping(value: Any, field_name: str) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise ManagedJobStateError(f"managed-job state {field_name} must be an object")
+    return dict(value)
+
+
+def _normalise_identifier(value: Any) -> str:
+    return "" if value is None else str(value)
 
 
 @dataclass
@@ -47,18 +60,27 @@ class ManagedJobState:
     succeeded_tasks: int = 0
     failed_tasks: int = 0
     attempt: int = 0
-    correlation_metadata: dict[str, Any] = field(default_factory=_empty_object_dict)
     # Deprecated aliases retained so callers can load and resave old state
     # without losing the identifiers they used before schema 2.
     campaign_id: str = ""
     stage_id: str = ""
-    correlation: dict[str, Any] | None = None
     extra: dict[str, Any] = field(default_factory=_empty_object_dict)
+    correlation_metadata: dict[str, Any] = field(default_factory=_empty_object_dict)
+    correlation: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
-        """Accept ``correlation`` as a spelling alias for new callers."""
-        if self.correlation is not None:
-            self.correlation_metadata = dict(self.correlation)
+        """Normalise correlation aliases and persisted object fields."""
+        metadata = _normalise_mapping(self.correlation_metadata, "correlation_metadata")
+        for key, value in _normalise_mapping(self.correlation, "correlation").items():
+            metadata.setdefault(key, value)
+        self.campaign_id = _normalise_identifier(self.campaign_id)
+        self.stage_id = _normalise_identifier(self.stage_id)
+        if self.campaign_id:
+            metadata.setdefault("campaign_id", self.campaign_id)
+        if self.stage_id:
+            metadata.setdefault("stage_id", self.stage_id)
+        self.correlation_metadata = metadata
+        self.extra = _normalise_mapping(self.extra, "extra")
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize the state to a JSON-safe dictionary."""
@@ -85,13 +107,35 @@ def load_managed_job_state(path: Path) -> ManagedJobState:
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError as exc:
         raise ManagedJobStateError(f"managed-job state not found: {path}") from exc
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ManagedJobStateError(f"could not read managed-job state: {path}") from exc
 
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise ManagedJobStateError(f"managed-job state is not valid JSON: {path}") from exc
 
+    if not isinstance(payload, dict):
+        raise ManagedJobStateError("managed-job state JSON root must be an object")
+    return _load_payload(payload, path)
+
+
+def _load_payload(payload: dict[str, Any], path: Path) -> ManagedJobState:
+    """Validate, migrate, and construct a state from a parsed object."""
+    try:
+        payload = _migrate_payload(payload)
+        return _build_state_from_payload(payload, path)
+    except ManagedJobStateError:
+        raise
+    except (AttributeError, TypeError, ValueError, KeyError) as exc:
+        raise ManagedJobStateError(f"managed-job state migration failed: {path}") from exc
+
+
+def _migrate_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Migrate a parsed payload and normalise all supported aliases."""
     version = payload.get("schema_version")
+    if not isinstance(version, int) or isinstance(version, bool):
+        raise ManagedJobStateError(f"managed-job state schema_version is invalid: {version!r}")
     if version not in _VALID_MANAGED_JOB_SCHEMA_VERSIONS:
         raise ManagedJobStateError(
             f"managed-job state schema_version {version!r} is not supported; "
@@ -105,8 +149,7 @@ def load_managed_job_state(path: Path) -> ManagedJobState:
     if version == 1:
         logger.info("managed-job state: migrating v1 → v%d", CURRENT_MANAGED_JOB_SCHEMA)
         payload = _migrate_v1_to_v2(payload)
-
-    return _build_state_from_payload(payload, path)
+    return _normalise_correlation_fields(payload)
 
 
 def load_or_none(path: Path) -> ManagedJobState | None:
@@ -130,13 +173,32 @@ def _migrate_v0_to_v1(payload: dict[str, Any]) -> dict[str, Any]:
 
 def _migrate_v1_to_v2(payload: dict[str, Any]) -> dict[str, Any]:
     """Move stage-specific correlation fields into neutral metadata."""
-    correlation = dict(payload.get("correlation_metadata", {}))
+    payload = dict(payload)
+    correlation = _normalise_mapping(payload.get("correlation_metadata"), "correlation_metadata")
     if payload.get("campaign_id"):
         correlation.setdefault("campaign_id", str(payload["campaign_id"]))
     if payload.get("stage_id"):
         correlation.setdefault("stage_id", str(payload["stage_id"]))
     payload["correlation_metadata"] = correlation
     payload["schema_version"] = CURRENT_MANAGED_JOB_SCHEMA
+    return payload
+
+
+def _normalise_correlation_fields(payload: dict[str, Any]) -> dict[str, Any]:
+    """Backfill canonical metadata from every supported legacy alias."""
+    payload = dict(payload)
+    metadata = _normalise_mapping(payload.get("correlation_metadata"), "correlation_metadata")
+    for key, value in _normalise_mapping(payload.get("correlation"), "correlation").items():
+        metadata.setdefault(key, value)
+    campaign_id = _normalise_identifier(payload.get("campaign_id"))
+    stage_id = _normalise_identifier(payload.get("stage_id"))
+    if campaign_id:
+        metadata.setdefault("campaign_id", campaign_id)
+    if stage_id:
+        metadata.setdefault("stage_id", stage_id)
+    payload["correlation_metadata"] = metadata
+    payload["campaign_id"] = campaign_id
+    payload["stage_id"] = stage_id
     return payload
 
 
@@ -157,12 +219,12 @@ def _build_state_from_payload(payload: dict[str, Any], path: Path) -> ManagedJob
         succeeded_tasks=int(payload.get("succeeded_tasks", 0)),
         failed_tasks=int(payload.get("failed_tasks", 0)),
         attempt=int(payload.get("attempt", 0)),
-        correlation_metadata=dict(
-            payload.get("correlation_metadata", payload.get("correlation", {}))
+        correlation_metadata=_normalise_mapping(
+            payload.get("correlation_metadata"), "correlation_metadata"
         ),
-        campaign_id=str(payload.get("campaign_id", "")),
-        stage_id=str(payload.get("stage_id", "")),
-        extra=dict(payload.get("extra", {})),
+        campaign_id=_normalise_identifier(payload.get("campaign_id")),
+        stage_id=_normalise_identifier(payload.get("stage_id")),
+        extra=_normalise_mapping(payload.get("extra"), "extra"),
     )
 
 

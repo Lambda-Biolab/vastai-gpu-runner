@@ -386,14 +386,15 @@ class GcsSink:
             )
         except Exception as exc:
             raise _resolve_precondition_failure(exc) from exc
-        # CAS rewrites in place by passing the expected generation.
-        # Reload to expose the new generation number.
-        try:
-            blob.reload()
-        except Exception:  # pragma: no cover - depends on storage client
-            return 0
+        # The upload response populates the blob generation in the real SDK.
+        # Only reload when a client does not expose it there.
         new_gen = getattr(blob, "generation", None)
-        return int(new_gen) if new_gen is not None else 0
+        if new_gen is None:
+            blob.reload()
+            new_gen = getattr(blob, "generation", None)
+        if new_gen is None:
+            raise RuntimeError("GCS CAS upload did not return an object generation")
+        return int(new_gen)
 
     def exists(self, key: str) -> bool:
         """Return True if ``key`` exists in the configured bucket."""

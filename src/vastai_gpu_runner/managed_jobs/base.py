@@ -204,7 +204,6 @@ class ManagedJobSpec:
     environment: Mapping[str, str] = field(default_factory=dict)
     labels: Mapping[str, str] = field(default_factory=dict)
     gcs_mounts: tuple[str, ...] = ()
-    storage_mounts: tuple[StorageMount, ...] = ()
     timeout_seconds: int | None = None
     retry_on_preempt: bool = True
     region: str = ""
@@ -214,6 +213,7 @@ class ManagedJobSpec:
     network: NetworkConfig | None = None
     allowed_locations: tuple[str, ...] = ()
     spot: bool = False
+    storage_mounts: tuple[StorageMount, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         """Serialize the spec into a JSON-safe dictionary."""
