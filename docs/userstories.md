@@ -1,5 +1,9 @@
 # User stories
 
+> **Historical/superseded planning document:** These stories preserve earlier
+> product planning. See [`architecture.md`](architecture.md) and [`api.md`](api.md)
+> for current behavior and signatures.
+
 Three personas drive the near-term roadmap. Each story uses `As a <persona>, I want <capability> so that <outcome>` and is tagged with the roadmap item it maps to — `[R1]` `LocalRunner`, `[R2]` `RunPodRunner`, `[R3]` inference helper, `[future]` deferred.
 
 See `roadmap.md` for item scope and `vision.md` for non-goals.

@@ -14,6 +14,11 @@ Cloud GPU orchestration framework for Vast.ai + GCP Batch:
 - **BatchState** — atomic JSON persistence for crash-recoverable batch orchestration
 - **CLI** — credential checks, instance listing, cost estimation, orphan cleanup, batch, run, r2-lifecycle
 
+The distribution and import package retain the historical `vastai-gpu-runner`
+and `vastai_gpu_runner` names. The current published version is `0.6.0`; the
+managed-job contract stabilization is the recommended next `0.7.0` release,
+not a published release.
+
 ## Architecture
 
 ```text
@@ -28,8 +33,8 @@ src/vastai_gpu_runner/
 ├── providers/
 │   ├── vastai.py         # Vast.ai implementation (CloudRunner)
 │   ├── local.py          # Local subprocess backend (CloudRunner)
-│   └── destroy.py        # Provider-agnostic destroy orchestration
-├── destroy_adapters/     # Per-provider destroy adapters
+│   ├── destroy.py        # Provider-agnostic destroy orchestration
+│   └── destroy_adapters/ # Per-provider destroy adapters
 ├── managed_jobs/         # ManagedJobRunner implementations (declarative cloud batch)
 │   ├── base.py           # ManagedJobRunner Protocol + DTOs
 │   ├── gcp_batch.py      # GcpBatchRunner + FakeGcpBatchClient + FakeGcsClient
@@ -53,7 +58,7 @@ The runtime has two distinct provider abstractions that are
 
 | Abstraction | Implemented by | Use case |
 |---|---|---|
-| `CloudRunner` (`runner.py`) | `VastaiRunner`, `LocalRunner` | Direct VM SSH lifecycle (you run the VM, you SSH in) |
+| `CloudRunner` (`runner.py`) | `VastaiRunner`, `LocalRunner` | Direct VM/process lifecycle (you run the VM or local worker) |
 | `ManagedJobRunner` (`managed_jobs/base.py`) | `GcpBatchRunner` | Declarative cloud batch (the cloud platform owns the VM lifecycle) |
 
 A consumer picks one explicitly via configuration. The two
@@ -114,8 +119,10 @@ declarative batch providers).
    - `managed_jobs/<name>.py` for `ManagedJobRunner` (mirroring
      `gcp_batch.py`)
 3. Define config + result dataclasses
-4. Implement the runner class with `run()` (or `submit` + `get_status`),
-   idempotency, logging
+4. Implement the direct-VM lifecycle methods for `CloudRunner`, or the
+   `submit` + `get_status` + `list_tasks` + `cancel` + `delete` methods for
+   `ManagedJobRunner`, including the documented duplicate and idempotency
+   semantics
 5. Add tests in `tests/` using mocks (no real cloud APIs)
 6. Add optional extras in `pyproject.toml`
 7. Export from `__init__.py`

@@ -1,5 +1,9 @@
 # Roadmap
 
+> **Historical/superseded planning document:** This roadmap preserves earlier
+> planning. See [`architecture.md`](architecture.md) and [`api.md`](api.md) for
+> current behavior and signatures.
+
 **Scope**: committed near-term work only. Deferred items are listed once at the bottom with a single-line reason each. See `vision.md` for horizon framing and `architecture-v2.md` for the target architecture.
 
 ## Committed items

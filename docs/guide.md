@@ -4,6 +4,7 @@
 
 ```python
 from vastai_gpu_runner.providers.vastai import VastaiRunner
+from vastai_gpu_runner.cleanup_policy import OwnershipPolicy
 from vastai_gpu_runner.types import DeploymentConfig
 
 config = DeploymentConfig(
@@ -16,7 +17,7 @@ config = DeploymentConfig(
 runner = VastaiRunner(
     config,
     docker_image="my-org/my-gpu-image:latest",
-    allowed_images=frozenset({"my-org/my-gpu-image:latest"}),
+    ownership=OwnershipPolicy(owned_images=frozenset({"my-org/my-gpu-image:latest"})),
 )
 
 # Deploys through launch; poll/download/destroy are separate (see below)

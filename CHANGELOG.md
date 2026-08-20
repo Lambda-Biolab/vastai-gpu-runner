@@ -1,5 +1,13 @@
 # Changelog
 
+The published package is `0.6.0`. The contract-stabilization changes below
+are the recommended contents of the next `0.7.0` release; `0.7.0` has not
+been published.
+
+Entries under released versions preserve the historical release record, even
+where a later compatibility change superseded an example or constructor
+name. Use [`docs/api.md`](docs/api.md) for the current signatures.
+
 ## Unreleased — managed-job contract stabilization + R2 lifecycle
 
 ### Added

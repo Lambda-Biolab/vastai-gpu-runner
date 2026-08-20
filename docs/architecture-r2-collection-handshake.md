@@ -1,5 +1,8 @@
 # Long-term R2 collection handshake (proposed — not implemented)
 
+> **Historical/superseded proposal:** This document is not the current
+> contract. See [`architecture.md`](architecture.md) and [`api.md`](api.md).
+>
 > **Status:** future architecture. **Not implemented in the current change.**
 > This document records the target state machine and protocol that will
 > replace the best-effort rsync fallback once `R2_FINAL_UPLOAD_TIMEOUT_SECONDS`
