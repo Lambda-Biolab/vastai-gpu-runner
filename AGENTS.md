@@ -7,7 +7,7 @@ Read this file first. It supersedes any default behavior.
 
 Cloud GPU orchestration framework for Vast.ai + GCP Batch:
 
-- **CloudRunner** — provider-agnostic lifecycle (Vast.ai, local) with retry and machine deduplication
+- **CloudRunner** — direct VM lifecycle (Vast.ai, local) with retry and machine deduplication
 - **ManagedJobRunner** — provider-neutral interface for declarative cloud batch workloads (GCP Batch backend)
 - **R2Sink** / **GcsSink** — artifact sinks (Cloudflare R2 / GCS)
 - **BaseWorker** — template method worker
@@ -70,15 +70,23 @@ declarative batch providers).
   MUST provide `provider_name`, `submit`, `get_status`, `list_tasks`,
   `cancel`, `delete`. The Protocol is `@runtime_checkable` so
   `isinstance(runner, ManagedJobRunner)` works.
-- Idempotency is the caller's responsibility. The
-  `managed_jobs/state.py` `ManagedJobState` loader is the canonical
-  way to detect "already submitted" on resume.
-- Terminal states are `SUCCEEDED | FAILED | CANCELLED | UNKNOWN`
-  (the `ManagedJobTerminalState` enum). `UNKNOWN` is a fail-closed
-  fallback for cloud-side status responses that don't map cleanly.
+- `spec.name` is the provider idempotency key. Duplicate names raise
+  `ManagedJobConflictError`; they are not treated as implicit success.
+- Lifecycle states are `QUEUED | PENDING | RUNNING | SUCCEEDED | FAILED |
+  CANCELLING | CANCELLED | UNKNOWN` (`ManagedJobLifecycleState`). The
+  historical `ManagedJobTerminalState` import remains an alias, and
+  in-progress states are not silently converted to `UNKNOWN`.
+- `cancel` and `delete` are behaviorally idempotent, including provider
+  not-found responses.
+- `ManagedJobState` uses neutral `correlation_metadata`; schema migration
+  preserves legacy `campaign_id` / `stage_id` fields and old state files.
 - `GcsSink` (GCS artifact sink) is a sibling of `R2Sink` — the
   GCS source-of-truth is the object set itself, not a DONE
-  marker. Don't introduce DONE-marker logic to GcsSink.
+  marker. Its historical `upload_atomic_json` name means staged temp
+  write plus final overwrite; it does not claim atomic rename.
+- `ManagedJobSpec.storage_mounts` is the typed generic mount contract.
+  `gcs_mounts` remains a deprecated compatibility field for `gs://`
+  mounts during migration.
 
 ### `CloudRunner` (direct VM lifecycle)
 

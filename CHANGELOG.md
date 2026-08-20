@@ -1,8 +1,20 @@
 # Changelog
 
-## Unreleased — R2 lifecycle + fail-closed worker upload
+## Unreleased — managed-job contract stabilization + R2 lifecycle
 
 ### Added
+
+- **Managed-job contract stabilization** — `ManagedJobLifecycleState` now
+  distinguishes queued, pending, running, succeeded, failed, cancelling,
+  cancelled, and unknown. `ManagedJobTerminalState` remains a compatibility
+  alias. Added typed managed-job errors for transient, permanent, conflict,
+  and not-found outcomes; GCP provider causes are preserved.
+- **Generic storage mounts** — `StorageMount(uri, mount_path, read_only)` is
+  the provider-neutral field on `ManagedJobSpec`. GCP maps `gs://` mounts and
+  rejects unsupported schemes; deprecated `gcs_mounts` remains during
+  migration.
+- **Managed-job state schema 2** — neutral `correlation_metadata` replaces
+  stage-specific correlation while loading and preserving old state files.
 
 - **`storage/r2_lifecycle.py`** — provider-agnostic domain for managing
   one Cloudflare R2 bucket-lifecycle expiration rule per prefix.
@@ -76,6 +88,16 @@
   `docs/roadmap.md` (item 1 implemented).
 
 ### Changed
+
+- **Managed-job submission semantics** — `spec.name` is the provider
+  idempotency key; duplicate names raise a typed conflict. `cancel` and
+  `delete` are behaviorally idempotent when the provider reports not-found.
+- **`GcsSink` contract** — create-only writes, generation-based CAS, and
+  staged JSON writes are documented consistently. `upload_atomic_json` keeps
+  its historical name but does not claim atomic rename; completion remains
+  the expected object set with no DONE marker.
+- **Version recommendation** — release these contract changes as `0.7.0`;
+  the package name remains `vastai-gpu-runner`.
 
 - **`BaseWorker.upload_results()`** — fixed `R2_FINAL_UPLOAD_TIMEOUT_SECONDS`
   lowered from 300s to 90s. `subprocess.TimeoutExpired` caught

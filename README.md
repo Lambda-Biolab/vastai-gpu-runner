@@ -8,16 +8,20 @@
 [![CodeQL](https://github.com/Lambda-Biolab/vastai-gpu-runner/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/Lambda-Biolab/vastai-gpu-runner/actions/workflows/codeql.yml)
 ![vastai-gpu-runner — Cloud GPU batches for Vast.ai.](.github/social-preview.png)
 
-Cloud GPU orchestration framework for [Vast.ai](https://vast.ai) — batch deployment, R2 storage, worker lifecycle, crash recovery.
+Cloud GPU orchestration framework with direct [Vast.ai](https://vast.ai)
+deployment, managed declarative jobs, R2/GCS storage, worker lifecycle, and
+crash recovery. The package keeps its historical `vastai-gpu-runner` name;
+the managed-job surface is provider-neutral.
 
 ## Features
 
-- **CloudRunner** — provider-agnostic lifecycle (Vast.ai, GCP, local) with retry and machine deduplication.
+- **CloudRunner** — direct VM lifecycle (Vast.ai, local) with retry and machine deduplication.
 - **VastaiRunner** — hardened Vast.ai deployment with quality filters and ownership guards. Implements `CloudRunner` (direct VM SSH lifecycle), **not** `ManagedJobRunner`.
 - **LocalRunner** — zero-cost local/CI backend: the same lifecycle as a subprocess, no cloud credentials.
 - **ManagedJobRunner** (Protocol) — provider-neutral interface for declarative cloud batch workloads (GCP Batch, AWS Batch, Azure Batch). The contract behind `GcpBatchRunner`. **Not** the contract behind `VastaiRunner` (that's `CloudRunner`).
+- **Managed-job contract** — typed lifecycle states, provider-neutral storage mounts, typed provider errors, duplicate-name conflicts, and idempotent cancellation/deletion.
 - **GcpBatchRunner** — Google Cloud Batch backend implementing `ManagedJobRunner`. Submits jobs, polls status, downloads via the shared `ArtifactSink` interface.
-- **GcsSink** — Google Cloud Storage artifact sink. Mirrors the surface of `R2Sink` (upload / download / list) but uses `google-cloud-storage`.
+- **GcsSink** — Google Cloud Storage artifact sink. Plain writes are create-only, CAS writes use generations, and staged JSON writes do not claim atomic rename or use a DONE marker.
 - **R2Sink** — Cloudflare R2 / S3-compatible result storage with DONE markers and parallel downloads.
 - **BaseWorker** — template method worker: GPU check, preflight gates, self-destruct.
 - **BatchState** — atomic JSON persistence for crash-recoverable batch orchestration.

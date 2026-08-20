@@ -27,13 +27,33 @@ from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
 
-class ManagedJobTerminalState(enum.Enum):
-    """Normalized terminal states for managed-job providers."""
+class ManagedJobLifecycleState(enum.Enum):
+    """Normalized lifecycle states returned by managed-job providers."""
+
+    QUEUED = "queued"
+    PENDING = "pending"
+    RUNNING = "running"
 
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+    CANCELLING = "cancelling"
     CANCELLED = "cancelled"
     UNKNOWN = "unknown"
+
+    @property
+    def is_terminal(self) -> bool:
+        """Return whether this state represents a completed lifecycle."""
+        return self in {
+            self.SUCCEEDED,
+            self.FAILED,
+            self.CANCELLED,
+            self.UNKNOWN,
+        }
+
+
+# Kept as an alias because consumers imported this name before in-progress
+# states were represented explicitly.
+ManagedJobTerminalState = ManagedJobLifecycleState
 
 
 def _empty_str_tuple() -> tuple[str, ...]:
@@ -141,6 +161,15 @@ class NetworkConfig:
 
 
 @dataclass(frozen=True)
+class StorageMount:
+    """Provider-neutral storage mount declaration."""
+
+    uri: str
+    mount_path: str
+    read_only: bool = False
+
+
+@dataclass(frozen=True)
 class ManagedJobSpec:
     """Provider-neutral description of a unit of managed-job work.
 
@@ -157,9 +186,10 @@ class ManagedJobSpec:
     fields).
 
     Attributes:
-        gcs_mounts: Tuple of GCS mount URIs (``gs://bucket/path``).
-            Each entry maps to a single Cloud Volume. Multiple mounts
-            are supported where the SDK permits.
+        storage_mounts: Typed storage mounts. Providers may support
+            different URI schemes; unsupported schemes fail at submit time.
+        gcs_mounts: Deprecated GCS-only compatibility field. New callers
+            should use ``storage_mounts``.
         allowed_locations: Allowed regions/zones for the job
             (e.g. ``("regions/us-central1",)``). Validated against
             ``region`` at submit time when non-empty.
@@ -174,6 +204,7 @@ class ManagedJobSpec:
     environment: Mapping[str, str] = field(default_factory=dict)
     labels: Mapping[str, str] = field(default_factory=dict)
     gcs_mounts: tuple[str, ...] = ()
+    storage_mounts: tuple[StorageMount, ...] = ()
     timeout_seconds: int | None = None
     retry_on_preempt: bool = True
     region: str = ""
@@ -199,6 +230,14 @@ class ManagedJobSpec:
             "environment": dict(self.environment),
             "labels": dict(self.labels),
             "gcs_mounts": list(self.gcs_mounts),
+            "storage_mounts": [
+                {
+                    "uri": mount.uri,
+                    "mount_path": mount.mount_path,
+                    "read_only": mount.read_only,
+                }
+                for mount in self.storage_mounts
+            ],
             "timeout_seconds": self.timeout_seconds,
             "retry_on_preempt": self.retry_on_preempt,
             "region": self.region,
@@ -268,7 +307,7 @@ class ManagedTaskStatus:
     """Per-task status snapshot returned by :meth:`ManagedJobRunner.list_tasks`."""
 
     task_index: int
-    state: str
+    state: str | ManagedJobLifecycleState
     exit_code: int | None = None
     message: str = ""
 
@@ -276,7 +315,7 @@ class ManagedTaskStatus:
         """Serialize the task status to a JSON-safe dictionary."""
         return {
             "task_index": self.task_index,
-            "state": self.state,
+            "state": self.state.value if isinstance(self.state, enum.Enum) else self.state,
             "exit_code": self.exit_code,
             "message": self.message,
         }
@@ -287,7 +326,7 @@ class ManagedJobStatus:
     """Snapshot of a managed-job's state at a point in time."""
 
     handle: ManagedJobHandle
-    state: ManagedJobTerminalState
+    state: ManagedJobLifecycleState
     succeeded_tasks: int = 0
     failed_tasks: int = 0
     total_tasks: int = 0
@@ -305,7 +344,7 @@ class ManagedJobStatus:
             "failed_tasks": self.failed_tasks,
             "total_tasks": self.total_tasks,
             "message": self.message,
-            "raw_events": tuple(self.raw_events),
+            "raw_events": list(self.raw_events),
         }
 
 
@@ -314,8 +353,8 @@ class ManagedJobRunner(Protocol):
     """Provider-neutral interface for declarative cloud-job providers.
 
     Implementations must be safe to use from multiple threads; the
-    Activin-E pipeline calls ``submit`` once per stage attempt and
-    polls ``get_status`` from a background loop.
+    A controller calls ``submit`` once per job attempt and polls
+    ``get_status`` from a background loop.
     """
 
     @property
@@ -326,11 +365,10 @@ class ManagedJobRunner(Protocol):
     def submit(self, spec: ManagedJobSpec) -> ManagedJobHandle:
         """Submit ``spec`` and return the cloud resource handle.
 
-        Idempotency is the caller's responsibility: providers may
-        reject duplicate submissions with a name collision. The
-        :class:`~vastai_gpu_runner.managed_jobs.state.ManagedJobState`
-        loader is the canonical way to detect "already submitted" on
-        resume.
+        ``spec.name`` is the idempotency key. A duplicate provider name
+        raises ``ManagedJobConflictError``; it is not implicit success.
+        State persistence can still be used by callers to avoid a retry
+        after a successful submit.
         """
         ...
 

@@ -5,7 +5,7 @@ so a consumer can swap artifact stores without changing the
 orchestrator. Implementations live behind the optional ``gcp``
 extra and the Google SDK is imported lazily.
 
-Atomic uploads use ``upload_atomic_json`` (temp-then-rename with
+JSON uploads use ``upload_atomic_json`` (stage-then-copy with
 overwrite semantics on the final key). Plain ``upload_bytes`` /
 ``upload_file`` use ``if_generation_match=0`` so two siblings
 cannot silently overwrite each other (create-only semantics). The
@@ -14,13 +14,17 @@ preconditioned CAS pattern for controller snapshots: a reader
 records the current generation, builds a new value, and the writer
 only succeeds if the object is still at the recorded generation.
 
-All CAS write paths raise :class:`GcsPreconditionFailed` so the
+All CAS and create-only write paths raise :class:`GcsPreconditionFailed` so the
 caller has a single, stable exception class to catch. The SDK's
 own ``google.api_core.exceptions.PreconditionFailed`` is wrapped
 using ``raise X from exc`` so the underlying error is preserved as
 ``__cause__`` for inspection. Other SDK errors (auth, network,
-permissions) are *not* wrapped — they propagate so callers can
-handle them with their native types.
+permissions) propagate unchanged. GCS completion is represented by the
+expected object set; this sink does not create or require a ``DONE`` marker.
+
+``upload_atomic_json`` retains its historical name for compatibility. GCS
+has no atomic rename operation here: the temporary object and final object
+are separate writes, and the final object is the durable completion signal.
 """
 
 from __future__ import annotations
@@ -86,10 +90,10 @@ class GcsSink:
       writes (``if_generation_match=0``). Sibling artefacts cannot
       silently overwrite each other; a second upload of the same key
       raises :class:`GcsPreconditionFailed`.
-    * ``upload_atomic_json`` — durable, retriable JSON write. The
-      final key may already exist (overwrite semantics); the temp
+    * ``upload_atomic_json`` — durable, retriable staged JSON write.
+      The final key may already exist (overwrite semantics); the temp
       key is cleaned up on success and stale ``.tmp`` files from a
-      previous attempt are recovered.
+      previous attempt are recovered. It is not an atomic rename.
     * ``upload_cas_write`` — generation-aware CAS update for the
       controller snapshot pattern.
 
@@ -196,16 +200,15 @@ class GcsSink:
         return f"gs://{self._bucket_name}/{key}"
 
     def upload_atomic_json(self, key: str, payload: Any) -> str:
-        """Upload a JSON document atomically with temp-side rename.
+        """Stage a JSON document, then overwrite its durable final key.
 
         The pattern is:
         1. Clean up any stale ``<key>.tmp`` from a previous crashed
            attempt (best-effort delete; a missing ``.tmp`` is fine).
         2. Write ``<key>.tmp`` with create-only semantics on the
            unique-per-write key.
-        3. Write the final ``<key>`` with overwrite semantics. The
-           public API stays create-only; this internal path is what
-           makes the atomic-json retryable.
+         3. Write the final ``<key>`` with overwrite semantics. This is
+            not an atomic rename; the final key is the completion signal.
         4. Best-effort delete of ``<key>.tmp``.
 
         Consumers treat a present ``<key>`` without the ``.tmp``
@@ -332,8 +335,14 @@ class GcsSink:
         # If the object does not exist, `generation` stays None.
         try:
             blob.reload()
-        except Exception:  # pragma: no cover - depends on storage client
-            return b"", None
+        except Exception as exc:  # pragma: no cover - depends on storage client
+            try:
+                from google.api_core.exceptions import NotFound
+            except ImportError:
+                raise
+            if isinstance(exc, NotFound):
+                return b"", None
+            raise
         gen = getattr(blob, "generation", None)
         if gen is None:
             return b"", None

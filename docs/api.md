@@ -245,17 +245,24 @@ class ManagedJobRunner(Protocol):
 
 | Class | Description |
 |---|---|
-| `ManagedJobSpec` | name, task_count, parallelism, image, command, environment, labels, gcs_mounts, timeout_seconds, retry_on_preempt, region, machine_resource, compute_resource, service_account, network, allowed_locations, spot |
+| `ManagedJobSpec` | name, task_count, parallelism, image, command, environment, labels, storage_mounts, deprecated gcs_mounts, timeout_seconds, retry_on_preempt, region, machine_resource, compute_resource, service_account, network, allowed_locations, spot |
 | `BootDisk` | typed boot disk (image, size_gb, type_) |
 | `GpuAccelerator` | typed GPU accelerator (type_, count, driver_version, install_gpu_drivers) |
 | `MachineResource` | typed VM shape + accelerators + boot disk (machine_type, boot_disk, accelerators, min_cpu_platform) |
 | `ComputeResource` | typed per-task compute (cpu_milli, memory_mib, boot_disk_mib) |
 | `ServiceAccount` | typed service account (email, scopes) |
 | `NetworkConfig` | typed network (network, subnetwork, no_external_ip_address) |
+| `StorageMount` | typed mount (uri, mount_path, read_only); GCP currently supports `gs://` |
 | `ManagedJobHandle` | opaque (provider, resource_name, location) |
 | `ManagedJobStatus` | handle, state, succeeded_tasks, failed_tasks, total_tasks, message, raw_events |
 | `ManagedTaskStatus` | per-task snapshot (task_index, state, exit_code, message) |
-| `ManagedJobTerminalState` | enum: SUCCEEDED, FAILED, CANCELLED, UNKNOWN |
+| `ManagedJobLifecycleState` | enum: QUEUED, PENDING, RUNNING, SUCCEEDED, FAILED, CANCELLING, CANCELLED, UNKNOWN |
+| `ManagedJobTerminalState` | deprecated compatibility alias for `ManagedJobLifecycleState` |
+| `ManagedJobError` | base typed managed-job error |
+| `ManagedJobTransientError` | retryable provider failure |
+| `ManagedJobPermanentError` | non-retryable provider failure |
+| `ManagedJobConflictError` / `ManagedJobAlreadyExistsError` | duplicate `spec.name` conflict |
+| `ManagedJobNotFoundError` | provider resource was not found |
 
 ### Implementations
 
@@ -268,7 +275,13 @@ class ManagedJobRunner(Protocol):
 Google Cloud Storage artifact sink. Mirrors the surface of `R2Sink`
 (upload / download / list) but uses `google-cloud-storage` v3.0+.
 The GCS source-of-truth is the object set itself, not a DONE-marker
-sentinel — don't introduce DONE-marker logic to GcsSink.
+sentinel — don't introduce DONE-marker logic to GcsSink. `upload_bytes`
+and `upload_file` are create-only (`if_generation_match=0`).
+`upload_cas_write` is a generation-checked compare-and-set write;
+`expected_generation=None` means create-only. `upload_atomic_json` is a
+compatibility name for a staged temp upload followed by final-key overwrite;
+GCS does not perform an atomic rename, and the final object is the durable
+completion signal.
 
 ### Test doubles
 

@@ -19,10 +19,18 @@ from vastai_gpu_runner.managed_jobs.base import (
     ComputeResource,
     GpuAccelerator,
     MachineResource,
+    ManagedJobHandle,
+    ManagedJobLifecycleState,
     ManagedJobSpec,
     ManagedJobTerminalState,
     NetworkConfig,
     ServiceAccount,
+    StorageMount,
+)
+from vastai_gpu_runner.managed_jobs.errors import (
+    ManagedJobConflictError,
+    ManagedJobNotFoundError,
+    ManagedJobTransientError,
 )
 from vastai_gpu_runner.managed_jobs.gcp_batch import (
     SPOT_PREEMPT_EXIT_CODE,
@@ -90,6 +98,70 @@ def test_submit_builds_correct_request() -> None:
     assert request.job.logs_policy.destination == expected_log_dest
 
 
+def test_submit_duplicate_name_raises_typed_conflict() -> None:
+    fake = FakeGcpBatchClient()
+    runner = GcpBatchRunner(project_id="p", region="us-central1", client=fake)  # type: ignore[arg-type]
+    runner.submit(_make_spec())
+
+    with pytest.raises(ManagedJobConflictError) as exc_info:
+        runner.submit(_make_spec())
+
+    assert exc_info.value.__cause__ is not None
+    assert len(fake.submit_calls) == 1
+
+
+def test_cancel_and_delete_are_idempotent_after_provider_not_found() -> None:
+    fake = FakeGcpBatchClient()
+    runner = GcpBatchRunner(project_id="p", region="us-central1", client=fake)  # type: ignore[arg-type]
+    handle = runner.submit(_make_spec())
+    runner.delete(handle)
+
+    runner.cancel(handle)
+    runner.delete(handle)
+
+    assert fake.cancel_calls == []
+    assert fake.delete_calls == [handle.resource_name]
+
+
+def test_submit_maps_transient_gcp_error_and_preserves_cause() -> None:
+    from google.api_core.exceptions import ServiceUnavailable
+
+    class FailingClient:
+        def create_job(self, request: Any) -> Any:
+            raise ServiceUnavailable("temporary outage")
+
+    runner = GcpBatchRunner(
+        project_id="p",
+        region="us-central1",
+        client=FailingClient(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(ManagedJobTransientError) as exc_info:
+        runner.submit(_make_spec())
+
+    assert isinstance(exc_info.value.__cause__, ServiceUnavailable)
+
+
+def test_get_status_maps_provider_not_found() -> None:
+    from google.api_core.exceptions import NotFound
+
+    class MissingClient:
+        def get_job(self, view: Any, name: str) -> Any:
+            raise NotFound("gone")
+
+    runner = GcpBatchRunner(
+        project_id="p",
+        region="us-central1",
+        client=MissingClient(),  # type: ignore[arg-type]
+    )
+    handle = ManagedJobHandle(provider="gcp-batch", resource_name="missing")
+
+    with pytest.raises(ManagedJobNotFoundError) as exc_info:
+        runner.get_status(handle)
+
+    assert isinstance(exc_info.value.__cause__, NotFound)
+
+
 def test_submit_with_spot_retry_when_requested() -> None:
     fake = FakeGcpBatchClient()
     runner = GcpBatchRunner(project_id="p", region="us-central1", client=fake)  # type: ignore[arg-type]
@@ -142,7 +214,30 @@ def test_get_status_translates_state() -> None:
 
     fake.statuses[handle.resource_name] = _status(google_cloud_batch.JobStatus.State.RUNNING)
     status = runner.get_status(handle)
-    assert status.state == ManagedJobTerminalState.UNKNOWN
+    assert status.state == ManagedJobLifecycleState.RUNNING
+
+
+@pytest.mark.parametrize(
+    ("provider_state", "expected"),
+    [
+        ("QUEUED", ManagedJobLifecycleState.QUEUED),
+        ("SCHEDULED", ManagedJobLifecycleState.PENDING),
+        ("CANCELLATION_IN_PROGRESS", ManagedJobLifecycleState.CANCELLING),
+        ("DELETION_IN_PROGRESS", ManagedJobLifecycleState.CANCELLING),
+        ("STATE_UNSPECIFIED", ManagedJobLifecycleState.UNKNOWN),
+    ],
+)
+def test_get_status_maps_every_in_progress_lifecycle_state(
+    provider_state: str, expected: ManagedJobLifecycleState
+) -> None:
+    fake = FakeGcpBatchClient()
+    runner = GcpBatchRunner(project_id="p", region="us-central1", client=fake)  # type: ignore[arg-type]
+    handle = runner.submit(_make_spec())
+    fake.statuses[handle.resource_name] = _status(
+        google_cloud_batch.JobStatus.State[provider_state]
+    )
+
+    assert runner.get_status(handle).state == expected
 
 
 def test_get_status_aggregates_task_counts() -> None:
@@ -677,6 +772,37 @@ def test_submit_supports_multiple_gcs_mounts() -> None:
     # The bare absolute path falls back to the configured bucket.
     assert task.volumes[2].gcs.remote_path == "primary"
     assert task.volumes[2].mount_path == "/mnt/local"
+
+
+def test_submit_maps_generic_gcs_mount_and_read_only_intent() -> None:
+    fake = FakeGcpBatchClient()
+    runner = GcpBatchRunner(project_id="p", region="us-central1", client=fake)  # type: ignore[arg-type]
+    runner.submit(
+        _make_spec(
+            gcs_mounts=(),
+            storage_mounts=(
+                StorageMount(uri="gs://campaign/input", mount_path="/mnt/input", read_only=True),
+            ),
+        )
+    )
+
+    volume = fake.submit_calls[0].job.task_groups[0].task_spec.volumes[0]
+    assert volume.gcs.remote_path == "campaign/input"
+    assert volume.mount_path == "/mnt/input"
+    assert list(volume.mount_options) == ["ro"]
+
+
+def test_submit_rejects_unsupported_generic_mount_scheme() -> None:
+    fake = FakeGcpBatchClient()
+    runner = GcpBatchRunner(project_id="p", region="us-central1", client=fake)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="gs:// URIs only"):
+        runner.submit(
+            _make_spec(
+                gcs_mounts=(),
+                storage_mounts=(StorageMount("s3://bucket/input", "/mnt/input"),),
+            )
+        )
+    assert fake.submit_calls == []
 
 
 def test_submit_omits_volumes_when_gcs_mounts_empty() -> None:

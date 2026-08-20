@@ -15,8 +15,8 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-CURRENT_MANAGED_JOB_SCHEMA = 1
-_VALID_MANAGED_JOB_SCHEMA_VERSIONS: frozenset[int] = frozenset({0, CURRENT_MANAGED_JOB_SCHEMA})
+CURRENT_MANAGED_JOB_SCHEMA = 2
+_VALID_MANAGED_JOB_SCHEMA_VERSIONS: frozenset[int] = frozenset({0, 1, CURRENT_MANAGED_JOB_SCHEMA})
 
 
 class ManagedJobStateError(RuntimeError):
@@ -31,7 +31,7 @@ def _empty_object_dict() -> dict[str, Any]:
 class ManagedJobState:
     """Persistent state for a managed-job attempt.
 
-    One state file per (stage, attempt). The orchestrator writes it
+    One state file per (job attempt). The controller writes it
     after a successful :meth:`ManagedJobRunner.submit` and reads it
     on resume; a present state with a successful submit means the
     job is the canonical handle for this attempt and must not be
@@ -47,9 +47,18 @@ class ManagedJobState:
     succeeded_tasks: int = 0
     failed_tasks: int = 0
     attempt: int = 0
+    correlation_metadata: dict[str, Any] = field(default_factory=_empty_object_dict)
+    # Deprecated aliases retained so callers can load and resave old state
+    # without losing the identifiers they used before schema 2.
     campaign_id: str = ""
     stage_id: str = ""
+    correlation: dict[str, Any] | None = None
     extra: dict[str, Any] = field(default_factory=_empty_object_dict)
+
+    def __post_init__(self) -> None:
+        """Accept ``correlation`` as a spelling alias for new callers."""
+        if self.correlation is not None:
+            self.correlation_metadata = dict(self.correlation)
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize the state to a JSON-safe dictionary."""
@@ -63,6 +72,7 @@ class ManagedJobState:
             "succeeded_tasks": self.succeeded_tasks,
             "failed_tasks": self.failed_tasks,
             "attempt": self.attempt,
+            "correlation_metadata": dict(self.correlation_metadata),
             "campaign_id": self.campaign_id,
             "stage_id": self.stage_id,
             "extra": dict(self.extra),
@@ -91,6 +101,10 @@ def load_managed_job_state(path: Path) -> ManagedJobState:
     if version == 0:
         logger.info("managed-job state: migrating v0 → v%d", CURRENT_MANAGED_JOB_SCHEMA)
         payload = _migrate_v0_to_v1(payload)
+        version = 1
+    if version == 1:
+        logger.info("managed-job state: migrating v1 → v%d", CURRENT_MANAGED_JOB_SCHEMA)
+        payload = _migrate_v1_to_v2(payload)
 
     return _build_state_from_payload(payload, path)
 
@@ -104,13 +118,25 @@ def load_or_none(path: Path) -> ManagedJobState | None:
 
 
 def _migrate_v0_to_v1(payload: dict[str, Any]) -> dict[str, Any]:
-    """Migrate a v0 managed-job state payload to the current schema."""
-    payload["schema_version"] = CURRENT_MANAGED_JOB_SCHEMA
+    """Migrate a v0 managed-job state payload to the v1 shape."""
+    payload["schema_version"] = 1
     payload.setdefault("task_count", 1)
     payload.setdefault("attempt", 0)
     payload.setdefault("succeeded_tasks", 0)
     payload.setdefault("failed_tasks", 0)
     payload.setdefault("extra", {})
+    return payload
+
+
+def _migrate_v1_to_v2(payload: dict[str, Any]) -> dict[str, Any]:
+    """Move stage-specific correlation fields into neutral metadata."""
+    correlation = dict(payload.get("correlation_metadata", {}))
+    if payload.get("campaign_id"):
+        correlation.setdefault("campaign_id", str(payload["campaign_id"]))
+    if payload.get("stage_id"):
+        correlation.setdefault("stage_id", str(payload["stage_id"]))
+    payload["correlation_metadata"] = correlation
+    payload["schema_version"] = CURRENT_MANAGED_JOB_SCHEMA
     return payload
 
 
@@ -131,6 +157,9 @@ def _build_state_from_payload(payload: dict[str, Any], path: Path) -> ManagedJob
         succeeded_tasks=int(payload.get("succeeded_tasks", 0)),
         failed_tasks=int(payload.get("failed_tasks", 0)),
         attempt=int(payload.get("attempt", 0)),
+        correlation_metadata=dict(
+            payload.get("correlation_metadata", payload.get("correlation", {}))
+        ),
         campaign_id=str(payload.get("campaign_id", "")),
         stage_id=str(payload.get("stage_id", "")),
         extra=dict(payload.get("extra", {})),

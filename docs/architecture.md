@@ -104,12 +104,35 @@ class MyR2Sink(R2Sink):
         super().__init__(bucket="my-bucket", prefix="my-project/batches")
 ```
 
-### Configurable GcsSink
+### Managed-job contract and GcsSink
+
+`ManagedJobRunner` is a provider-neutral declarative job contract and is
+deliberately separate from `CloudRunner`, whose providers own direct VM and
+SSH lifecycle. `spec.name` is the managed-job idempotency key: a duplicate
+provider name is a typed conflict, while cancel and delete tolerate
+not-found responses.
+
+`ManagedJobLifecycleState` distinguishes queued, pending, running, succeeded,
+failed, cancelling, cancelled, and unknown. `ManagedJobTerminalState` remains
+as a deprecated compatibility alias; it must not collapse in-progress states
+into unknown. Provider failures are exposed through the typed managed-job
+error hierarchy with the provider exception preserved as the cause.
+
+`ManagedJobSpec.storage_mounts` carries a URI, mount path, and read-only
+intent. The deprecated `gcs_mounts` field remains for migration. GCP Batch
+maps supported `gs://` mounts to GCS volumes and rejects other schemes.
+
+`ManagedJobState` persists neutral correlation metadata. Schema migration keeps
+legacy `campaign_id` and `stage_id` values, so old state files remain loadable.
 
 GcsSink mirrors the surface of R2Sink (upload / download / list) but
-uses `google-cloud-storage`. The GCS source-of-truth is the object set
-itself, not a DONE marker — there is no GCS equivalent of the R2
-DONE-marker sentinel.
+uses `google-cloud-storage`.
+
+The GCS source-of-truth is the object set itself, not a DONE marker — there is
+no GCS equivalent of the R2 DONE-marker sentinel. Plain writes are
+create-only, CAS writes use generation preconditions, and the historical
+`upload_atomic_json` API stages a temporary object before overwriting the
+final key. It does not perform an atomic rename.
 
 ### Template method workers
 
