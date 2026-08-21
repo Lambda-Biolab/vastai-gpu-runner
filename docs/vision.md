@@ -1,5 +1,9 @@
 # Vision
 
+> **Historical/superseded planning document:** This vision preserves earlier
+> product framing. See [`architecture.md`](architecture.md) and [`api.md`](api.md)
+> for current behavior and signatures.
+
 ## Purpose
 
 `vastai-gpu-runner` is a **GPU batch orchestration framework**. It provisions short-lived GPU instances, deploys a worker, collects results into object storage, and destroys the instance — with crash recovery and cost transparency along the way.

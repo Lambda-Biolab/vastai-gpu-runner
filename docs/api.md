@@ -1,351 +1,260 @@
 # API reference
 
-## Types (`vastai_gpu_runner.types`)
+This reference describes the public surface in the current `0.6.0` package.
+The recommended next release is `0.7.0`; it is not published.
 
-| Class | Description |
-|-------|-------------|
-| `Provider` | Enum: `VASTAI`, `RUNPOD`, `LOCAL` |
-| `InstanceStatus` | Enum: `CREATING`, `BOOTING`, `RUNNING`, `FAILED`, `DESTROYED` |
-| `DeploymentConfig` | GPU model, cost limits, timeouts, workspace, reliability thresholds |
-| `CloudInstance` | Instance metadata: ID, SSH host/port, GPU model, cost, status |
-| `DeploymentResult` | Success flag, instance reference, error message, output files |
+## Public exports
 
-### `DeploymentConfig` fields
+`vastai_gpu_runner` exports:
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `gpu_model` | `str` | `"RTX_4090"` | GPU model identifier |
-| `max_cost_per_hour` | `float` | `0.45` | Maximum $/hr for offers |
-| `boot_timeout_seconds` | `int` | `300` | Max wait for instance boot |
-| `gpu_verify_timeout` | `int` | `120` | Max wait for GPU verification |
-| `min_disk_gb` | `int` | `40` | Minimum disk space |
-| `min_network_mbps` | `int` | `800` | Minimum download bandwidth |
-| `min_reliability` | `float` | `0.995` | Minimum host reliability score |
-| `worker_script` | `str` | `"worker.sh"` | Worker script filename |
-| `workspace_dir` | `str` | `"/workspace"` | Remote workspace path |
-| `conda_env_spec` | `str` | `""` | Conda packages to install (empty = skip setup) |
+```text
+BatchOrchestrator, BatchUnit, CloudInstance, CloudRunner, ComputeMode,
+DeploymentConfig, DeploymentResult, FailureVerdict, GcpBatchRunner,
+InstanceStatus, ManagedJobAlreadyExistsError, ManagedJobConflictError,
+ManagedJobError, ManagedJobHandle, ManagedJobLifecycleState,
+ManagedJobNotFoundError, ManagedJobPermanentError, ManagedJobRunner,
+ManagedJobSpec, ManagedJobStatus, ManagedJobTerminalState,
+ManagedJobTransientError, ManagedTaskStatus, Provider, StorageMount
+```
+
+The managed-job package additionally exports `BootDisk`, `ComputeResource`,
+`GpuAccelerator`, `MachineResource`, `NetworkConfig`, `ServiceAccount`,
+`CURRENT_MANAGED_JOB_SCHEMA`, `ManagedJobState`, `ManagedJobStateError`,
+`load_managed_job_state`, `load_or_none`, and `save_managed_job_state`.
+Import these from `vastai_gpu_runner.managed_jobs`.
+
+`vastai_gpu_runner.storage` exports `GcsPreconditionFailed`, `GcsSink`,
+`streaming_upload`, and `upload_json_atomic`. `R2Sink` remains available from
+`vastai_gpu_runner.storage.r2`; it is not re-exported by the package root.
+
+## Core types (`vastai_gpu_runner.types`)
+
+| Class | Contract |
+|---|---|
+| `Provider` | `VASTAI`, `RUNPOD`, or `LOCAL`. `RUNPOD` is an enum value only; no RunPod runner is included. |
+| `InstanceStatus` | `CREATING`, `BOOTING`, `RUNNING`, `FAILED`, or `DESTROYED`. |
+| `DeploymentConfig` | Direct-VM deployment settings: GPU, cost, timeouts, workspace, worker script, and checkpoint flags. |
+| `CloudInstance` | Direct-VM instance metadata, including provider, ID, GPU, cost, status, label, and SSH fields. |
+| `DeploymentResult` | Deployment success, optional instance, error text, and output-file names. |
 
 ## Runner (`vastai_gpu_runner.runner`)
 
-| Method | Returns | Description |
-|--------|---------|-------------|
-| `search_offers(**kwargs)` | `list[dict]` | Search marketplace for GPU offers |
-| `create_instance(offer)` | `CloudInstance` | Create instance from an offer |
-| `wait_for_boot(instance)` | `bool` | Wait for running status |
-| `verify_gpu(instance)` | `bool` | Verify GPU via nvidia-smi |
-| `deploy_files(instance, files)` | `bool` | Upload files via SCP |
-| `setup_environment(instance)` | `bool` | Install deps (micromamba/conda) |
-| `launch_worker(instance)` | `bool` | Start worker process |
-| `check_progress(instance)` | `dict` | Check DONE file / PID liveness |
-| `list_remote_files(instance)` | `list[str]` | List workspace files |
-| `download_file(instance, name, path)` | `bool` | Download single file via SCP |
-| `destroy_instance(instance)` | `bool` | Tear down instance |
-| `run_full_cycle(files, output_dir, ...)` | `DeploymentResult` | Deploy through launch with retry; polling, download, and destroy are caller steps |
-| `download_all_results(instance, dir, ...)` | `list[str]` | Bulk rsync download |
+`CloudRunner` is the direct VM lifecycle base class. Its constructor is
+`CloudRunner(config: DeploymentConfig | None = None)`. Subclasses implement
+the provider operations; `run_full_cycle` runs through worker launch and
+returns a `DeploymentResult`. It does not poll, download, or destroy after
+launch.
 
-### `run_full_cycle` parameters
+| Method | Signature | Return |
+|---|---|---|
+| `search_offers` | `search_offers(**kwargs: object)` | `list[dict[str, object]]` |
+| `create_instance` | `create_instance(offer: Mapping[str, object])` | `CloudInstance` |
+| `wait_for_boot` | `wait_for_boot(instance)` | `bool` |
+| `verify_gpu` | `verify_gpu(instance)` | `bool` |
+| `deploy_files` | `deploy_files(instance, files: dict[str, Path])` | `bool` |
+| `setup_environment` | `setup_environment(instance)` | `bool` |
+| `launch_worker` | `launch_worker(instance)` | `bool` |
+| `check_progress` | `check_progress(instance)` | `dict[str, object]` |
+| `list_remote_files` | `list_remote_files(instance)` | `list[str]` |
+| `download_file` | `download_file(instance, remote_name, local_path)` | `bool` |
+| `destroy_instance` | `destroy_instance(instance)` | `bool` |
+| `download_all_results` | `download_all_results(instance, local_dir, *, remote_subdir="", critical_files=None)` | `list[str]` |
+| `run_full_cycle` | `run_full_cycle(files, local_output_dir, *, max_retries=3, offers=None, used_machine_ids=None, machine_lock=None)` | `DeploymentResult` |
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `files` | `dict[str, Path]` | required | Remote name -> local path mapping |
-| `local_output_dir` | `Path` | required | Reserved (currently unused; download is a separate caller step) |
-| `max_retries` | `int` | `3` | Maximum deployment attempts |
-| `offers` | `list[dict] \| None` | `None` | Pre-fetched offers (avoids re-query) |
-| `used_machine_ids` | `set[str] \| None` | `None` | Machine IDs claimed by other threads |
-| `machine_lock` | `Lock \| None` | `None` | Lock protecting `used_machine_ids` |
+The `run_full_cycle` `local_output_dir` parameter is reserved by the current
+implementation. Callers own polling, collection, and destruction.
 
-## Vast.ai Provider (`vastai_gpu_runner.providers.vastai`)
+## Vast.ai provider (`vastai_gpu_runner.providers.vastai`)
 
-| Class/Function | Description |
-|----------------|-------------|
-| `VastaiRunner(config, allowed_images, docker_image, min_gpu_vram_mib)` | Hardened Vast.ai runner |
-| `vastai_cmd(args, timeout)` | Run `vastai` CLI command, returns stdout |
-| `verify_instance_ownership(instance_id, allowed_images)` | Check instance belongs to project |
-| `GPU_NAME_MAP` | Dict mapping model IDs to Vast.ai GPU names |
-| `DEFAULT_IMAGE` | Default Docker image (`nvidia/cuda:12.4.0-devel-ubuntu22.04`) |
+`VastaiRunner` implements `CloudRunner`:
 
-## Local Provider (`vastai_gpu_runner.providers.local`)
+```python
+VastaiRunner(
+    config: DeploymentConfig | None = None,
+    *,
+    ownership: OwnershipPolicy | None = None,
+    credentials: CredentialResolution | None = None,
+    label_prefix: str | None = None,
+    allowed_images: frozenset[str] | None = None,  # deprecated
+    docker_image: str = DEFAULT_IMAGE,
+    min_gpu_vram_mib: int = MIN_GPU_VRAM_MIB,
+    setup_commands: list[str] | None = None,
+)
+```
 
-| Class/Function | Description |
-|----------------|-------------|
-| `LocalRunner(config)` | `CloudRunner` backend that runs the lifecycle as a local subprocess. No SSH, cloud credentials, or Docker; single job per runner. |
-| `build_local_cleanup_policy()` | Returns a `Provider.LOCAL` `ProviderCleanupPolicy` with no cross-process candidates — the owning `LocalRunner` cleans up via `destroy_instance` |
+Use `ownership=OwnershipPolicy(...)` for new code. `allowed_images=` is a
+deprecated compatibility alias; passing both names raises `ValueError`.
+`VastaiRunner.from_config(canonical)` accepts a `VastaiProviderConfig`.
 
-Lifecycle overrides:
+The provider module also exposes `list_vastai_instances(*, credentials)`,
+`verify_instance_ownership(instance_id, *, ownership)`, and
+`build_vastai_cleanup_policy(*, ownership, credentials)`. Ownership
+verification returns the tagged `OwnershipVerification` result, not a
+boolean. `VASTAI_TERMINAL_STATES` contains the provider's terminal states.
 
-| Method | Local behavior |
-|--------|----------------|
-| `search_offers` | Single synthetic offer `{"machine_id": "local", "dph_total": 0.0}` |
-| `create_instance` | Allocate a tempdir workspace; `CloudInstance(provider=Provider.LOCAL, instance_id="local", ssh_host="localhost")` |
-| `verify_gpu` | Probe `nvidia-smi`; log and proceed on failure (CPU-only OK) |
-| `deploy_files` | Copy payload files into the workspace |
-| `launch_worker` | `bash worker.sh` in the workspace via `subprocess.Popen`; persist PID |
-| `check_progress` | `DONE` marker, else PID liveness; reports `worker_dead` + log tail on premature exit |
-| `list_remote_files` / `download_file` / `download_all_results` | Copy files out of the workspace (no rsync/SSH) |
-| `destroy_instance` | Terminate (then kill) the worker process; remove the workspace |
+## Local provider (`vastai_gpu_runner.providers.local`)
 
-Like the base class, `run_full_cycle` deploys through launch and returns — polling, collection, and destruction are the caller's job.
-
-### CLI — `run` command
-
-```text
-vastai-gpu-runner run --provider local --file worker.sh [--file INPUT...] --output OUTPUT
-```text
-
-Waits for a `DONE` marker, downloads the workspace into `--output`, and destroys the runner. `--provider` values other than `local` are rejected.
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--file` / `-f` | (required) | Payload file copied into the workspace; repeatable; must include the worker script |
-| `--output` / `-o` | `outputs/local` | Directory for files produced by the worker |
-| `--provider` | `local` | Execution provider; only `local` is supported |
-| `--worker-script` | `worker.sh` | Worker script filename inside the payload |
-| `--timeout` | `300.0` | Maximum seconds to wait for worker completion |
-| `--poll-interval` | `1.0` | Seconds between progress checks |
-| `--verbose` / `-v` | `False` | Show detailed logs |
-
-## SSH (`vastai_gpu_runner.ssh`)
-
-| Function | Returns | Description |
-|----------|---------|-------------|
-| `ssh_cmd(instance, command, timeout=30)` | `(int, str)` | Execute command, returns (rc, stdout) |
-| `scp_upload(instance, local_path, remote_path, timeout=300)` | `bool` | Upload file |
-| `scp_download(instance, remote_path, local_path, timeout=600)` | `bool` | Download file (checks non-empty) |
-
-All SSH functions use `StrictHostKeyChecking=no` (ephemeral IPs) and `stdin=DEVNULL` (prevents stdin stealing).
-
-## State (`vastai_gpu_runner.state`)
-
-### Shard-based (`BatchState`)
-
-| Class | Description |
-|-------|-------------|
-| `ShardState` | Per-shard: `shard_id`, `instance_id`, `status`, `item_ids`, `cost_per_hour`, `retry_count` |
-| `BatchState` | Collection with `save(path)`, `load(path)`, `active_shards`, `failed_shards`, `pending_shards`, `downloaded_shards` |
-
-Status flow: `pending` -> `deployed` -> `running` -> `downloaded` -> `destroyed` | `failed`
-
-### Job-based (`JobBatchState`)
-
-| Class | Description |
-|-------|-------------|
-| `JobState` | Per-job: `job_name`, `status`, `instance_id`, `cost_per_hour`, `cost_usd` (computed) |
-| `JobBatchState` | Collection with `save(path)`, `load(path)`, `pending_jobs`, `active_jobs`, `completed_jobs`, `total_cost` |
-
-Status flow: `pending` -> `deploying` -> `running` -> `completed` -> `downloaded` | `failed`
-
-## Worker (`vastai_gpu_runner.worker`)
-
-### `BaseWorker`
-
-| Method | Override? | Description |
-|--------|-----------|-------------|
-| `main()` | No | Template method — runs the full lifecycle |
-| `write_pid()` | No | Write `worker.pid` |
-| `check_gpu(min_memory_mib, max_temp_c)` | No | GPU health via nvidia-smi |
-| `preflight_gates()` | Optional | Return list of `() -> bool` callables. Default: `[_check_r2]` |
-| `run_workload()` | **Required** | Your GPU code. Return 0 for success. |
-| `upload_results()` | Optional | Default: call `r2_upload.py --done` |
-| `self_destruct()` | No | Vast.ai REST DELETE (reads env vars) |
-
-### Health checks (`vastai_gpu_runner.worker.health`)
-
-| Function | Returns | Description |
-|----------|---------|-------------|
-| `check_gpu(min_memory_mib=0, max_temp_c=90)` | `bool` | nvidia-smi temp + ECC + optional VRAM check |
-| `check_r2_connectivity(workspace)` | `bool` | Run `r2_upload.py --check` if script exists |
+`LocalRunner(config: DeploymentConfig | None = None)` runs one worker as a
+local subprocess. It needs no cloud credentials, SSH, Docker, or network
+provider. `build_local_cleanup_policy()` returns the local cleanup policy.
+The `run` CLI command is the synchronous poll/collect/destroy wrapper around
+this lifecycle.
 
 ## Batch orchestrator (`vastai_gpu_runner.batch`)
 
-`BatchOrchestrator[UnitT]` is the template-method ABC that coordinates deploy → poll → collect → cleanup across many units in parallel. Sits one layer above `CloudRunner`. Generic over unit type (`ShardState` or `JobState`).
+`BatchOrchestrator` is an abstract, generic coordinator above `CloudRunner`.
+Its constructor is keyword-only:
 
-| Constructor parameter | Type | Default | Description |
-|-----------------------|------|---------|-------------|
-| `runner_factory` | `Callable[[], CloudRunner]` | required | Fresh `CloudRunner` per deploy attempt |
-| `label_prefix` | `str` | required | Instance label prefix for zombie-sweep filtering (unique per batch) |
-| `workspace_dir` | `str` | `"/workspace"` | Remote workspace path |
-| `r2_sink` | `R2Sink \| None` | `None` | Optional R2 sink for DONE-marker polling + recovery |
-| `r2_batch_id` | `str` | `""` | Batch ID for R2 marker lookups |
-| `budget_usd` | `float` | `0.0` | Hard cost ceiling (`0` disables) |
-| `max_retries` | `int` | `2` | Max re-deploys per unit on preemption |
-| `max_parallel_deploys` | `int` | `16` | Concurrent deploy threads |
-| `poll_interval_seconds` | `int` | `30` | Base poll cadence (exponential backoff) |
-| `zombie_sweep_every_n_cycles` | `int` | `5` | Run zombie sweep every N poll cycles |
-| `poll_timeout_seconds` | `float` | `0.0` | Hard poll deadline (`0` = no timeout) |
+```python
+BatchOrchestrator(
+    *,
+    runner_factory,
+    label_prefix,
+    cleanup_policy,
+    workspace_dir="/workspace",
+    r2_sink=None,
+    r2_batch_id="",
+    budget_usd=0.0,
+    max_retries=2,
+    max_parallel_deploys=16,
+    max_parallel_collects=1,
+    poll_interval_seconds=30,
+    zombie_sweep_every_n_cycles=5,
+    poll_timeout_seconds=0.0,
+)
+```
 
-### Domain hooks (subclasses must implement)
-
-| Method | Returns | Purpose |
-|--------|---------|---------|
-| `iter_pending_units()` | `Iterable[UnitT]` | Units to deploy |
-| `iter_active_units()` | `Iterable[UnitT]` | Units to poll |
-| `iter_failed_units()` | `Iterable[UnitT]` | Candidates for R2 recovery |
-| `iter_completed_units()` | `Iterable[UnitT]` | Terminal — skipped |
-| `save_state()` | `None` | Persist batch state atomically |
-| `unit_key(unit)` | `str` | Stable unique identifier |
-| `unit_label(unit)` | `str` | Human-readable label for logs |
-| `build_unit_payload(unit)` | `dict[str, Path]` | Files to upload |
-| `reconstruct_instance(unit)` | `CloudInstance` | Rebuild from persisted fields (resume) |
-| `collect_unit_results(unit, instance)` | `bool` | Download artifacts |
-| `unit_is_done_in_r2(unit)` | `bool` | R2 DONE marker check |
-| `classify_failure(unit, error)` | `"retry" \| "fatal"` | Retryable or permanent |
-
-### State-mutation event callbacks (subclasses must implement)
-
-| Method | Purpose |
-|--------|---------|
-| `on_unit_deployed(unit, instance)` | Set instance fields + status=deployed, save |
-| `on_unit_failed(unit, reason)` | Set status=failed, bump retry, save |
-| `on_unit_completed(unit)` | Set status=downloaded, save |
-| `on_unit_preempted(unit)` | Reset instance_id, status=pending, save |
-
-### Inherited lifecycle
-
-| Method | Description |
-|--------|-------------|
-| `run()` | Entry point: resume → deploy → sweep → poll → collect → cleanup |
-| `_resume_from_state()` | Rebuild live-runner map from persisted active units |
-| `_deploy_phase()` | Parallel deploy via `ThreadPoolExecutor` |
-| `_poll_phase()` | R2-first poll loop with exponential backoff |
-| `_check_unit(runner, instance, unit)` | Single-unit progress check with 3-layer rescue |
-| `_collect_phase()` | R2 recovery for failed-but-uploaded units |
-| `_cleanup_phase()` | Destroy leftover instances + final zombie sweep |
-| `_handle_instance_loss(unit, key, reason)` | Mark preempted; enforces `max_retries` cap |
-| `_sweep_zombies()` | Policy-driven: enumerates `cleanup_policy.list_instances()`, filters by `f"{label_prefix}-"`, dispatches `policy.destroy(candidate)` per candidate |
-
-## Orchestrator utils (`vastai_gpu_runner.orchestrator`)
-
-| Function | Returns | Description |
-|----------|---------|-------------|
-| `check_budget(spent, ceiling)` | `bool` | True if within budget, warns at 80% |
-
-The v3 `sweep_zombie_instances`, `load_vastai_api_key`, `ensure_detached`, and `poll_instance_progress` are deleted (v4 step 7). Zombie sweep is policy-driven from `batch._sweep_zombies`; ownership keys are read via the v3 destroy adapter's `read_vastai_api_key`; long-running shell detachment and progress polling live in the consumer's worker module.
+`cleanup_policy` is required. Consumer subclasses implement unit iteration,
+state persistence, payload construction, collection, failure classification,
+and state-mutation callbacks. Zombie cleanup uses the policy's
+`list_instances()` and `destroy(candidate)` methods.
 
 ## Managed jobs (`vastai_gpu_runner.managed_jobs`)
 
-Provider-neutral interface for declarative cloud-job providers (where the cloud platform owns the underlying VM lifecycle — e.g. GCP Batch, AWS Batch, Azure Batch). Separate from `CloudRunner` (direct VM SSH lifecycle); the two abstractions do not share code or types.
+`ManagedJobRunner` is a `@runtime_checkable` protocol for declarative batch
+providers. It is separate from `CloudRunner`: the managed provider owns the
+VM lifecycle, while `CloudRunner` manages a direct VM/SSH lifecycle.
 
-### Protocol — `vastai_gpu_runner.managed_jobs.base`
+Required protocol methods:
 
 ```python
-class ManagedJobRunner(Protocol):
-    @property
-    def provider_name(self) -> str: ...
+@property
+def provider_name(self) -> str: ...
 
-    def submit(self, spec: ManagedJobSpec) -> ManagedJobHandle: ...
-    def get_status(self, handle: ManagedJobHandle) -> ManagedJobStatus: ...
-    def list_tasks(self, handle: ManagedJobHandle) -> Iterable[ManagedTaskStatus]: ...
-    def cancel(self, handle: ManagedJobHandle) -> None: ...
-    def delete(self, handle: ManagedJobHandle) -> None: ...
+def submit(self, spec: ManagedJobSpec) -> ManagedJobHandle: ...
+def get_status(self, handle: ManagedJobHandle) -> ManagedJobStatus: ...
+def list_tasks(self, handle: ManagedJobHandle) -> Iterable[ManagedTaskStatus]: ...
+def cancel(self, handle: ManagedJobHandle) -> None: ...
+def delete(self, handle: ManagedJobHandle) -> None: ...
 ```
 
-`@runtime_checkable` — `isinstance(runner, ManagedJobRunner)` works.
+### Data-transfer objects
 
-### Provider-neutral DTOs
-
-| Class | Description |
+| Type | Fields |
 |---|---|
-| `ManagedJobSpec` | name, task_count, parallelism, image, command, environment, labels, gcs_mounts, timeout_seconds, retry_on_preempt, region, machine_resource, compute_resource, service_account, network, allowed_locations, spot |
-| `BootDisk` | typed boot disk (image, size_gb, type_) |
-| `GpuAccelerator` | typed GPU accelerator (type_, count, driver_version, install_gpu_drivers) |
-| `MachineResource` | typed VM shape + accelerators + boot disk (machine_type, boot_disk, accelerators, min_cpu_platform) |
-| `ComputeResource` | typed per-task compute (cpu_milli, memory_mib, boot_disk_mib) |
-| `ServiceAccount` | typed service account (email, scopes) |
-| `NetworkConfig` | typed network (network, subnetwork, no_external_ip_address) |
-| `ManagedJobHandle` | opaque (provider, resource_name, location) |
-| `ManagedJobStatus` | handle, state, succeeded_tasks, failed_tasks, total_tasks, message, raw_events |
-| `ManagedTaskStatus` | per-task snapshot (task_index, state, exit_code, message) |
-| `ManagedJobTerminalState` | enum: SUCCEEDED, FAILED, CANCELLED, UNKNOWN |
+| `ManagedJobSpec` | `name`, `task_count`, `parallelism`, `image`, `command`, `environment`, `labels`, `gcs_mounts` (deprecated), `storage_mounts`, `timeout_seconds`, `retry_on_preempt`, `region`, `machine_resource`, `compute_resource`, `service_account`, `network`, `allowed_locations`, `spot` |
+| `StorageMount` | `uri`, `mount_path`, `read_only=False` |
+| `ManagedJobHandle` | `provider`, `resource_name`, `location` |
+| `ManagedJobStatus` | `handle`, `state`, `succeeded_tasks`, `failed_tasks`, `total_tasks`, `message`, `raw_events` |
+| `ManagedTaskStatus` | `task_index`, `state`, `exit_code`, `message` |
+| `BootDisk` | `image`, `size_gb`, `type_` |
+| `GpuAccelerator` | `type_`, `count`, `driver_version`, `install_gpu_drivers` |
+| `MachineResource` | `machine_type`, `boot_disk`, `accelerators`, `min_cpu_platform` |
+| `ComputeResource` | `cpu_milli`, `memory_mib`, `boot_disk_mib` |
+| `ServiceAccount` | `email`, `scopes` |
+| `NetworkConfig` | `network`, `subnetwork`, `no_external_ip_address` |
 
-### Implementations
+`ManagedJobLifecycleState` is the canonical enum:
+`QUEUED`, `PENDING`, `RUNNING`, `SUCCEEDED`, `FAILED`, `CANCELLING`,
+`CANCELLED`, and `UNKNOWN`. Only `SUCCEEDED`, `FAILED`, `CANCELLED`, and
+`UNKNOWN` are terminal. `ManagedJobTerminalState` is a compatibility alias to
+the same enum; it does not collapse in-progress states into `UNKNOWN`.
 
-| Provider | Class | Backend |
-|---|---|---|
-| GCP Batch | `GcpBatchRunner` (`managed_jobs/gcp_batch.py`) | `google-cloud-batch` v0.17+ |
+`ManagedJobState` uses schema 2 and neutral `correlation_metadata`. Loading
+schema 0 or 1 migrates it to schema 2 while preserving legacy `campaign_id`
+and `stage_id` fields. Unknown schemas, missing files, malformed JSON, and
+missing required state keys raise `ManagedJobStateError` through
+`load_managed_job_state`; `load_or_none` is the compatibility loader that
+returns `None` for those failures. `save_managed_job_state` writes a temporary
+file and replaces the destination.
 
-### `GcsSink` (`vastai_gpu_runner.storage.gcs`)
+### Errors and operation semantics
 
-Google Cloud Storage artifact sink. Mirrors the surface of `R2Sink`
-(upload / download / list) but uses `google-cloud-storage` v3.0+.
-The GCS source-of-truth is the object set itself, not a DONE-marker
-sentinel — don't introduce DONE-marker logic to GcsSink.
+`ManagedJobError` is the base class. `ManagedJobTransientError` is normally
+retryable; `ManagedJobPermanentError` is not. `ManagedJobConflictError`
+(`ManagedJobAlreadyExistsError` is its alias) reports a duplicate provider
+resource, including a duplicate `ManagedJobSpec.name`. `ManagedJobNotFoundError`
+reports a missing resource. GCP provider exceptions are mapped to these
+types, with the original SDK exception preserved as the cause.
 
-### Test doubles
+`submit` does not treat a duplicate name as implicit success. `cancel` and
+`delete` are behaviorally idempotent for provider not-found responses.
 
-| Class | Module | Purpose |
-|---|---|---|
-| `FakeGcpBatchClient` | `managed_jobs/gcp_batch.py` (private) | In-memory `BatchServiceClient`; tests preset `statuses` to drive transitions |
-| `FakeGcsClient` | `managed_jobs/gcp_batch.py` (private) | In-memory `Client`; bucket/blob round-trip keyed by name |
+### GCP Batch implementation
 
-Semantics pinned by `tests/test_fake_gcp_clients.py`.
+`GcpBatchRunner` implements `ManagedJobRunner`:
 
-## Estimator (`vastai_gpu_runner.estimator`)
+```python
+GcpBatchRunner(
+    project_id: str,
+    region: str,
+    client=None,
+    storage_client=None,
+    bucket_name: str = "",
+)
+```
 
-### Core (`vastai_gpu_runner.estimator.core`)
+The `client` and `storage_client` arguments are optional seams for fakes and
+stubbed runs. `bucket_name` is the current constructor name; `project` and
+`location` are not constructor parameters. The runner uses `spec.region` when
+present, validates `allowed_locations`, and returns handles in
+`project/region` form. GCP Batch currently supports `gs://` `StorageMount`
+URIs and rejects other schemes. `gcs_mounts` remains for compatibility.
 
-| Name | Type | Description |
-|------|------|-------------|
-| `GPU_SPEED_FACTOR` | `dict` | `RTX_3090=0.77`, `RTX_4090=1.0`, `RTX_5090=1.43` |
-| `GPU_TYPES` | `list` | `["RTX_3090", "RTX_4090", "RTX_5090"]` |
-| `FALLBACK_PRICES` | `dict` | Static $/hr: 3090=$0.15, 4090=$0.32, 5090=$0.60 |
-| `PriceSummary` | dataclass | GPU pricing snapshot: min/max/median $/hr, count |
-| `ScalingRow` | dataclass | One table row: GPUs, wall time, cost range, notes |
-| `EstimateResult` | dataclass | Full result with `to_dict()` and `to_rich_table()` |
-| `build_scaling_table(work_hours, gpu_counts, pricing, ...)` | `list[ScalingRow]` | Compute scaling table |
-| `fallback_pricing(gpu_types)` | `dict[str, PriceSummary]` | Static prices (offline) |
-| `cheapest_gpu_type(pricing)` | `str` | Lowest median price GPU |
-| `format_time(hours)` | `str` | `2.25` -> `"2h 15m"` |
-| `record_timing(path, workload, **metrics)` | `None` | Append to JSONL benchmarks |
-| `load_calibration(path, workload)` | `list[dict]` | Load benchmark records |
+`list_tasks` exposes task index, normalized task state, optional exit code, and
+the latest task-event description. Job status exposes aggregate task counts,
+the latest event message, and raw event descriptions.
 
-### Pricing (`vastai_gpu_runner.estimator.pricing`)
+## GCS storage (`vastai_gpu_runner.storage.gcs`)
 
-| Function | Returns | Description |
-|----------|---------|-------------|
-| `query_vastai_pricing(gpu_types, max_cost_per_hour, ...)` | `dict[str, PriceSummary]` | Live marketplace query with fallback |
+`GcsSink(bucket_name, client=None, chunk_size=40 * 1024 * 1024)` provides
+upload, download, listing, CAS, and SHA-256 operations. A missing bucket
+raises `KeyError`.
 
-## R2 lifecycle (`vastai_gpu_runner.storage.r2_lifecycle`)
+- `upload_bytes`, `upload_file`, and `upload_text` are create-only writes and
+  use `if_generation_match=0`.
+- `upload_cas_write` compares the expected object generation. `None` means
+  create-only. Generation mismatches raise `GcsPreconditionFailed`; other SDK
+  errors propagate unchanged.
+- `read_cas` returns `(data, generation)` and returns `(b"", None)` when the
+  object is missing.
+- `upload_atomic_json` and `upload_json_atomic` are compatibility names for a
+  staged temporary write followed by final-key overwrite. They do not perform
+  an atomic rename.
+- `download_all(prefix, dest)` returns written paths and rejects unsafe object
+  names. Completion is the expected GCS object set; `GcsSink` neither creates
+  nor requires a `DONE` marker.
 
-Bucket-lifecycle administration for Cloudflare R2. Operator-facing;
-not invoked from worker code.
+## CLI
 
-| Name | Type | Description |
-|------|------|-------------|
-| `R2AdminCredentials` | dataclass | `endpoint`, `access_key_id`, `secret_access_key`. `R2AdminCredentials.from_file(path)` parses a shell-export credentials file containing **only** `R2_ADMIN_*` keys. Worker-style `R2_*` keys are explicitly rejected to enforce credential separation. |
-| `R2ExpirationPolicy` | dataclass | `bucket`, `prefix`, `expire_after_days >= 1`. `canonical_prefix` is computed. |
-| `R2LifecycleManager(creds, *, client=None)` | class | `inspect_managed_rule(bucket, prefix)`, `plan_apply(policy)`, `plan_remove(bucket, prefix)`, `apply(plan)`, `remove(plan)`. All mutations are read-after-write verified. |
-| `LifecyclePlan` | dataclass | Operation, bucket, canonical prefix, managed rule ID, before/after rules, no-op flag, source fingerprint, warnings. |
-| `LifecycleResult` | dataclass | Operation, verified flag, no-op flag, post-write rules count. |
-| `R2LifecycleError` | exception | Base. Subtypes: `ValidationError`, `CredentialsError`, `AccessDeniedError`, `CollisionError`, `StalePlanError`, `RuleLimitError`, `VerificationError`. |
-| `canonicalise_prefix(raw)` | function | Canonical form (trailing `/`, no leading `/`, no root). |
-| `managed_rule_id(bucket, canonical_prefix)` | function | Deterministic rule ID `vastai-gpu-runner-expire-<12-hex>`. |
-| `fingerprint_rules(rules)` | function | Order-sensitive stable fingerprint for OPTIMISTIC stale-plan detection. |
-
-## Worker upload bounds (`vastai_gpu_runner.worker.base`)
-
-| Name | Value | Description |
-|------|-------|-------------|
-| `R2_FINAL_UPLOAD_TIMEOUT_SECONDS` | `90` | Hard upper bound on `upload_results()` subprocess. Transport failure does not change the workload exit code; `self_destruct()` still runs. |
-
-## CLI — `r2-lifecycle` sub-app
+The installed command is `vastai-gpu-runner`. Current commands are:
 
 ```text
-vastai-gpu-runner r2-lifecycle show   --bucket B --prefix P/ --credentials-file F
-vastai-gpu-runner r2-lifecycle apply  --bucket B --prefix P/ --credentials-file F --expire-after-days N [--dry-run] [--yes]
-vastai-gpu-runner r2-lifecycle remove --bucket B --prefix P/ --credentials-file F [--dry-run] [--yes]
-```text
+check
+instances
+estimate
+cleanup
+batch
+run
+r2-lifecycle
+```
 
-Exit codes:
+`batch` composes the direct Vast.ai batch state/configuration and prints a JSON
+summary; it does not submit a `ManagedJobSpec` to GCP Batch. Managed jobs are
+submitted through the Python `ManagedJobRunner` API.
 
-| Code | Meaning |
-|------|---------|
-| 0 | Success (or no-op). |
-| 1 | Generic lifecycle error (catch-all). |
-| 2 | Validation error. |
-| 3 | Credentials missing or malformed (file not found, missing keys). |
-| 4 | Access denied. |
-| 5 | Managed-rule ID collision with incompatible shape. |
-| 6 | Stale plan (bucket changed between plan and apply). |
-| 7 | Provider rejected rule count (`TooManyRules`). |
-| 8 | Read-after-write mismatch. |
-| 9 | Refused to mutate without `--yes` on non-interactive stdin. |
+`r2-lifecycle` provides `show`, `apply`, and `remove` for one managed
+Cloudflare R2 expiration rule per prefix. It requires a credentials file with
+`R2_ADMIN_*` keys and uses exit codes 0 through 9 for the documented success,
+validation, credential, access, collision, stale-plan, rule-limit,
+verification, and confirmation outcomes.

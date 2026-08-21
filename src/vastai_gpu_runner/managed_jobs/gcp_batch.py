@@ -29,13 +29,18 @@ from vastai_gpu_runner.managed_jobs.base import (
     ComputeResource,
     GpuAccelerator,
     ManagedJobHandle,
+    ManagedJobLifecycleState,
     ManagedJobRunner,
     ManagedJobSpec,
     ManagedJobStatus,
-    ManagedJobTerminalState,
     ManagedTaskStatus,
     NetworkConfig,
     ServiceAccount,
+    StorageMount,
+)
+from vastai_gpu_runner.managed_jobs.errors import (
+    ManagedJobNotFoundError,
+    map_gcp_exception,
 )
 
 if TYPE_CHECKING:
@@ -55,20 +60,17 @@ SPOT_PREEMPT_EXIT_CODE = 50001
 # polluting the container env.
 _LEGACY_RESOURCE_KEYS = frozenset({"machine_type", "provisioning_model", "gpu_type", "gpu_count"})
 
-# Map GCP Batch State enum strings onto our normalized terminal states.
-# CANCELLATION_IN_PROGRESS and DELETION_IN_PROGRESS fold into CANCELLED
-# so consumers see a single "the job was cancelled" signal before the
-# row is fully drained.
-_STATE_MAP: dict[str, ManagedJobTerminalState] = {
-    "STATE_UNSPECIFIED": ManagedJobTerminalState.UNKNOWN,
-    "QUEUED": ManagedJobTerminalState.UNKNOWN,
-    "SCHEDULED": ManagedJobTerminalState.UNKNOWN,
-    "RUNNING": ManagedJobTerminalState.UNKNOWN,
-    "SUCCEEDED": ManagedJobTerminalState.SUCCEEDED,
-    "FAILED": ManagedJobTerminalState.FAILED,
-    "CANCELLED": ManagedJobTerminalState.CANCELLED,
-    "CANCELLATION_IN_PROGRESS": ManagedJobTerminalState.CANCELLED,
-    "DELETION_IN_PROGRESS": ManagedJobTerminalState.CANCELLED,
+# Map GCP Batch State enum strings onto the normalized lifecycle states.
+_STATE_MAP: dict[str, ManagedJobLifecycleState] = {
+    "STATE_UNSPECIFIED": ManagedJobLifecycleState.UNKNOWN,
+    "QUEUED": ManagedJobLifecycleState.QUEUED,
+    "SCHEDULED": ManagedJobLifecycleState.PENDING,
+    "RUNNING": ManagedJobLifecycleState.RUNNING,
+    "SUCCEEDED": ManagedJobLifecycleState.SUCCEEDED,
+    "FAILED": ManagedJobLifecycleState.FAILED,
+    "CANCELLED": ManagedJobLifecycleState.CANCELLED,
+    "CANCELLATION_IN_PROGRESS": ManagedJobLifecycleState.CANCELLING,
+    "DELETION_IN_PROGRESS": ManagedJobLifecycleState.CANCELLING,
 }
 
 # Map TaskGroup state strings. UNEXECUTED (a task that never started
@@ -167,9 +169,9 @@ class GcpBatchRunner(ManagedJobRunner):
         request.job = job
         try:
             created = client.create_job(request=request)
-        except Exception:  # pragma: no cover - depends on real GCP response
+        except Exception as exc:  # pragma: no cover - depends on real GCP response
             logger.exception("GCP Batch submit failed for %s", spec.name)
-            raise
+            raise map_gcp_exception(exc, operation="GCP Batch submit") from exc
         resource_name = getattr(created, "name", "") or f"{request.parent}/jobs/{spec.name}"
         location = self._format_handle_location(spec)
         return ManagedJobHandle(
@@ -189,10 +191,10 @@ class GcpBatchRunner(ManagedJobRunner):
         client = self._require_client()
         view = self._build_view_request(handle)
         try:
-            job = client.get_job(view=view, name=handle.resource_name)
-        except Exception:  # pragma: no cover - depends on real GCP response
+            job = client.get_job(request=view)
+        except Exception as exc:  # pragma: no cover - depends on real GCP response
             logger.exception("GCP Batch get_job failed for %s", handle.resource_name)
-            raise
+            raise map_gcp_exception(exc, operation="GCP Batch get_status") from exc
         return self._translate_status(job)
 
     def list_tasks(self, handle: ManagedJobHandle) -> Iterable[ManagedTaskStatus]:
@@ -209,29 +211,35 @@ class GcpBatchRunner(ManagedJobRunner):
         client = self._require_client()
         try:
             tasks = client.list_tasks(parent=self._task_parent(handle))
-        except Exception:  # pragma: no cover - depends on real GCP response
+            for task in tasks:
+                yield self._translate_task(task)
+        except Exception as exc:  # pragma: no cover - depends on real GCP response
             logger.exception("GCP Batch list_tasks failed for %s", handle.resource_name)
-            raise
-        for task in tasks:
-            yield self._translate_task(task)
+            raise map_gcp_exception(exc, operation="GCP Batch list_tasks") from exc
 
     def cancel(self, handle: ManagedJobHandle) -> None:
         """Request cancellation of the job. Idempotent."""
         client = self._require_client()
         try:
             client.cancel_job(name=handle.resource_name)
-        except Exception:  # pragma: no cover - depends on real GCP response
+        except Exception as exc:  # pragma: no cover - depends on real GCP response
             logger.exception("GCP Batch cancel_job failed for %s", handle.resource_name)
-            raise
+            error = map_gcp_exception(exc, operation="GCP Batch cancel")
+            if isinstance(error, ManagedJobNotFoundError):
+                return
+            raise error from exc
 
     def delete(self, handle: ManagedJobHandle) -> None:
         """Permanently remove the job from GCP Batch. Idempotent."""
         client = self._require_client()
         try:
             client.delete_job(name=handle.resource_name)
-        except Exception:  # pragma: no cover - depends on real GCP response
+        except Exception as exc:  # pragma: no cover - depends on real GCP response
             logger.exception("GCP Batch delete_job failed for %s", handle.resource_name)
-            raise
+            error = map_gcp_exception(exc, operation="GCP Batch delete")
+            if isinstance(error, ManagedJobNotFoundError):
+                return
+            raise error from exc
 
     def _require_client(self) -> batch_v1.BatchServiceClient:
         if self._client is not None:
@@ -595,35 +603,49 @@ class GcpBatchRunner(ManagedJobRunner):
         return policy
 
     def _build_volumes(self, spec: ManagedJobSpec) -> list[Any]:
-        """Translate ``spec.gcs_mounts`` into a list of ``batch_v1.Volume``s.
-
-        Supports the common forms:
-
-        * ``gs://bucket/path`` — bucket = remote_path, mount_path = ``/path``.
-        * ``gs://bucket`` — bucket = remote_path, mount_path = ``/bucket``.
-        * ``/mnt/foo`` — falls back to the configured bucket as remote_path.
-
-        Multiple mounts are passed through as multiple volumes; the
-        SDK supports arbitrary mount counts per task.
-        """
+        """Translate supported storage mounts into GCP Batch volumes."""
         from google.cloud import batch_v1
 
-        if not spec.gcs_mounts:
+        mounts_to_build = self._storage_mounts(spec)
+        if not mounts_to_build:
             return []
         mounts: list[Any] = []
-        for entry in spec.gcs_mounts:
-            parsed = parse_gcs_mount(entry, default_bucket=self._bucket_name)
-            if parsed is None:
-                # Empty entry in a tuple of multiple mounts is a no-op;
-                # a single empty mount is also a no-op.
-                continue
-            bucket, mount_path = parsed
+        for mount in mounts_to_build:
+            remote_path = self._gcs_remote_path(mount.uri)
             volume = batch_v1.Volume()
             volume.gcs = batch_v1.GCS()
-            volume.gcs.remote_path = bucket
-            volume.mount_path = mount_path
+            volume.gcs.remote_path = remote_path
+            volume.mount_path = mount.mount_path
+            if mount.read_only:
+                volume.mount_options = ["ro"]
             mounts.append(volume)
         return mounts
+
+    def _storage_mounts(self, spec: ManagedJobSpec) -> list[StorageMount]:
+        """Combine typed mounts with the deprecated GCS compatibility field."""
+        mounts = list(spec.storage_mounts)
+        for entry in spec.gcs_mounts:
+            stripped = entry.strip()
+            if not stripped:
+                continue
+            parsed = parse_gcs_mount(entry, default_bucket=self._bucket_name)
+            if parsed is not None:
+                bucket, mount_path = parsed
+                mounts.append(StorageMount(uri=f"gs://{bucket}", mount_path=mount_path))
+            elif not stripped.startswith("/") or self._bucket_name:
+                raise ValueError(f"invalid or unsupported legacy GCS mount: {entry!r}")
+        return mounts
+
+    @staticmethod
+    def _gcs_remote_path(uri: str) -> str:
+        """Return the GCS remote path or fail clearly for other schemes."""
+        stripped = uri.strip()
+        if not stripped.startswith("gs://"):
+            raise ValueError(f"GCP Batch storage mounts support gs:// URIs only; got {uri!r}")
+        remote_path = stripped[len("gs://") :].strip("/")
+        if not remote_path:
+            raise ValueError(f"invalid GCS storage mount URI: {uri!r}")
+        return remote_path
 
     def _create_request(self, spec: ManagedJobSpec) -> batch_v1.CreateJobRequest:
         from google.cloud import batch_v1
@@ -771,17 +793,17 @@ class GcpBatchRunner(ManagedJobRunner):
             return f"{project}/{region}"
         return f"{self._project_id}/{self._region}"
 
-    def _translate_state(self, status: Any) -> ManagedJobTerminalState:
+    def _translate_state(self, status: Any) -> ManagedJobLifecycleState:
         if status is None:
-            return ManagedJobTerminalState.UNKNOWN
+            return ManagedJobLifecycleState.UNKNOWN
         raw_state = getattr(status, "state", None)
         if raw_state is None:
-            return ManagedJobTerminalState.UNKNOWN
+            return ManagedJobLifecycleState.UNKNOWN
         if hasattr(raw_state, "name"):
             key = raw_state.name
         else:
             key = str(raw_state)
-        return _STATE_MAP.get(key, ManagedJobTerminalState.UNKNOWN)
+        return _STATE_MAP.get(key, ManagedJobLifecycleState.UNKNOWN)
 
     def _aggregate_task_counts(self, job: Any, status: Any) -> tuple[int, int]:
         _ = job
@@ -866,6 +888,26 @@ def _parse_absolute_path(stripped: str, default_bucket: str) -> tuple[str, str] 
     return default_bucket, stripped
 
 
+def _already_exists(message: str) -> Exception:
+    """Create the provider conflict used by the in-memory client."""
+    try:
+        from google.api_core.exceptions import AlreadyExists
+
+        return AlreadyExists(message)
+    except ImportError:  # pragma: no cover - optional GCP dependency
+        return RuntimeError(message)
+
+
+def _not_found(message: str) -> Exception:
+    """Create the provider not-found error used by the in-memory client."""
+    try:
+        from google.api_core.exceptions import NotFound
+
+        return NotFound(message)
+    except ImportError:  # pragma: no cover - optional GCP dependency
+        return LookupError(message)
+
+
 # ---------------------------------------------------------------------------
 # In-memory fakes used by the test suite.
 # ---------------------------------------------------------------------------
@@ -893,8 +935,10 @@ class FakeGcpBatchClient:
 
     def create_job(self, request: Any) -> Any:
         """Record the request and return a synthetic :class:`batch_v1.Job`."""
-        self.submit_calls.append(request)
         resource_name = f"{request.parent}/jobs/{request.job_id}"
+        if resource_name in self.jobs:
+            raise _already_exists(f"job already exists: {resource_name}")
+        self.submit_calls.append(request)
         self.jobs[resource_name] = request.job
         self.statuses.setdefault(resource_name, _make_job_status("RUNNING"))
         self.events.setdefault(resource_name, [])
@@ -906,8 +950,15 @@ class FakeGcpBatchClient:
             status_events=self.events[resource_name],
         )
 
-    def get_job(self, view: Any, name: str) -> Any:
+    def get_job(self, request: Any) -> Any:
         """Return the most recent job record, augmented with current status."""
+        name = getattr(request, "name", None)
+        if name is None and isinstance(request, dict):
+            name = request.get("name")
+        if not name:
+            raise ValueError("get_job request must include name")
+        if name not in self.jobs:
+            raise _not_found(f"job not found: {name}")
         job = self.jobs[name]
         return _make_job(
             name=name,
@@ -922,11 +973,15 @@ class FakeGcpBatchClient:
 
     def cancel_job(self, name: str) -> None:
         """Record the cancellation call and mark the job as cancelling."""
+        if name not in self.jobs:
+            raise _not_found(f"job not found: {name}")
         self.cancel_calls.append(name)
         self.statuses[name] = _make_job_status("CANCELLATION_IN_PROGRESS")
 
     def delete_job(self, name: str) -> None:
         """Record the deletion call and drop the cached job state."""
+        if name not in self.jobs:
+            raise _not_found(f"job not found: {name}")
         self.delete_calls.append(name)
         self.jobs.pop(name, None)
         self.statuses.pop(name, None)

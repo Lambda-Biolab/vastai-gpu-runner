@@ -1,5 +1,9 @@
 # Architecture v4 — ProviderCleanupPolicy
 
+> **Historical/superseded design:** This document preserves the earlier
+> proposal and review record. See [`architecture.md`](architecture.md) and
+> [`api.md`](api.md) for current behavior and signatures.
+
 This doc describes the **target architecture** for the layer above the v3
 belt-and-suspenders destroy refactor. It resolves [issue #19][i19] and
 defines the long-term shape for the zombie-sweep + ownership-guard

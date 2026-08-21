@@ -1,4 +1,4 @@
-"""Cloud GPU orchestration framework for Vast.ai + GCP Batch.
+"""Cloud GPU orchestration framework with Vast.ai and managed-job surfaces.
 
 Provides battle-tested infrastructure for deploying GPU workloads to
 Vast.ai marketplace instances with R2 storage, crash recovery, and
@@ -28,14 +28,7 @@ Public API::
     from vastai_gpu_runner.storage.r2 import R2Sink
 
     # Managed jobs (declarative cloud batch — separate from CloudRunner)
-    from vastai_gpu_runner.managed_jobs import (
-        ManagedJobRunner,
-        ManagedJobSpec,
-        ManagedJobHandle,
-        ManagedJobStatus,
-        ManagedJobTerminalState,
-        GcpBatchRunner,  # provided gcp extra
-    )
+    from vastai_gpu_runner.managed_jobs import ManagedJobRunner, ManagedJobSpec
 
     # GCS storage (provided gcp extra)
     from vastai_gpu_runner.storage.gcs import GcsSink
@@ -56,6 +49,23 @@ Public API::
 """
 
 from vastai_gpu_runner.batch import BatchOrchestrator, BatchUnit, FailureVerdict
+from vastai_gpu_runner.managed_jobs import (
+    GcpBatchRunner,
+    ManagedJobAlreadyExistsError,
+    ManagedJobConflictError,
+    ManagedJobError,
+    ManagedJobHandle,
+    ManagedJobLifecycleState,
+    ManagedJobNotFoundError,
+    ManagedJobPermanentError,
+    ManagedJobRunner,
+    ManagedJobSpec,
+    ManagedJobStatus,
+    ManagedJobTerminalState,
+    ManagedJobTransientError,
+    ManagedTaskStatus,
+    StorageMount,
+)
 from vastai_gpu_runner.runner import CloudRunner
 from vastai_gpu_runner.types import (
     CloudInstance,
@@ -75,6 +85,21 @@ __all__ = [
     "DeploymentConfig",
     "DeploymentResult",
     "FailureVerdict",
+    "GcpBatchRunner",
     "InstanceStatus",
+    "ManagedJobAlreadyExistsError",
+    "ManagedJobConflictError",
+    "ManagedJobError",
+    "ManagedJobHandle",
+    "ManagedJobLifecycleState",
+    "ManagedJobNotFoundError",
+    "ManagedJobPermanentError",
+    "ManagedJobRunner",
+    "ManagedJobSpec",
+    "ManagedJobStatus",
+    "ManagedJobTerminalState",
+    "ManagedJobTransientError",
+    "ManagedTaskStatus",
     "Provider",
+    "StorageMount",
 ]

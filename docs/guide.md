@@ -4,6 +4,7 @@
 
 ```python
 from vastai_gpu_runner.providers.vastai import VastaiRunner
+from vastai_gpu_runner.cleanup_policy import OwnershipPolicy
 from vastai_gpu_runner.types import DeploymentConfig
 
 config = DeploymentConfig(
@@ -16,7 +17,7 @@ config = DeploymentConfig(
 runner = VastaiRunner(
     config,
     docker_image="my-org/my-gpu-image:latest",
-    allowed_images=frozenset({"my-org/my-gpu-image:latest"}),
+    ownership=OwnershipPolicy(owned_images=frozenset({"my-org/my-gpu-image:latest"})),
 )
 
 # Deploys through launch; poll/download/destroy are separate (see below)
@@ -41,6 +42,42 @@ vastai-gpu-runner run --provider local --file worker.sh --file input.json --outp
 It copies the payload into a temp workspace, waits for a `DONE` marker, downloads the results into `--output`, then removes the workspace. Only `--provider local` is supported for now. Tuning options: `--worker-script`, `--timeout`, `--poll-interval`, `--verbose`.
 
 **Lifecycle caveat**: programmatic callers of `run_full_cycle` get the instance back after the worker *launches* — the method does not wait for completion. Poll `check_progress` for the `DONE` marker (or worker death), collect with `download_all_results`, and call `destroy_instance` in a `finally`; the CLI `run` command does all three. See [docs/extending.md](extending.md) for the worked programmatic example.
+
+## Submit a managed job
+
+`ManagedJobRunner` is a separate, provider-neutral contract for declarative
+batch services. It is not a second name for `CloudRunner`: `CloudRunner`
+manages direct VM/SSH lifecycle, while a managed-job provider owns the VM.
+
+```python
+from vastai_gpu_runner.managed_jobs import GcpBatchRunner, ManagedJobSpec, StorageMount
+
+runner = GcpBatchRunner(project_id="project", region="us-central1")
+handle = runner.submit(
+    ManagedJobSpec(
+        name="unique-job-name",  # provider idempotency key
+        image="gcr.io/project/worker:latest",
+        command=("python", "-m", "worker"),
+        storage_mounts=(
+            StorageMount(uri="gs://project-input", mount_path="/mnt/input", read_only=True),
+        ),
+    )
+)
+status = runner.get_status(handle)
+```
+
+Lifecycle values distinguish `QUEUED`, `PENDING`, `RUNNING`, `SUCCEEDED`,
+`FAILED`, `CANCELLING`, `CANCELLED`, and `UNKNOWN`. A duplicate `name` raises
+`ManagedJobConflictError`; `cancel` and `delete` tolerate provider not-found
+responses. GCP Batch supports `gs://` storage mounts and rejects unsupported
+URI schemes. The deprecated `gcs_mounts` field remains available while
+consumers migrate to `storage_mounts`.
+
+`GcsSink.upload_bytes` is create-only, `upload_cas_write` uses generation
+preconditions, and `upload_atomic_json` is a compatibility name for staged
+temporary upload followed by final-key overwrite. It does not perform an
+atomic rename. GCS completion is the expected object set, with no `DONE`
+marker.
 
 ## Build a custom worker
 

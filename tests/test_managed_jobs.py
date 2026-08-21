@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import vastai_gpu_runner
 from vastai_gpu_runner.managed_jobs import (
     CURRENT_MANAGED_JOB_SCHEMA,
     BootDisk,
@@ -15,6 +16,7 @@ from vastai_gpu_runner.managed_jobs import (
     GpuAccelerator,
     MachineResource,
     ManagedJobHandle,
+    ManagedJobLifecycleState,
     ManagedJobSpec,
     ManagedJobState,
     ManagedJobStateError,
@@ -23,6 +25,7 @@ from vastai_gpu_runner.managed_jobs import (
     ManagedTaskStatus,
     NetworkConfig,
     ServiceAccount,
+    StorageMount,
     load_managed_job_state,
     load_or_none,
     save_managed_job_state,
@@ -99,6 +102,63 @@ def test_spec_round_trip_dict() -> None:
     assert payload["gcs_mounts"] == ["gs://example/x"]
 
 
+def test_lifecycle_enum_preserves_in_progress_states() -> None:
+    assert [state.value for state in ManagedJobLifecycleState] == [
+        "queued",
+        "pending",
+        "running",
+        "succeeded",
+        "failed",
+        "cancelling",
+        "cancelled",
+        "unknown",
+    ]
+    assert not ManagedJobLifecycleState.RUNNING.is_terminal
+    assert ManagedJobLifecycleState.SUCCEEDED.is_terminal
+    assert ManagedJobTerminalState.RUNNING is ManagedJobLifecycleState.RUNNING
+
+
+def test_managed_job_public_exports_are_available() -> None:
+    assert vastai_gpu_runner.ManagedJobRunner
+    assert vastai_gpu_runner.ManagedJobLifecycleState
+    assert vastai_gpu_runner.StorageMount
+    assert vastai_gpu_runner.ManagedJobConflictError
+
+
+def test_spec_storage_mount_is_json_safe() -> None:
+    spec = ManagedJobSpec(
+        name="mount-job",
+        storage_mounts=(StorageMount("gs://bucket/input", "/mnt/input", read_only=True),),
+    )
+    payload = spec.to_dict()
+    assert json.dumps(payload)
+    assert payload["storage_mounts"] == [
+        {"uri": "gs://bucket/input", "mount_path": "/mnt/input", "read_only": True}
+    ]
+
+
+def test_spec_preserves_legacy_positional_constructor_order() -> None:
+    spec = ManagedJobSpec(
+        "legacy",
+        2,
+        2,
+        "image",
+        ("run",),
+        {"ENV": "value"},
+        {"label": "value"},
+        ("gs://bucket/input",),
+        60,
+        False,
+        "us-central1",
+    )
+
+    assert spec.gcs_mounts == ("gs://bucket/input",)
+    assert spec.timeout_seconds == 60
+    assert spec.retry_on_preempt is False
+    assert spec.region == "us-central1"
+    assert spec.storage_mounts == ()
+
+
 def test_fake_runner_submit_and_poll() -> None:
     runner = FakeRunner()
     spec = ManagedJobSpec(name="a", task_count=2)
@@ -141,6 +201,31 @@ def test_state_round_trip(tmp_path: Path) -> None:
     assert loaded.state == "RUNNING"
 
 
+def test_state_preserves_legacy_positional_constructor_order() -> None:
+    state = ManagedJobState(
+        1,
+        "fake-batch",
+        "projects/x/jobs/y",
+        "us-central1",
+        5,
+        "RUNNING",
+        3,
+        0,
+        0,
+        "demo",
+        "backbone",
+        {"owner": "test"},
+    )
+
+    assert state.campaign_id == "demo"
+    assert state.stage_id == "backbone"
+    assert state.extra == {"owner": "test"}
+    assert state.correlation_metadata == {
+        "campaign_id": "demo",
+        "stage_id": "backbone",
+    }
+
+
 def test_state_atomic_write_leaves_no_tmp(tmp_path: Path) -> None:
     target = tmp_path / "nested" / "state.json"
     save_managed_job_state(ManagedJobState(resource_name="r"), target)
@@ -174,7 +259,7 @@ def test_invalid_json_raises(tmp_path: Path) -> None:
         load_managed_job_state(bad)
 
 
-def test_v0_payload_migrates_to_v1(tmp_path: Path) -> None:
+def test_v0_payload_migrates_to_current_schema(tmp_path: Path) -> None:
     payload = {
         "schema_version": 0,
         "provider": "fake-batch",
@@ -188,6 +273,77 @@ def test_v0_payload_migrates_to_v1(tmp_path: Path) -> None:
     assert loaded.task_count == 1
     assert loaded.succeeded_tasks == 0
     assert loaded.attempt == 0
+
+
+def test_v1_state_migrates_correlation_without_losing_legacy_fields(tmp_path: Path) -> None:
+    payload = {
+        "schema_version": 1,
+        "provider": "fake-batch",
+        "resource_name": "r",
+        "state": "RUNNING",
+        "campaign_id": "legacy-campaign",
+        "stage_id": "legacy-stage",
+    }
+    target = tmp_path / "v1.json"
+    target.write_text(json.dumps(payload))
+
+    loaded = load_managed_job_state(target)
+
+    assert loaded.schema_version == CURRENT_MANAGED_JOB_SCHEMA
+    assert loaded.correlation_metadata == {
+        "campaign_id": "legacy-campaign",
+        "stage_id": "legacy-stage",
+    }
+    assert loaded.campaign_id == "legacy-campaign"
+    assert loaded.stage_id == "legacy-stage"
+
+
+def test_current_state_backfills_correlation_from_legacy_aliases(tmp_path: Path) -> None:
+    payload = {
+        "schema_version": CURRENT_MANAGED_JOB_SCHEMA,
+        "provider": "fake-batch",
+        "resource_name": "r",
+        "state": "RUNNING",
+        "campaign_id": "legacy-campaign",
+        "stage_id": "legacy-stage",
+    }
+    target = tmp_path / "current.json"
+    target.write_text(json.dumps(payload))
+
+    loaded = load_managed_job_state(target)
+
+    assert loaded.correlation_metadata == {
+        "campaign_id": "legacy-campaign",
+        "stage_id": "legacy-stage",
+    }
+
+
+@pytest.mark.parametrize("metadata_key", ["correlation_metadata", "correlation", "extra"])
+def test_state_rejects_non_mapping_metadata_as_typed_error(
+    tmp_path: Path, metadata_key: str
+) -> None:
+    payload = {
+        "schema_version": CURRENT_MANAGED_JOB_SCHEMA,
+        "provider": "fake-batch",
+        "resource_name": "r",
+        "state": "RUNNING",
+        metadata_key: [],
+    }
+    target = tmp_path / f"invalid-{metadata_key}.json"
+    target.write_text(json.dumps(payload))
+
+    with pytest.raises(ManagedJobStateError):
+        load_managed_job_state(target)
+    assert load_or_none(target) is None
+
+
+def test_state_rejects_non_object_json_root_as_typed_error(tmp_path: Path) -> None:
+    target = tmp_path / "null.json"
+    target.write_text("null")
+
+    with pytest.raises(ManagedJobStateError):
+        load_managed_job_state(target)
+    assert load_or_none(target) is None
 
 
 def test_load_or_none_swallows_errors(tmp_path: Path) -> None:
@@ -218,7 +374,7 @@ def test_status_to_dict_round_trip() -> None:
         "failed_tasks": 0,
         "total_tasks": 8,
         "message": "ok",
-        "raw_events": ("submitted", "running", "succeeded"),
+        "raw_events": ["submitted", "running", "succeeded"],
     }
 
 

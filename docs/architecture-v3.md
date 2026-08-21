@@ -1,5 +1,9 @@
 # Architecture v3 (target)
 
+> **Historical/superseded design:** This document records an earlier target.
+> See [`architecture.md`](architecture.md) and [`api.md`](api.md) for current
+> behavior and signatures.
+
 This doc describes the **target architecture** after the unit-lifecycle decision tree and belt-and-suspenders destroy refactor land. For the current-state architecture (today's code) see
 [`architecture.md`](architecture.md). For the next-step target see
 [`architecture-v2.md`](architecture-v2.md).
