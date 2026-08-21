@@ -29,8 +29,10 @@ from vastai_gpu_runner.managed_jobs.base import (
 )
 from vastai_gpu_runner.managed_jobs.errors import (
     ManagedJobConflictError,
+    ManagedJobError,
     ManagedJobNotFoundError,
     ManagedJobTransientError,
+    map_gcp_exception,
 )
 from vastai_gpu_runner.managed_jobs.gcp_batch import (
     SPOT_PREEMPT_EXIT_CODE,
@@ -140,6 +142,26 @@ def test_submit_maps_transient_gcp_error_and_preserves_cause() -> None:
         runner.submit(_make_spec())
 
     assert isinstance(exc_info.value.__cause__, ServiceUnavailable)
+
+
+@pytest.mark.parametrize(
+    ("exception_type", "expected_type"),
+    [
+        ("Conflict", ManagedJobConflictError),
+        ("BadGateway", ManagedJobTransientError),
+        ("GatewayTimeout", ManagedJobTransientError),
+        ("Aborted", ManagedJobTransientError),
+    ],
+)
+def test_map_gcp_exception_maps_transport_classes(
+    exception_type: str, expected_type: type[ManagedJobError]
+) -> None:
+    from google.api_core import exceptions as gcp_exceptions
+
+    provider_exception = getattr(gcp_exceptions, exception_type)("provider response")
+    mapped = map_gcp_exception(provider_exception)
+
+    assert type(mapped) is expected_type
 
 
 def test_get_status_maps_provider_not_found() -> None:

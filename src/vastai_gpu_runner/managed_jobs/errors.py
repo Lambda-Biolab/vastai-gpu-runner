@@ -46,7 +46,9 @@ def map_gcp_exception(
         return ManagedJobNotFoundError(f"{operation} target was not found: {exc}")
     transient_types: tuple[type[Any], ...] = (
         gcp_exceptions.Aborted,
+        gcp_exceptions.BadGateway,
         gcp_exceptions.DeadlineExceeded,
+        gcp_exceptions.GatewayTimeout,
         gcp_exceptions.InternalServerError,
         gcp_exceptions.ResourceExhausted,
         gcp_exceptions.ServiceUnavailable,
@@ -54,4 +56,6 @@ def map_gcp_exception(
     )
     if isinstance(exc, transient_types):
         return ManagedJobTransientError(f"{operation} failed transiently: {exc}")
+    if isinstance(exc, gcp_exceptions.Conflict):
+        return ManagedJobConflictError(f"{operation} conflicts with an existing job: {exc}")
     return ManagedJobPermanentError(f"{operation} failed: {exc}")

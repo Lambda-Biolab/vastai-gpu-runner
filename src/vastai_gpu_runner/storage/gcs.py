@@ -5,8 +5,8 @@ so a consumer can swap artifact stores without changing the
 orchestrator. Implementations live behind the optional ``gcp``
 extra and the Google SDK is imported lazily.
 
-JSON uploads use ``upload_atomic_json`` (stage-then-copy with
-overwrite semantics on the final key). Plain ``upload_bytes`` /
+JSON uploads use ``upload_atomic_json`` (temporary upload followed by a
+final overwrite). Plain ``upload_bytes`` /
 ``upload_file`` use ``if_generation_match=0`` so two siblings
 cannot silently overwrite each other (create-only semantics). The
 ``upload_cas_write`` / ``read_cas`` pair implements a generation-
