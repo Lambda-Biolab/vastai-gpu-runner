@@ -621,8 +621,9 @@ class GcpBatchRunner(ManagedJobRunner):
             volume.gcs = batch_v1.GCS()
             volume.gcs.remote_path = remote_path
             volume.mount_path = host_path
+            volume.mount_options = ["-o", "allow_other"]
             if mount.read_only:
-                volume.mount_options = ["-o", "ro"]
+                volume.mount_options = ["-o", "ro", *volume.mount_options]
             mounts.append(volume)
             mode = "ro" if mount.read_only else "rw"
             container_volumes.append(f"{host_path}:{mount.mount_path}:{mode}")
