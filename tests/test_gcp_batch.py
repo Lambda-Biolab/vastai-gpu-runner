@@ -995,6 +995,94 @@ def test_gcs_sink_list_blobs_filters_by_prefix() -> None:
     assert sink.list_blobs("") == ["a/1.json", "a/2.json", "b/1.json"]
 
 
+class _PrefixPage:
+    def __init__(self, prefixes: list[str]) -> None:
+        self.prefixes = prefixes
+
+
+class _PrefixPager:
+    def __init__(self, page: _PrefixPage | None, next_page_token: str | None) -> None:
+        self.page = page
+        self.next_page_token = next_page_token
+        self.pages_read = 0
+
+    @property
+    def pages(self) -> Any:
+        self.pages_read += 1
+        if self.page is None:
+            return
+        yield self.page
+        raise AssertionError("the sink consumed more than one GCS page")
+
+
+class _PrefixBucket:
+    def __init__(self, pager: _PrefixPager) -> None:
+        self.pager = pager
+        self.list_calls: list[dict[str, Any]] = []
+
+    def exists(self) -> bool:
+        return True
+
+    def list_blobs(self, **kwargs: Any) -> _PrefixPager:
+        self.list_calls.append(kwargs)
+        return self.pager
+
+
+class _PrefixClient:
+    def __init__(self, bucket: _PrefixBucket) -> None:
+        self._bucket = bucket
+
+    def bucket(self, _name: str) -> _PrefixBucket:
+        return self._bucket
+
+
+def test_gcs_sink_list_prefixes_page_uses_one_sorted_normalized_page() -> None:
+    pager = _PrefixPager(_PrefixPage(["runs/zeta/", "runs/alpha/"]), "next-page")
+    bucket = _PrefixBucket(pager)
+    sink = GcsSink(bucket_name="campaign", client=_PrefixClient(bucket))  # type: ignore[arg-type]
+    opaque = "current-page"
+
+    result = sink.list_prefixes_page("runs/", page_size=2, page_token=opaque)
+
+    assert result == (["alpha", "zeta"], "next-page")
+    assert bucket.list_calls == [
+        {
+            "prefix": "runs/",
+            "delimiter": "/",
+            "max_results": 2,
+            "page_token": opaque,
+        }
+    ]
+    assert pager.pages_read == 1
+
+
+def test_gcs_sink_list_prefixes_page_empty_fetched_page_preserves_token() -> None:
+    pager = _PrefixPager(_PrefixPage([]), "later-page")
+    bucket = _PrefixBucket(pager)
+    sink = GcsSink(bucket_name="campaign", client=_PrefixClient(bucket))  # type: ignore[arg-type]
+
+    assert sink.list_prefixes_page(page_size=1) == ([], "later-page")
+
+
+def test_gcs_sink_list_prefixes_page_without_api_page_has_no_token() -> None:
+    pager = _PrefixPager(None, "unused-page")
+    bucket = _PrefixBucket(pager)
+    sink = GcsSink(bucket_name="campaign", client=_PrefixClient(bucket))  # type: ignore[arg-type]
+
+    assert sink.list_prefixes_page(page_size=1) == ([], None)
+
+
+@pytest.mark.parametrize("page_size", [0, -1])
+def test_gcs_sink_list_prefixes_page_rejects_non_positive_page_size(page_size: int) -> None:
+    pager = _PrefixPager(None, None)
+    bucket = _PrefixBucket(pager)
+    sink = GcsSink(bucket_name="campaign", client=_PrefixClient(bucket))  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="greater than zero"):
+        sink.list_prefixes_page(page_size=page_size)
+    assert bucket.list_calls == []
+
+
 def test_gcs_sink_download_all_creates_local_files(tmp_path: Path) -> None:
     sink, client = _make_sink()
     client.bucket("campaign").blob("data/manifest.json").upload_from_string(b"{}")

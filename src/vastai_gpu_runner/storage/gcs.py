@@ -251,6 +251,36 @@ class GcsSink:
         listed = bucket.list_blobs(prefix=prefix)
         return sorted(blob.name[len(prefix) :] for blob in listed)
 
+    def list_prefixes_page(
+        self,
+        prefix: str = "",
+        *,
+        page_size: int,
+        page_token: str | None = None,
+    ) -> tuple[list[str], str | None]:
+        """Return direct child prefixes from one GCS listing page.
+
+        The returned prefixes have ``prefix`` and their trailing slash
+        removed. A fetched empty page preserves its continuation token.
+        """
+        if page_size <= 0:
+            raise ValueError("page_size must be greater than zero")
+
+        listed = self._bucket().list_blobs(
+            prefix=prefix,
+            delimiter="/",
+            max_results=page_size,
+            page_token=page_token,
+        )
+        page = next(iter(listed.pages), None)
+        if page is None:
+            return [], None
+        if not page.prefixes:
+            return [], listed.next_page_token
+
+        prefixes = sorted(child[len(prefix) :].removesuffix("/") for child in page.prefixes)
+        return prefixes, listed.next_page_token
+
     def download_all(self, prefix: str, dest: FsPath) -> list[FsPath]:
         """Download every blob under ``prefix`` into ``dest`` and return the paths.
 
