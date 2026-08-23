@@ -868,7 +868,7 @@ def test_submit_supports_multiple_gcs_mounts() -> None:
         "/mnt/disks/vastai-gpu-runner-gcs-3",
     ]
     assert [list(volume.mount_options) for volume in task.volumes] == [
-        ["ro"],
+        ["-o", "ro"],
         [],
         [],
         [],
@@ -897,7 +897,7 @@ def test_submit_maps_generic_gcs_mount_and_read_only_intent() -> None:
     runnable = fake.submit_calls[0].job.task_groups[0].task_spec.runnables[0]
     assert volume.gcs.remote_path == "campaign/input"
     assert volume.mount_path == "/mnt/disks/vastai-gpu-runner-gcs-0"
-    assert list(volume.mount_options) == ["ro"]
+    assert list(volume.mount_options) == ["-o", "ro"]
     assert list(runnable.container.volumes) == [
         "/mnt/disks/vastai-gpu-runner-gcs-0:/mnt/input:ro",
     ]
