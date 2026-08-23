@@ -337,6 +337,10 @@ class GcpBatchRunner(ManagedJobRunner):
             runnable.container.entrypoint = spec.command[0]
             runnable.container.commands = list(spec.command[1:])
 
+        volumes, container_volumes = self._build_volumes(spec)
+        if container_volumes:
+            runnable.container.volumes = container_volumes
+
         task = batch_v1.TaskSpec()
         task.runnables = [runnable]
         task.max_retry_count = 3 if spec.retry_on_preempt else 0
@@ -362,7 +366,6 @@ class GcpBatchRunner(ManagedJobRunner):
         # Set the volumes BEFORE handing the task to the TaskGroup:
         # proto-plus copies the underlying protobuf on assignment, so
         # post-group mutations on the local task are dropped.
-        volumes = self._build_volumes(spec)
         if volumes:
             task.volumes = volumes
         return task
@@ -602,24 +605,28 @@ class GcpBatchRunner(ManagedJobRunner):
         policy.network_interfaces = [interface]
         return policy
 
-    def _build_volumes(self, spec: ManagedJobSpec) -> list[Any]:
-        """Translate supported storage mounts into GCP Batch volumes."""
+    def _build_volumes(self, spec: ManagedJobSpec) -> tuple[list[Any], list[str]]:
+        """Translate storage mounts into GCP volumes and container bindings."""
         from google.cloud import batch_v1
 
         mounts_to_build = self._storage_mounts(spec)
         if not mounts_to_build:
-            return []
+            return [], []
         mounts: list[Any] = []
-        for mount in mounts_to_build:
+        container_volumes: list[str] = []
+        for index, mount in enumerate(mounts_to_build):
             remote_path = self._gcs_remote_path(mount.uri)
+            host_path = f"/mnt/disks/vastai-gpu-runner-gcs-{index}"
             volume = batch_v1.Volume()
             volume.gcs = batch_v1.GCS()
             volume.gcs.remote_path = remote_path
-            volume.mount_path = mount.mount_path
+            volume.mount_path = host_path
             if mount.read_only:
                 volume.mount_options = ["ro"]
             mounts.append(volume)
-        return mounts
+            mode = "ro" if mount.read_only else "rw"
+            container_volumes.append(f"{host_path}:{mount.mount_path}:{mode}")
+        return mounts, container_volumes
 
     def _storage_mounts(self, spec: ManagedJobSpec) -> list[StorageMount]:
         """Combine typed mounts with the deprecated GCS compatibility field."""
