@@ -335,7 +335,7 @@ class GcpBatchRunner(ManagedJobRunner):
         runnable.container.image_uri = spec.image
         if spec.command:
             runnable.container.entrypoint = spec.command[0]
-            runnable.container.commands = list(spec.command)
+            runnable.container.commands = list(spec.command[1:])
 
         task = batch_v1.TaskSpec()
         task.runnables = [runnable]

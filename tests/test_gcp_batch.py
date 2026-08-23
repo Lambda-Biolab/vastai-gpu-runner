@@ -90,6 +90,10 @@ def test_submit_builds_correct_request() -> None:
     request = fake.submit_calls[0]
     assert request.parent == "projects/proj-1/locations/us-central1"
     assert request.job_id == "demo-job"
+    container = request.job.task_groups[0].task_spec.runnables[0].container
+    assert container.image_uri == "gcr.io/example/worker:latest"
+    assert container.entrypoint == "python"
+    assert list(container.commands) == ["-m", "demo"]
     assert request.job.task_groups[0].task_count == 3
     assert request.job.task_groups[0].parallelism == 2
     assert request.job.task_groups[0].task_spec.max_retry_count == 3
@@ -98,6 +102,18 @@ def test_submit_builds_correct_request() -> None:
     assert lifecycle[0].action_condition.exit_codes == [SPOT_PREEMPT_EXIT_CODE]
     expected_log_dest = google_cloud_batch.LogsPolicy.Destination.CLOUD_LOGGING
     assert request.job.logs_policy.destination == expected_log_dest
+
+
+def test_submit_single_token_command_has_no_arguments() -> None:
+    fake = FakeGcpBatchClient()
+    runner = GcpBatchRunner(project_id="p", region="us-central1", client=fake)  # type: ignore[arg-type]
+
+    runner.submit(_make_spec(command=("python",)))
+
+    container = fake.submit_calls[0].job.task_groups[0].task_spec.runnables[0].container
+    assert container.image_uri == "gcr.io/example/worker:latest"
+    assert container.entrypoint == "python"
+    assert list(container.commands) == []
 
 
 def test_submit_duplicate_name_raises_typed_conflict() -> None:
