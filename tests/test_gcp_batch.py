@@ -826,6 +826,9 @@ def test_submit_supports_multiple_gcs_mounts() -> None:
     )
     runner.submit(
         _make_spec(
+            storage_mounts=(
+                StorageMount(uri="gs://typed/input", mount_path="/mnt/typed", read_only=True),
+            ),
             gcs_mounts=(
                 "gs://campaign/state",
                 "gs://artifacts/runs",
@@ -834,14 +837,32 @@ def test_submit_supports_multiple_gcs_mounts() -> None:
         )
     )
     task = fake.submit_calls[0].job.task_groups[0].task_spec
-    assert len(task.volumes) == 3
-    assert task.volumes[0].gcs.remote_path == "campaign"
-    assert task.volumes[0].mount_path == "/state"
-    assert task.volumes[1].gcs.remote_path == "artifacts"
-    assert task.volumes[1].mount_path == "/runs"
-    # The bare absolute path falls back to the configured bucket.
-    assert task.volumes[2].gcs.remote_path == "primary"
-    assert task.volumes[2].mount_path == "/mnt/local"
+    runnable = task.runnables[0]
+    assert len(task.volumes) == 4
+    assert [volume.gcs.remote_path for volume in task.volumes] == [
+        "typed/input",
+        "campaign",
+        "artifacts",
+        "primary",
+    ]
+    assert [volume.mount_path for volume in task.volumes] == [
+        "/mnt/disks/vastai-gpu-runner-gcs-0",
+        "/mnt/disks/vastai-gpu-runner-gcs-1",
+        "/mnt/disks/vastai-gpu-runner-gcs-2",
+        "/mnt/disks/vastai-gpu-runner-gcs-3",
+    ]
+    assert [list(volume.mount_options) for volume in task.volumes] == [
+        ["ro"],
+        [],
+        [],
+        [],
+    ]
+    assert list(runnable.container.volumes) == [
+        "/mnt/disks/vastai-gpu-runner-gcs-0:/mnt/typed:ro",
+        "/mnt/disks/vastai-gpu-runner-gcs-1:/state:rw",
+        "/mnt/disks/vastai-gpu-runner-gcs-2:/runs:rw",
+        "/mnt/disks/vastai-gpu-runner-gcs-3:/mnt/local:rw",
+    ]
 
 
 def test_submit_maps_generic_gcs_mount_and_read_only_intent() -> None:
@@ -857,9 +878,50 @@ def test_submit_maps_generic_gcs_mount_and_read_only_intent() -> None:
     )
 
     volume = fake.submit_calls[0].job.task_groups[0].task_spec.volumes[0]
+    runnable = fake.submit_calls[0].job.task_groups[0].task_spec.runnables[0]
     assert volume.gcs.remote_path == "campaign/input"
-    assert volume.mount_path == "/mnt/input"
+    assert volume.mount_path == "/mnt/disks/vastai-gpu-runner-gcs-0"
     assert list(volume.mount_options) == ["ro"]
+    assert list(runnable.container.volumes) == [
+        "/mnt/disks/vastai-gpu-runner-gcs-0:/mnt/input:ro",
+    ]
+
+
+def test_submit_maps_generic_gcs_mount_and_writable_intent() -> None:
+    fake = FakeGcpBatchClient()
+    runner = GcpBatchRunner(project_id="p", region="us-central1", client=fake)  # type: ignore[arg-type]
+    runner.submit(
+        _make_spec(
+            gcs_mounts=(),
+            storage_mounts=(StorageMount(uri="gs://campaign/output", mount_path="/mnt/output"),),
+        )
+    )
+
+    task = fake.submit_calls[0].job.task_groups[0].task_spec
+    assert task.volumes[0].mount_path == "/mnt/disks/vastai-gpu-runner-gcs-0"
+    assert list(task.volumes[0].mount_options) == []
+    assert list(task.runnables[0].container.volumes) == [
+        "/mnt/disks/vastai-gpu-runner-gcs-0:/mnt/output:rw",
+    ]
+
+
+def test_submit_preserves_container_target_under_mnt_disks() -> None:
+    fake = FakeGcpBatchClient()
+    runner = GcpBatchRunner(project_id="p", region="us-central1", client=fake)  # type: ignore[arg-type]
+    runner.submit(
+        _make_spec(
+            gcs_mounts=(),
+            storage_mounts=(
+                StorageMount(uri="gs://campaign/data", mount_path="/mnt/disks/campaigns"),
+            ),
+        )
+    )
+
+    task = fake.submit_calls[0].job.task_groups[0].task_spec
+    assert task.volumes[0].mount_path == "/mnt/disks/vastai-gpu-runner-gcs-0"
+    assert list(task.runnables[0].container.volumes) == [
+        "/mnt/disks/vastai-gpu-runner-gcs-0:/mnt/disks/campaigns:rw",
+    ]
 
 
 def test_submit_rejects_unsupported_generic_mount_scheme() -> None:
@@ -881,6 +943,7 @@ def test_submit_omits_volumes_when_gcs_mounts_empty() -> None:
     runner.submit(_make_spec(gcs_mounts=()))
     task = fake.submit_calls[0].job.task_groups[0].task_spec
     assert not task.volumes
+    assert not task.runnables[0].container.volumes
 
 
 # ---------------------------------------------------------------------------
