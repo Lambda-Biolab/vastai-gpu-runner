@@ -959,6 +959,36 @@ def test_submit_maps_gcs_mount_ownership_and_modes() -> None:
     ]
 
 
+def test_submit_preserves_max_uint32_gcs_mount_ownership() -> None:
+    fake = FakeGcpBatchClient()
+    runner = GcpBatchRunner(project_id="p", region="us-central1", client=fake)  # type: ignore[arg-type]
+    maximum = 2**32 - 1
+
+    runner.submit(
+        _make_spec(
+            gcs_mounts=(),
+            storage_mounts=(
+                StorageMount(
+                    uri="gs://campaign/output",
+                    mount_path="/mnt/output",
+                    uid=maximum,
+                    gid=maximum,
+                ),
+            ),
+        )
+    )
+
+    volume = fake.submit_calls[0].job.task_groups[0].task_spec.volumes[0]
+    assert list(volume.mount_options) == [
+        "-o",
+        "allow_other",
+        "--uid",
+        str(maximum),
+        "--gid",
+        str(maximum),
+    ]
+
+
 @pytest.mark.parametrize(
     "mount",
     [
@@ -966,6 +996,8 @@ def test_submit_maps_gcs_mount_ownership_and_modes() -> None:
         StorageMount("gs://bucket/path", "/mnt/path", gid="10001"),  # type: ignore[arg-type]
         StorageMount("gs://bucket/path", "/mnt/path", uid=-1),
         StorageMount("gs://bucket/path", "/mnt/path", gid=-1),
+        StorageMount("gs://bucket/path", "/mnt/path", uid=2**32),
+        StorageMount("gs://bucket/path", "/mnt/path", gid=2**32),
         StorageMount("gs://bucket/path", "/mnt/path", file_mode=True),
         StorageMount("gs://bucket/path", "/mnt/path", file_mode="660"),  # type: ignore[arg-type]
         StorageMount("gs://bucket/path", "/mnt/path", file_mode=-1),

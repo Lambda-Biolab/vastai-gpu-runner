@@ -50,6 +50,7 @@ logger = logging.getLogger(__name__)
 
 # Exit code 50001 = Batch-documented Spot VM preemption.
 SPOT_PREEMPT_EXIT_CODE = 50001
+_MAX_UINT32 = 2**32 - 1
 
 # Environment keys that the runner interprets as job-shape overrides
 # (machine_type, provisioning_model, gpu_type, gpu_count). These are
@@ -634,7 +635,7 @@ class GcpBatchRunner(ManagedJobRunner):
             options = ["-o", "ro", *options]
         for name, value in (("uid", mount.uid), ("gid", mount.gid)):
             if value is not None:
-                GcpBatchRunner._validate_mount_value(name, value, maximum=None)
+                GcpBatchRunner._validate_mount_value(name, value, maximum=_MAX_UINT32)
                 options.extend([f"--{name}", str(value)])
         for name, value in (("file-mode", mount.file_mode), ("dir-mode", mount.dir_mode)):
             if value is not None:
