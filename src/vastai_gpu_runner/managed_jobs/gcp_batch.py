@@ -50,6 +50,7 @@ logger = logging.getLogger(__name__)
 
 # Exit code 50001 = Batch-documented Spot VM preemption.
 SPOT_PREEMPT_EXIT_CODE = 50001
+_MAX_UINT32 = 2**32 - 1
 
 # Environment keys that the runner interprets as job-shape overrides
 # (machine_type, provisioning_model, gpu_type, gpu_count). These are
@@ -621,13 +622,35 @@ class GcpBatchRunner(ManagedJobRunner):
             volume.gcs = batch_v1.GCS()
             volume.gcs.remote_path = remote_path
             volume.mount_path = host_path
-            volume.mount_options = ["-o", "allow_other"]
-            if mount.read_only:
-                volume.mount_options = ["-o", "ro", *volume.mount_options]
+            volume.mount_options = self._mount_options(mount)
             mounts.append(volume)
             mode = "ro" if mount.read_only else "rw"
             container_volumes.append(f"{host_path}:{mount.mount_path}:{mode}")
         return mounts, container_volumes
+
+    @staticmethod
+    def _mount_options(mount: StorageMount) -> list[str]:
+        options = ["-o", "allow_other"]
+        if mount.read_only:
+            options = ["-o", "ro", *options]
+        for name, value in (("uid", mount.uid), ("gid", mount.gid)):
+            if value is not None:
+                GcpBatchRunner._validate_mount_value(name, value, maximum=_MAX_UINT32)
+                options.extend([f"--{name}", str(value)])
+        for name, value in (("file-mode", mount.file_mode), ("dir-mode", mount.dir_mode)):
+            if value is not None:
+                GcpBatchRunner._validate_mount_value(name, value, maximum=0o777)
+                options.extend([f"--{name}", format(value, "o")])
+        return options
+
+    @staticmethod
+    def _validate_mount_value(name: str, value: object, maximum: int | None) -> None:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"GCSFuse {name} must be an integer")
+        if value < 0 or (maximum is not None and value > maximum):
+            if maximum is None:
+                raise ValueError(f"GCSFuse {name} must not be negative")
+            raise ValueError(f"GCSFuse {name} must be between 0 and {oct(maximum)}")
 
     def _storage_mounts(self, spec: ManagedJobSpec) -> list[StorageMount]:
         """Combine typed mounts with the deprecated GCS compatibility field."""

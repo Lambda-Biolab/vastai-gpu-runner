@@ -137,6 +137,37 @@ def test_spec_storage_mount_is_json_safe() -> None:
     ]
 
 
+def test_spec_storage_mount_ownership_is_json_safe() -> None:
+    spec = ManagedJobSpec(
+        name="mount-job",
+        storage_mounts=(
+            StorageMount(
+                "gs://bucket/input",
+                "/mnt/input",
+                uid=10001,
+                gid=10001,
+                file_mode=0o660,
+                dir_mode=0o770,
+            ),
+        ),
+    )
+
+    payload = spec.to_dict()
+
+    assert json.dumps(payload)
+    assert payload["storage_mounts"] == [
+        {
+            "uri": "gs://bucket/input",
+            "mount_path": "/mnt/input",
+            "read_only": False,
+            "uid": 10001,
+            "gid": 10001,
+            "file_mode": 0o660,
+            "dir_mode": 0o770,
+        }
+    ]
+
+
 def test_spec_preserves_legacy_positional_constructor_order() -> None:
     spec = ManagedJobSpec(
         "legacy",
