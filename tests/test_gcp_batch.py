@@ -921,6 +921,71 @@ def test_submit_maps_generic_gcs_mount_and_writable_intent() -> None:
     ]
 
 
+def test_submit_maps_gcs_mount_ownership_and_modes() -> None:
+    fake = FakeGcpBatchClient()
+    runner = GcpBatchRunner(project_id="p", region="us-central1", client=fake)  # type: ignore[arg-type]
+    runner.submit(
+        _make_spec(
+            gcs_mounts=(),
+            storage_mounts=(
+                StorageMount(
+                    uri="gs://campaign/output",
+                    mount_path="/mnt/output",
+                    read_only=True,
+                    uid=10001,
+                    gid=10001,
+                    file_mode=0o660,
+                    dir_mode=0o770,
+                ),
+            ),
+        )
+    )
+
+    volume = fake.submit_calls[0].job.task_groups[0].task_spec.volumes[0]
+
+    assert list(volume.mount_options) == [
+        "-o",
+        "ro",
+        "-o",
+        "allow_other",
+        "--uid",
+        "10001",
+        "--gid",
+        "10001",
+        "--file-mode",
+        "660",
+        "--dir-mode",
+        "770",
+    ]
+
+
+@pytest.mark.parametrize(
+    "mount",
+    [
+        StorageMount("gs://bucket/path", "/mnt/path", uid=True),
+        StorageMount("gs://bucket/path", "/mnt/path", gid="10001"),  # type: ignore[arg-type]
+        StorageMount("gs://bucket/path", "/mnt/path", uid=-1),
+        StorageMount("gs://bucket/path", "/mnt/path", gid=-1),
+        StorageMount("gs://bucket/path", "/mnt/path", file_mode=True),
+        StorageMount("gs://bucket/path", "/mnt/path", file_mode="660"),  # type: ignore[arg-type]
+        StorageMount("gs://bucket/path", "/mnt/path", file_mode=-1),
+        StorageMount("gs://bucket/path", "/mnt/path", file_mode=0o1000),
+        StorageMount("gs://bucket/path", "/mnt/path", dir_mode=True),
+        StorageMount("gs://bucket/path", "/mnt/path", dir_mode="770"),  # type: ignore[arg-type]
+        StorageMount("gs://bucket/path", "/mnt/path", dir_mode=-1),
+        StorageMount("gs://bucket/path", "/mnt/path", dir_mode=0o1000),
+    ],
+)
+def test_submit_rejects_invalid_gcs_mount_ownership_or_modes(mount: StorageMount) -> None:
+    fake = FakeGcpBatchClient()
+    runner = GcpBatchRunner(project_id="p", region="us-central1", client=fake)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError):
+        runner.submit(_make_spec(gcs_mounts=(), storage_mounts=(mount,)))
+
+    assert fake.submit_calls == []
+
+
 def test_submit_preserves_container_target_under_mnt_disks() -> None:
     fake = FakeGcpBatchClient()
     runner = GcpBatchRunner(project_id="p", region="us-central1", client=fake)  # type: ignore[arg-type]

@@ -167,6 +167,10 @@ class StorageMount:
     uri: str
     mount_path: str
     read_only: bool = False
+    uid: int | None = None
+    gid: int | None = None
+    file_mode: int | None = None
+    dir_mode: int | None = None
 
 
 @dataclass(frozen=True)
@@ -235,6 +239,10 @@ class ManagedJobSpec:
                     "uri": mount.uri,
                     "mount_path": mount.mount_path,
                     "read_only": mount.read_only,
+                    **({"uid": mount.uid} if mount.uid is not None else {}),
+                    **({"gid": mount.gid} if mount.gid is not None else {}),
+                    **({"file_mode": mount.file_mode} if mount.file_mode is not None else {}),
+                    **({"dir_mode": mount.dir_mode} if mount.dir_mode is not None else {}),
                 }
                 for mount in self.storage_mounts
             ],
