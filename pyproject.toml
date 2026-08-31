@@ -27,10 +27,10 @@ vastai-gpu-runner = "vastai_gpu_runner.cli:app"
 
 [dependency-groups]
 dev = [
-    "ruff==0.16.1",
+    "ruff==0.16.5",
     "pyright>=1.1.411",
     "pytest==9.1.1",
-    "pytest-cov==7.0.0",
+    "pytest-cov==7.1.0",
     "hypothesis>=6.164.0",
     "complexipy>=3.0",
     "bump-my-version>=1.5.0",
