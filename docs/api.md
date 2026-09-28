@@ -234,6 +234,11 @@ raises `KeyError`.
 - `download_all(prefix, dest)` returns written paths and rejects unsafe object
   names. Completion is the expected GCS object set; `GcsSink` neither creates
   nor requires a `DONE` marker.
+- `download_bounded(key, max_bytes=..., if_generation_match=None, directory=None)`
+  streams an object to a unique temp file under a byte cap and returns a
+  `BoundedDownload(path, size, sha256, generation)`. The caller owns the
+  returned file and must delete it. Oversize objects raise `GcsObjectTooLarge`;
+  generation mismatches raise `GcsPreconditionFailed`.
 
 ## CLI
 

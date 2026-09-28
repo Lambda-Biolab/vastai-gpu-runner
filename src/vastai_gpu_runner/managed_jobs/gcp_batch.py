@@ -1056,6 +1056,7 @@ class FakeGcsClient:
         self.generations: dict[tuple[str, str], int] = {}
         self.uploads: list[tuple[str, str, bytes, str | None, int | None]] = []
         self.downloads: list[tuple[str, str, int | None]] = []
+        self.download_chunks: list[int] = []
         self.copy_calls: list[tuple[str, str, str, int | None, int | None]] = []
         self.delete_calls: list[tuple[str, str, int | None]] = []
         self.list_calls: list[tuple[str, str | None]] = []
@@ -1185,6 +1186,10 @@ class FakeGcsBlob:
     the real SDK would raise.
     """
 
+    # The fake streams in small chunks so bounded writers are exercised
+    # across multiple writes; the real SDK chunk size is set by the sink.
+    _DOWNLOAD_CHUNK_SIZE = 64
+
     def __init__(
         self,
         client: FakeGcsClient,
@@ -1198,6 +1203,12 @@ class FakeGcsBlob:
         self._key = key
         self.name = key
         self.generation = generation
+
+    @property
+    def size(self) -> int | None:
+        """Return the stored object's byte length, or None if absent."""
+        data = self._client.buckets.get(self._bucket, {}).get(self._key)
+        return None if data is None else len(data)
 
     def upload_from_string(
         self,
@@ -1237,6 +1248,35 @@ class FakeGcsBlob:
         )
         self._client.downloads.append((self._bucket, self._key, if_generation_match))
         return self._client.buckets.get(self._bucket, {}).get(self._key, b"")
+
+    def download_to_file(
+        self,
+        file_obj: Any,
+        if_generation_match: int | None = None,
+        if_generation_not_match: int | None = None,
+        raw_download: bool = False,
+    ) -> None:
+        """Stream the stored bytes to ``file_obj`` in small chunks.
+
+        Honours ``if_generation_match`` like the real SDK's
+        ``download_to_file``. ``raw_download`` is accepted for call
+        compatibility; the fake stores bytes verbatim either way. The
+        chunked writes let tests observe a bounded writer aborting
+        partway through a stream, and each successful write is recorded
+        in :attr:`FakeGcsClient.download_chunks`.
+        """
+        current = self._client.generations.get((self._bucket, self._key))
+        self._enforce_precondition(
+            if_generation_match=if_generation_match,
+            if_generation_not_match=if_generation_not_match,
+            current=current,
+        )
+        self._client.downloads.append((self._bucket, self._key, if_generation_match))
+        data = self._client.buckets.get(self._bucket, {}).get(self._key, b"")
+        for start in range(0, len(data), self._DOWNLOAD_CHUNK_SIZE):
+            chunk = data[start : start + self._DOWNLOAD_CHUNK_SIZE]
+            file_obj.write(chunk)
+            self._client.download_chunks.append(len(chunk))
 
     def exists(self) -> bool:
         """Return True if this blob is in the in-memory bucket."""
