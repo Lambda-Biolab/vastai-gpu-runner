@@ -32,6 +32,8 @@ from __future__ import annotations
 import hashlib
 import io
 import logging
+import tempfile
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from pathlib import Path as FsPath
 from typing import TYPE_CHECKING, Any
@@ -40,6 +42,11 @@ if TYPE_CHECKING:
     from google.cloud import storage
 
 logger = logging.getLogger(__name__)
+
+# Chunk size for bounded downloads. The Google SDK buffers a whole
+# object when ``chunk_size`` is None; a non-None multiple of 256 KiB
+# forces the streaming ``ChunkedDownload`` path instead.
+_BOUNDED_DOWNLOAD_CHUNK_SIZE = 1024 * 1024
 
 
 class GcsPreconditionFailed(Exception):  # noqa: N818 — name is the public contract
@@ -51,6 +58,115 @@ class GcsPreconditionFailed(Exception):  # noqa: N818 — name is the public con
     or in-place CAS mismatch) is preserved as ``__cause__`` so it
     remains inspectable.
     """
+
+
+class GcsObjectTooLarge(Exception):  # noqa: N818 — name is the public contract
+    """Raised when a bounded download would exceed its ``max_bytes`` cap.
+
+    Raised both when the object's reported metadata size already
+    exceeds the cap (before any bytes are read) and when the actual
+    streamed bytes exceed it (the authoritative guard). The message
+    never carries a reference to the underlying blob.
+    """
+
+
+@dataclass(frozen=True)
+class BoundedDownload:
+    """Result of :meth:`GcsSink.download_bounded`.
+
+    ``path`` is a unique temporary file owned by the caller: the
+    caller MUST delete it when finished. ``size`` and ``sha256`` are
+    computed over the actual streamed bytes, and ``generation`` is the
+    object generation the download was bound to.
+    """
+
+    path: Path
+    size: int
+    sha256: str
+    generation: int
+
+
+class _BoundedWriter:
+    """Write-only stream that enforces a byte cap and hashes in one pass.
+
+    The cumulative count is checked *before* each write, so a chunk
+    that would push the total past ``max_bytes`` is rejected without
+    touching disk. The SDK writes sequentially and never seeks, so a
+    single forward pass is sufficient.
+    """
+
+    def __init__(self, file_obj: Any, max_bytes: int) -> None:
+        self._file = file_obj
+        self._max_bytes = max_bytes
+        self._written = 0
+        self._hasher = hashlib.sha256()
+
+    def write(self, data: bytes) -> int:
+        """Write ``data`` unless it would exceed the cap; hash as it goes."""
+        if self._written + len(data) > self._max_bytes:
+            raise GcsObjectTooLarge(
+                f"download exceeded max_bytes={self._max_bytes} "
+                f"(received {self._written + len(data)} bytes)"
+            )
+        self._file.write(data)
+        self._hasher.update(data)
+        self._written += len(data)
+        return len(data)
+
+    @property
+    def written(self) -> int:
+        """Return the number of bytes actually written."""
+        return self._written
+
+    def hexdigest(self) -> str:
+        """Return the SHA-256 of the bytes written so far."""
+        return self._hasher.hexdigest()
+
+
+def _is_not_found(exc: BaseException) -> bool:
+    """Return True iff ``exc`` is the SDK's ``NotFound``."""
+    try:
+        from google.api_core.exceptions import NotFound
+    except ImportError:
+        return False
+    return isinstance(exc, NotFound)
+
+
+def _validate_max_bytes(max_bytes: int) -> None:
+    """Reject non-positive, non-integer, and boolean caps."""
+    if (
+        isinstance(max_bytes, bool)
+        or not isinstance(max_bytes, int)  # pyright: ignore[reportUnnecessaryIsInstance]
+        or max_bytes <= 0
+    ):
+        raise ValueError("max_bytes must be a positive integer")
+
+
+def _bounded_generation(
+    blob: Any,
+    max_bytes: int,
+    if_generation_match: int | None,
+) -> int:
+    """Reload metadata and freeze the generation to bind the download to.
+
+    The caller's explicit ``if_generation_match`` wins; otherwise the
+    generation observed by ``reload()`` is used. A reported size above
+    ``max_bytes`` is rejected early, but the reported size is never the
+    sole guard — the bounded writer enforces the actual byte count.
+    """
+    try:
+        blob.reload()
+    except Exception as exc:
+        if _is_not_found(exc):
+            raise KeyError("GCS object not found") from exc
+        raise
+    live_gen = getattr(blob, "generation", None)
+    if live_gen is None:
+        raise KeyError("GCS object not found")
+    size = getattr(blob, "size", None)
+    if isinstance(size, int) and size > max_bytes:
+        raise GcsObjectTooLarge(f"object reports {size} bytes, exceeding max_bytes={max_bytes}")
+    return int(if_generation_match) if if_generation_match is not None else int(live_gen)
 
 
 def _is_precondition_failure(exc: BaseException) -> bool:
@@ -105,6 +221,9 @@ class GcsSink:
       between the metadata reload and the download, the read fails
       with :class:`GcsPreconditionFailed` so the caller can retry
       with the new generation.
+    * ``download_bounded`` streams an object to a caller-owned temp
+      file under a byte cap, returning a :class:`BoundedDownload` with
+      the actual size, SHA-256, and bound generation.
 
     Operations on a missing bucket raise :class:`KeyError`; the
     caller is responsible for ensuring the bucket exists
@@ -238,6 +357,76 @@ class GcsSink:
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(data)
         return destination
+
+    def download_bounded(
+        self,
+        key: str,
+        *,
+        max_bytes: int,
+        if_generation_match: int | None = None,
+        directory: FsPath | None = None,
+    ) -> BoundedDownload:
+        """Stream ``key`` to a unique temp file, bounded by ``max_bytes``.
+
+        The object is streamed through the SDK's chunked download path
+        (``chunk_size`` is set explicitly, ``raw_download=True``) into a
+        unique temporary file while a single pass counts the actual
+        bytes and computes their SHA-256. ``raw_download`` keeps
+        content-encoded objects byte-for-byte and bounds memory: the
+        SDK neither transparently decompresses nor buffers the whole
+        object. The download is bound to one object generation: the
+        caller's ``if_generation_match`` when supplied, otherwise the
+        generation observed by a metadata ``reload()``. A generation
+        mismatch raises :class:`GcsPreconditionFailed`.
+
+        ``max_bytes`` must be a positive integer (booleans are
+        rejected). The reported metadata size is checked first as a
+        cheap early reject, but the authoritative guard is the actual
+        streamed byte count: a chunk that would exceed the cap is
+        rejected before it is written. Exceeding the cap raises
+        :class:`GcsObjectTooLarge`.
+
+        On any failure — including a mid-stream interruption — the
+        partial temporary file is closed and removed before the
+        exception propagates.
+
+        The caller owns the returned :class:`BoundedDownload` file and
+        MUST delete ``result.path`` when finished. ``directory``
+        selects where the temp file is created (created if missing);
+        ``None`` uses the system temp directory.
+        """
+        _validate_max_bytes(max_bytes)
+        blob = self._blob(key)
+        generation = _bounded_generation(blob, max_bytes, if_generation_match)
+        if directory is not None:
+            Path(directory).mkdir(parents=True, exist_ok=True)
+        tmp_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                prefix=".gcs-bounded-",
+                suffix=".part",
+                dir=directory,
+                delete=False,
+            ) as tmp:
+                tmp_path = Path(tmp.name)
+                writer = _BoundedWriter(tmp, max_bytes)
+                blob.chunk_size = _BOUNDED_DOWNLOAD_CHUNK_SIZE
+                try:
+                    blob.download_to_file(writer, if_generation_match=generation, raw_download=True)
+                except Exception as exc:
+                    raise _resolve_precondition_failure(exc) from exc
+                result = BoundedDownload(
+                    path=tmp_path,
+                    size=writer.written,
+                    sha256=writer.hexdigest(),
+                    generation=generation,
+                )
+            return result
+        except BaseException:
+            if tmp_path is not None:
+                tmp_path.unlink(missing_ok=True)
+            raise
 
     def list_blobs(self, prefix: str = "") -> list[str]:
         """Return the blob names under ``prefix`` (sorted, with the prefix stripped).

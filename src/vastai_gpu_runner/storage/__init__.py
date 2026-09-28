@@ -1,6 +1,8 @@
 """Cloud storage backends for result persistence."""
 
 from vastai_gpu_runner.storage.gcs import (
+    BoundedDownload,
+    GcsObjectTooLarge,
     GcsPreconditionFailed,
     GcsSink,
     streaming_upload,
@@ -8,6 +10,8 @@ from vastai_gpu_runner.storage.gcs import (
 )
 
 __all__ = [
+    "BoundedDownload",
+    "GcsObjectTooLarge",
     "GcsPreconditionFailed",
     "GcsSink",
     "streaming_upload",

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from requests.structures import CaseInsensitiveDict
 
 from vastai_gpu_runner.managed_jobs.base import (
     BootDisk,
@@ -48,7 +49,7 @@ from vastai_gpu_runner.managed_jobs.state import (
     ManagedJobState,
     save_managed_job_state,
 )
-from vastai_gpu_runner.storage.gcs import GcsPreconditionFailed, GcsSink
+from vastai_gpu_runner.storage.gcs import GcsObjectTooLarge, GcsPreconditionFailed, GcsSink
 
 # google-cloud-batch is heavy and pinned via the optional extra; import
 # is lazy so the rest of the suite runs without the dependency.
@@ -1386,6 +1387,423 @@ def test_gcs_sink_read_cas_data_and_generation_coherent() -> None:
     data, gen = sink.read_cas("snap")
     assert gen == 3
     assert data == b"v3"
+
+
+# ---------------------------------------------------------------------------
+# download_bounded
+# ---------------------------------------------------------------------------
+
+
+def test_gcs_sink_download_bounded_returns_verified_result(tmp_path: Path) -> None:
+    import hashlib
+
+    sink, client = _make_sink()
+    payload = b"trajectory-bytes"
+    client.bucket("campaign").blob("traj").upload_from_string(payload, if_generation_match=0)
+
+    result = sink.download_bounded("traj", max_bytes=1024, directory=tmp_path)
+
+    assert result.path.read_bytes() == payload
+    assert result.size == len(payload)
+    assert result.sha256 == hashlib.sha256(payload).hexdigest()
+    assert result.generation == 1
+    # The caller owns cleanup of the returned file.
+    result.path.unlink()
+    assert not result.path.exists()
+
+
+def test_gcs_sink_download_bounded_default_directory() -> None:
+    sink, client = _make_sink()
+    client.bucket("campaign").blob("snap").upload_from_string(b"abc")
+
+    result = sink.download_bounded("snap", max_bytes=10)
+
+    try:
+        assert result.path.read_bytes() == b"abc"
+        assert result.size == 3
+    finally:
+        result.path.unlink(missing_ok=True)
+
+
+def test_gcs_sink_download_bounded_rejects_oversize_metadata_without_read(
+    tmp_path: Path,
+) -> None:
+    sink, client = _make_sink()
+    client.bucket("campaign").blob("big").upload_from_string(b"x" * 100)
+
+    with pytest.raises(GcsObjectTooLarge):
+        sink.download_bounded("big", max_bytes=10, directory=tmp_path)
+
+    assert client.downloads == []
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_gcs_sink_download_bounded_aborts_when_actual_exceeds_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sink, client = _make_sink()
+    payload = b"x" * 300
+    client.bucket("campaign").blob("big").upload_from_string(payload)
+    # Metadata under-reports the size; the writer must still abort.
+    monkeypatch.setattr(FakeGcsBlob, "size", property(lambda self: 4))
+
+    with pytest.raises(GcsObjectTooLarge):
+        sink.download_bounded("big", max_bytes=100, directory=tmp_path)
+
+    chunk = 64  # FakeGcsBlob streams in 64-byte chunks
+    total_chunks = (len(payload) + chunk - 1) // chunk
+    assert len(client.download_chunks) < total_chunks  # aborted before the end
+    assert sum(client.download_chunks) <= 100  # disk never exceeded the cap
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_gcs_sink_download_bounded_missing_size_still_enforced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sink, client = _make_sink()
+    client.bucket("campaign").blob("big").upload_from_string(b"x" * 300)
+    monkeypatch.setattr(FakeGcsBlob, "size", property(lambda self: None))
+
+    with pytest.raises(GcsObjectTooLarge):
+        sink.download_bounded("big", max_bytes=100, directory=tmp_path)
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_gcs_sink_download_bounded_missing_size_allows_small_object(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sink, client = _make_sink()
+    client.bucket("campaign").blob("small").upload_from_string(b"abc")
+    monkeypatch.setattr(FakeGcsBlob, "size", property(lambda self: None))
+
+    result = sink.download_bounded("small", max_bytes=10, directory=tmp_path)
+
+    assert result.size == 3
+    assert result.path.read_bytes() == b"abc"
+    result.path.unlink()
+
+
+def test_gcs_sink_download_bounded_allows_exact_cap(tmp_path: Path) -> None:
+    sink, client = _make_sink()
+    payload = b"x" * 100
+    client.bucket("campaign").blob("snap").upload_from_string(payload)
+
+    result = sink.download_bounded("snap", max_bytes=100, directory=tmp_path)
+
+    assert result.size == 100
+    assert result.path.read_bytes() == payload
+    result.path.unlink()
+
+
+def test_gcs_sink_download_bounded_allows_empty_object(tmp_path: Path) -> None:
+    import hashlib
+
+    sink, client = _make_sink()
+    client.bucket("campaign").blob("empty").upload_from_string(b"")
+
+    result = sink.download_bounded("empty", max_bytes=10, directory=tmp_path)
+
+    assert result.size == 0
+    assert result.path.read_bytes() == b""
+    assert result.sha256 == hashlib.sha256(b"").hexdigest()
+    result.path.unlink()
+
+
+def test_gcs_sink_download_bounded_rejects_one_over_cap(tmp_path: Path) -> None:
+    sink, client = _make_sink()
+    client.bucket("campaign").blob("snap").upload_from_string(b"x" * 101)
+
+    with pytest.raises(GcsObjectTooLarge):
+        sink.download_bounded("snap", max_bytes=100, directory=tmp_path)
+
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("bad", [0, -1, True, False])
+def test_gcs_sink_download_bounded_rejects_invalid_max_bytes(tmp_path: Path, bad: int) -> None:
+    sink, _client = _make_sink()
+
+    with pytest.raises(ValueError):
+        sink.download_bounded("snap", max_bytes=bad, directory=tmp_path)
+
+
+def test_gcs_sink_download_bounded_generation_toctou(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sink, client = _make_sink()
+    client.bucket("campaign").blob("snap").upload_from_string(b"v1", if_generation_match=0)
+
+    def _stale_reload(self: Any) -> None:
+        self.generation = 1
+
+    monkeypatch.setattr(FakeGcsBlob, "reload", _stale_reload)
+    client.generations[("campaign", "snap")] = 2
+
+    with pytest.raises(GcsPreconditionFailed):
+        sink.download_bounded("snap", max_bytes=100, directory=tmp_path)
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_gcs_sink_download_bounded_explicit_generation_mismatch(tmp_path: Path) -> None:
+    sink, client = _make_sink()
+    client.bucket("campaign").blob("snap").upload_from_string(b"v1", if_generation_match=0)
+
+    with pytest.raises(GcsPreconditionFailed):
+        sink.download_bounded("snap", max_bytes=100, if_generation_match=999, directory=tmp_path)
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_gcs_sink_download_bounded_cleans_up_on_stream_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sink, client = _make_sink()
+    client.bucket("campaign").blob("snap").upload_from_string(b"x" * 300)
+
+    def _boom(self: Any, file_obj: Any, **kwargs: Any) -> None:
+        file_obj.write(b"partial")
+        raise RuntimeError("stream interrupted")
+
+    monkeypatch.setattr(FakeGcsBlob, "download_to_file", _boom)
+
+    with pytest.raises(RuntimeError, match="stream interrupted"):
+        sink.download_bounded("snap", max_bytes=1000, directory=tmp_path)
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_gcs_sink_download_bounded_cleans_up_on_base_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sink, client = _make_sink()
+    client.bucket("campaign").blob("snap").upload_from_string(b"x" * 300)
+
+    def _interrupt(self: Any, file_obj: Any, **kwargs: Any) -> None:
+        file_obj.write(b"partial")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(FakeGcsBlob, "download_to_file", _interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        sink.download_bounded("snap", max_bytes=1000, directory=tmp_path)
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_gcs_sink_download_bounded_creates_nested_directory(tmp_path: Path) -> None:
+    sink, client = _make_sink()
+    client.bucket("campaign").blob("snap").upload_from_string(b"abc")
+    nested = tmp_path / "a" / "b"
+
+    result = sink.download_bounded("snap", max_bytes=10, directory=nested)
+
+    assert result.path.parent == nested
+    assert result.path.read_bytes() == b"abc"
+    result.path.unlink()
+
+
+def test_gcs_sink_download_bounded_rejects_noninteger_max_bytes(tmp_path: Path) -> None:
+    sink, _client = _make_sink()
+
+    with pytest.raises(ValueError):
+        sink.download_bounded("snap", max_bytes=1.5, directory=tmp_path)  # type: ignore[arg-type]
+
+
+def test_gcs_sink_download_bounded_errors_do_not_leak_key(tmp_path: Path) -> None:
+    object_name = "do-not-leak-this-object-name"
+    sink, client = _make_sink()
+    client.bucket("campaign").blob(object_name).upload_from_string(b"x" * 100)
+
+    with pytest.raises(GcsObjectTooLarge) as oversize:
+        sink.download_bounded(object_name, max_bytes=10, directory=tmp_path)
+    assert object_name not in str(oversize.value)
+
+    with pytest.raises(KeyError) as missing:
+        sink.download_bounded("absent-" + object_name, max_bytes=10, directory=tmp_path)
+    assert object_name not in str(missing.value)
+
+
+# ---------------------------------------------------------------------------
+# download_bounded against the real SDK (anonymous client + fake HTTP)
+# ---------------------------------------------------------------------------
+
+
+class _FakeGcsRequest:
+    def __init__(self, method: str, url: str) -> None:
+        self.method = method
+        self.url = url
+
+
+class _FakeGcsResponse:
+    """Minimal ``requests.Response`` stand-in for the SDK's HTTP seam.
+
+    ``_content`` is the raw object bytes; ``content`` is the decoded
+    view and raises for media responses so a missing ``raw_download``
+    is caught rather than silently transcoded.
+    """
+
+    def __init__(
+        self, status_code: int, raw: bytes, headers: dict[str, str], *, media: bool
+    ) -> None:
+        self.status_code = status_code
+        self._raw = raw
+        self.headers = CaseInsensitiveDict(headers)
+        self._media = media
+        self.request = _FakeGcsRequest("GET", "")
+        self.raw_reads = 0
+        self.decoded_reads = 0
+
+    @property
+    def _content(self) -> bytes:
+        self.raw_reads += 1
+        return self._raw
+
+    @property
+    def content(self) -> bytes:
+        self.decoded_reads += 1
+        if self._media:
+            raise AssertionError("decoded media content accessed; raw_download not set")
+        return self._raw
+
+    @property
+    def text(self) -> str:
+        return self._raw.decode("utf-8", "replace")
+
+    def json(self) -> Any:
+        import json
+
+        return json.loads(self._raw)
+
+
+class _FakeGcsHttp:
+    """Fake HTTP transport for a real ``storage.Client`` (no network)."""
+
+    is_mtls = False
+
+    def __init__(self, metadata: dict[str, Any], payload: bytes) -> None:
+        self.metadata = metadata
+        self.payload = payload
+        self.requests: list[dict[str, Any]] = []
+        self.media_responses: list[_FakeGcsResponse] = []
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        headers: Any = None,
+        data: Any = None,
+        timeout: Any = None,
+        stream: bool = False,
+        **kwargs: Any,
+    ) -> _FakeGcsResponse:
+        hdrs = dict(headers or {})
+        self.requests.append({"method": method, "url": url, "headers": hdrs})
+        if "alt=media" in url:
+            return self._media_response(method, url, hdrs)
+        body = self.metadata if "/o/" in url else {"name": "bucket"}
+        import json
+
+        return _FakeGcsResponse(
+            200, json.dumps(body).encode(), {"Content-Type": "application/json"}, media=False
+        )
+
+    def _media_response(self, method: str, url: str, headers: dict[str, Any]) -> _FakeGcsResponse:
+        total = len(self.payload)
+        range_header = headers.get("range")
+        if range_header:
+            start_s, end_s = range_header.split("=", 1)[1].split("-", 1)
+            start = int(start_s)
+            end = int(end_s) if end_s else total - 1
+        else:
+            start, end = 0, total - 1
+        end = min(end, total - 1)
+        chunk = self.payload[start : end + 1]
+        response = _FakeGcsResponse(
+            200,
+            chunk,
+            {
+                "Content-Range": f"bytes {start}-{end}/{total}",
+                "Content-Length": str(len(chunk)),
+            },
+            media=True,
+        )
+        response.request = _FakeGcsRequest(method, url)
+        self.media_responses.append(response)
+        return response
+
+
+def _object_metadata(
+    payload: bytes, *, generation: int = 7, reported_size: int | None = None
+) -> dict[str, Any]:
+    return {
+        "name": "trajectory.xtc",
+        "bucket": "bucket",
+        "generation": str(generation),
+        "size": str(len(payload) if reported_size is None else reported_size),
+        "contentEncoding": "gzip",
+        "mediaLink": "https://storage.googleapis.com/download/storage/v1/b/bucket/o/trajectory.xtc?alt=media",
+    }
+
+
+def _incompressible_bytes(size: int) -> bytes:
+    """Deterministic, poorly-compressible bytes for encoded-object tests."""
+    import hashlib
+
+    out = bytearray()
+    counter = 0
+    while len(out) < size:
+        out.extend(hashlib.sha256(str(counter).encode()).digest())
+        counter += 1
+    return bytes(out[:size])
+
+
+def _real_sdk_sink(metadata: dict[str, Any], payload: bytes) -> tuple[GcsSink, _FakeGcsHttp]:
+    storage = pytest.importorskip("google.cloud.storage")
+    from google.auth.credentials import AnonymousCredentials
+
+    http = _FakeGcsHttp(metadata, payload)
+    client = storage.Client(project="test", credentials=AnonymousCredentials(), _http=http)
+    return GcsSink(bucket_name="bucket", client=client), http
+
+
+def test_gcs_sink_download_bounded_real_sdk_streams_raw_bytes(tmp_path: Path) -> None:
+    import gzip
+    import hashlib
+
+    original = _incompressible_bytes(1024 * 1024 + 5000)
+    raw = gzip.compress(original)
+    sink, http = _real_sdk_sink(_object_metadata(raw), raw)
+
+    result = sink.download_bounded("trajectory.xtc", max_bytes=len(raw) + 1, directory=tmp_path)
+
+    assert result.path.read_bytes() == raw  # encoded bytes, not decompressed
+    assert result.size == len(raw)
+    assert result.sha256 == hashlib.sha256(raw).hexdigest()
+    assert result.generation == 7
+    result.path.unlink()
+
+    media = [r for r in http.requests if "alt=media" in r["url"]]
+    assert len(media) >= 2  # multi-chunk
+    assert media[0]["headers"].get("range") == "bytes=0-1048575"
+    assert media[1]["headers"].get("range", "").startswith("bytes=1048576-")
+    assert all("ifGenerationMatch=7" in r["url"] for r in media)
+    assert all(resp.raw_reads > 0 and resp.decoded_reads == 0 for resp in http.media_responses)
+
+
+def test_gcs_sink_download_bounded_real_sdk_overcap_cleans_up(tmp_path: Path) -> None:
+    import gzip
+
+    original = _incompressible_bytes(1024 * 1024 + 5000)
+    raw = gzip.compress(original)
+    # Metadata under-reports the size so the early reject does not fire.
+    sink, _http = _real_sdk_sink(_object_metadata(raw, reported_size=100), raw)
+
+    with pytest.raises(GcsObjectTooLarge):
+        sink.download_bounded("trajectory.xtc", max_bytes=1024 * 1024 + 1000, directory=tmp_path)
+
+    assert list(tmp_path.iterdir()) == []
 
 
 # ---------------------------------------------------------------------------
